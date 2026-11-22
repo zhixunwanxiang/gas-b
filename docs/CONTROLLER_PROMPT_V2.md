@@ -1,6 +1,6 @@
-# 27B 控制器提示词（当前 v3）
+# 27B 控制器提示词（当前 v4）
 
-运行版本：`gas-a-controller-zh-v3`，沿用原文档路径保留历史链接。正式入口实际使用 [controller_prompts.py](../src/gas_a/controller_prompts.py) 的 `PLAN` / `SELECT` 常量，分别由 `enrich_plan()`、`enrich_selection()` 连同当轮证据放入用户 JSON 消息。宿主负责附加官方提示；不要把 `rnd.prompt` 再粘进去。v3 将宿主回执校验和本地失败证据接入选版；之前真实 27B 测试属于保存的 v2 源码，不能当作 v3 的真实调用结果。
+运行版本：`gas-a-controller-zh-v4`，沿用原文档路径保留历史链接。正式入口实际使用 [controller_prompts.py](../src/gas_a/controller_prompts.py) 的 `PLAN` / `SELECT` 常量，分别由 `enrich_plan()`、`enrich_selection()` 连同当轮证据放入用户 JSON 消息。宿主负责附加官方提示；不要把 `rnd.prompt` 再粘进去。v3 接入宿主回执校验和本地失败证据；真实测试发现回滚提示歧义后，v4 明确区分新候选与本轮历史复评。v4 已通过实际镜像与真实 27B 的正常训练和回滚复测，旧失败证据保留。
 
 ## 本次修改解决什么
 
@@ -36,15 +36,17 @@ hypothesis 用简短文字说明：哪类错误、拟检验机制、预期改善
 ## 选版阶段的实际提示词
 
 ```text
-你是任务 A 的上线审核者。本轮实验已经完成，只根据本轮同范围测量和硬门槛选择产物，不再提出一个未经执行的新实验。
-selected_artifact_id 必须来自 response_schema 的允许列表。候选最高 F1 不等于可上线；admission 和 candidate_gate 的类别保护及最小收益必须同时满足。若有多个合格版本，以可比的 Macro-F1 选择更优者，同分保留父产物。不得为完成任务而放宽召回约束，也不得把不合格候选选进来。
-宿主回执的公开测量是权威依据。host_admission 由程序核对范围、摘要和数值；未通过的候选不可选择。scope 或摘要未知时保留父产物，不用本地高分绕过限制。experiment_failure 表示本地实验已失败，不能把部分文件称为新模型；应依据失败证据保留父产物。不得用旧历史分数替换本轮复评结果，也不得将任何公开验证分数称为隐藏集成绩。
+你是任务 A 的上线审核者。本轮评估已经完成，只根据本轮同范围测量和硬门槛选择产物，不再提出一个未经执行的新实验。
+selected_artifact_id 必须来自 response_schema 的允许列表。先识别 action，再使用对应证据：
+experiment：只有本轮新候选同时通过 candidate_gate 和 host_admission 才可上线；host_candidate_receipt、candidate_gate、host_admission 仅描述这个新候选。其公开范围、验证摘要或测量未知/冲突时不得用本地高分绕过限制。experiment_failure 表示本地训练失败，部分文件不是可选新模型。
+rollback：历史产物已通过 SDK 恢复并在本轮公开验证集重新运行。historical_admission 列出当前验证摘要、fresh_metrics、当前类别保护 gate 和最终允许资格；这是本轮复评，不能误称旧历史分数。新候选相关字段为 null 表示本轮没有新候选，不表示历史回滚不合格，也不需要为回滚制造新的 candidate_response。对 historical_admission 中 eligible=true 且在允许列表的历史 ID，使用其 fresh_metrics 与父模型本轮分数比较。
+observe：无新实验结果时保留父产物。所有动作均不得放宽 admission 的类别召回和最小收益约束。比较完整预测器的同范围 Macro-F1，选择有实测支持的更优合格版本，同分保留父产物。不得用旧历史记录中的分数替换本轮复评结果，也不得将任何公开验证分数称为隐藏集成绩。
 reason 简短列出：同口径父/候选/历史分数、关键类别召回或拒绝门槛、最终 ID 与选择理由。若看到主组件 epoch 指标和完整路由指标，必须区分范围；有可行 epoch 的诊断不等于该 epoch 已导出或已上线。
 召回门槛相对当轮父模型，不保证多轮累计下降相对初始基线仍在同一范围；整体 F1 提高也不证明每个气体类别都改善。
 只返回 response_schema 的两个字符串字段，不输出思考过程、Markdown 或额外字段。保留父模型是允许的真实结果，不能伪称已提升。
 ```
 
-选版还接收 `candidate_gate`、`host_admission`、`experiment_failure`、`checkpoint_selection`、`local_validation_sha256`，用于识别候选是否真正达标、宿主口径是否可比、本地实验是否失败以及哪个 epoch 被导出。输出只包含 `selected_artifact_id`、`reason` 两个字符串字段。
+`candidate_gate` 和 `host_admission` 仅约束本轮新候选。`historical_admission` 独立列出通过 SDK 恢复后，在本轮相同验证集重跑的指标、验证摘要和准入资格。没有新候选时相关字段为 null，不再误伤已经通过复评的历史产物。
 
 ## 提示词之外必须修正的执行缺口
 

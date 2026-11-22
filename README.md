@@ -2,7 +2,9 @@
 
 本项目面向任务 A：对 **128 维特征（16 个传感器，每个 8 维）**进行六类气体分类。正式入口使用 **contest-harness SDK 1.0.4**，支持从平台实际父产物续训、公开特征漂移监测、诊断、实验选版和历史版本回滚。
 
-目前已通过选手侧离线功能与协议测试，并完成本地 SDK 1.0.4 桥接真实 Qwen3.8-27B 的连续回合及单独回滚演练。Docker 实际沙箱、正式宿主模型绑定和回归、比赛隐藏集成绩仍待验证；本地测试不代表正式评测得分。
+最新一轮 v4 镜像已使用真实 PyTRiO Qwen3.8-27B 无人干预完成四轮正常训练和两轮独立故障回滚，形成 **3 次“读非空历史—实际实验—依据结果决策”**，共 12 次真实调用。公开 Macro-F1 为 **0.714030 → 0.798702（+8.47 个百分点）**。[SwanLab 实验](https://swanlab.cn/@1218/gas-b/runs/928d73e54bbc4c46bfd28e67487d571e/chart)已结束为 **FINISHED**；121 条文本、10 个关键指标点和 575 个文件的完整证据归档均已从云端下载核验。见[本次云端测试报告](docs/CLOUD_TEST_20261122.md)和[运行及下载命令](docs/CLOUD_EXPERIMENTS.md)。镜像和交付材料仍为 **59.43 MiB**。这是一个 Run 内的多轮测试，正式隐藏集成绩仍需平台评测。
+
+此前未接云端的独立 v4 真实测试为 **0.714030 → 0.838108**，其真实回复选择与本次不同；旧失败记录和测量均保留，见[历史镜像测试报告](runtime/image-real-27b-v4-20261122/REAL_IMAGE_TEST_REPORT.md)及[镜像交付说明](docs/IMAGE_RELEASE_20261122.md)。
 
 ## 文档导航
 
@@ -14,6 +16,7 @@
 | [审查问题修复说明](docs/CODE_FIXES_20261122.md) | 宿主分数保护、本地失败恢复、验收退出码、home 轮数与原生审计 |
 | [平台验收说明](PLATFORM_VALIDATION.md) | 正式闭环、离线演练、Docker 验收和真实平台验证边界 |
 | [云端连通性与异常收尾](docs/LIVE_PLATFORM_CHECK.md) | 真实连通性检查、SwanLab 结束状态核验、遗留运行的只读排查 |
+| [完整云端实验](docs/CLOUD_EXPERIMENTS.md) | 真实镜像训练、三次历史实验、故障回滚、完整留档及归档下载 |
 | [真实 27B 的 SDK 测试](docs/REAL_SDK_REHEARSAL.md) | `rnd.model()` 的真实回复桥接、多轮 CPU 训练与回执，及正式宿主边界 |
 | [历史回放说明](docs/LEGACY_REPLAY.md) | 固定 batch3–10 回放、旧配置、归档权重重建和历史指标口径 |
 | [SDK 官方说明](vendor/contest-harness-sdk-1.0.4/HARNESS_SDK.md) | 宿主协议、模型访问、挂载目录、分块上传和 SDK 接口 |
@@ -262,7 +265,7 @@ v2 代码复测见 [平台模拟复测报告](runtime/platform-check-v2-20261122
 
 ## 8. 已有验证结果与待完成事项
 
-最新真实 27B 测试：四轮正常 SDK 回合使用 8 次真实回复，形成 3 次含非空历史的完整实验记录，公开 Macro-F1 为 **0.714030 → 0.798702**；另两轮真实回滚演练使用 4 次回复，主动恢复历史产物并确认下一轮父模型一致。加上修复前两次推理耗尽 Token 的失败回复，共 14 次实际调用。原始 API 响应与 SDK 回执逐条匹配，工作区和保存源码中的 85 项项目测试均通过。详见 [真实 SDK 测试说明](docs/REAL_SDK_REHEARSAL.md) 与 [本次核验](runtime/real-27b-sdk-20261122-results/verification.json)。
+最新云端实测见首页和[完整报告](docs/CLOUD_TEST_20261122.md)：123 项项目测试通过，12 次真实模型响应与 SDK 回执逐条匹配，12 组测量及 14,928 条预测独立重算一致，实际历史回滚及下一轮完整父产物核验通过。云端终态和归档内容均已核验。较早源码版的 14 次真实调用证据保留在 [历史核验](runtime/real-27b-sdk-20261122-results/verification.json)。
 
 下面保留 **2026-11-22 较早的验收快照**，详见 [completion-audit.json](runtime/rsi-completion-20261122/completion-audit.json) 和 [sdk-offline-verification.json](runtime/rsi-completion-20261122/sdk-offline-verification.json)。`runtime/` 不纳入 Git，其他工作区需重新生成记录。
 
@@ -319,6 +322,8 @@ SDK 1.0.4 要求宿主声明 `artifact_upload_protocol=chunked-v1`，不支持�
 | [validate_platform.py](scripts/validate_platform.py)、[tests/](tests) | 离线宿主演练及功能回归测试 |
 | [simulate_competition.py](scripts/simulate_competition.py)、[simulation_audit.py](scripts/simulation_audit.py) | 验收条件模拟、独立复现、逐行测量、故障回滚及原生进程访问审计 |
 | [live_platforms.py](scripts/live_platforms.py) | 本地 PyTRiO / SwanLab 连通性检查、异常收尾及云端状态查询，不属于正式镜像入口 |
+| [test_cloud_suite.py](scripts/test_cloud_suite.py)、[cloud_experiment.py](scripts/cloud_experiment.py) | 真实镜像的完整云端实验、原始回复/训练/决策留档及内容回读 |
+| [download_cloud_evidence.py](scripts/download_cloud_evidence.py) | 只读下载完整云端证据 ZIP，或按本地日志再次核验文本、指标和归档 |
 | [replay.py](replay.py)、[router.py](src/gas_a/router.py)、[config.json](config.json) | 历史批次回放与标签反馈路由 |
 
 ## 11. 历史回放

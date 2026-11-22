@@ -20,6 +20,7 @@ from scripts.live_platforms import load_env, configuration, ensure_model, reques
 from scripts.simulate_competition import (EvidenceHost, Measurements, artifact_receipt,
                                           adapter, environment, audit_summary)
 from scripts.validate_platform import exchange
+from scripts.docker_rehearsal import DockerRuntime
 from gas_a.sensor_training.data import load_pair
 from gas_a.sensor_training.io import digest, write_json, append_jsonl
 from gas_a.sensor_training.reference.model import Model
@@ -109,11 +110,16 @@ class RealGateway:
 
 
 class RealModelHost(EvidenceHost):
-    def __init__(self, *args, gateway, **kwargs):
+    def __init__(self, *args, gateway, runtime=None, **kwargs):
         super().__init__(*args, **kwargs)
-        self.gateway = gateway
+        self.gateway, self.runtime = gateway, runtime
         self.frame.update(model_name=MODEL, prompt=LOCAL_PROMPT,
                           prompt_version="local-real-27b-sdk-1.0.4-v1")
+        if runtime is not None:
+            self.frame["task_contract"]["public_projection"].update(
+                train_path="/data/train.jsonl", validation_path="/data/validation.jsonl")
+            if self.frame.get("state_path"):
+                self.frame["state_path"] = "/state"
 
     def write(self, text):
         frame = json.loads(text)
@@ -145,9 +151,24 @@ def run_native_round(host, directory, state, dataset_root):
         for name in list(env):
             if name.startswith(("PYTRIO_", "SWANLAB_")) or name == "OPENAI_API_KEY":
                 env.pop(name)
-        argv = adapter("train", directory, Path(work), host.store / "access.jsonl", dataset_root,
-                       data=host.root / "data", state=state)
-        exchange(host, argv, env, host.store)
+        if host.runtime is not None:
+            argv, name = host.runtime.train(directory, host.root / "data", state,
+                                             host.store / "container.jsonl")
+            exchange(host, argv, env, host.store, name, docker_argv=host.runtime.cli)
+        else:
+            argv = adapter("train", directory, Path(work), host.store / "access.jsonl", dataset_root,
+                           data=host.root / "data", state=state)
+            exchange(host, argv, env, host.store)
+
+
+def measurements(out, validation, dataset_root, runtime):
+    return Measurements(out, validation, dataset_root,
+                        prediction_command=runtime.predict if runtime else None,
+                        prediction_cleanup=runtime.cleanup_prediction if runtime else None)
+
+
+def audit(out, runtime):
+    return runtime.audit() if runtime else audit_summary(out)
 
 
 def finalize_acceptance(report, *, recovery=False, minimum_rounds=4):
@@ -157,9 +178,15 @@ def finalize_acceptance(report, *, recovery=False, minimum_rounds=4):
     checks = {
         "acknowledged_rounds": bool(rows) and all(row.get("finish_acknowledged") for row in rows),
         "model_receipts_each_round": bool(rows) and all(row.get("model_call_ids") for row in rows),
-        "no_observed_data_or_network_violations": ("denied_accesses" in audit and "network_attempts" in audit
-                                                   and not audit["denied_accesses"] and not audit["network_attempts"]),
     }
+    if audit.get("mode") == "docker_enforced_mounts_and_network":
+        checks["docker_mount_network_resource_policy_verified"] = (
+            audit.get("container_policy_verified") is True
+            and audit.get("train_containers", 0) > 0 and audit.get("prediction_containers", 0) > 0)
+    else:
+        checks["no_observed_data_or_network_violations"] = (
+            "denied_accesses" in audit and "network_attempts" in audit
+            and not audit["denied_accesses"] and not audit["network_attempts"])
     baseline = report.get("baseline_macro_f1")
     score = report.get("recovered_macro_f1" if recovery else "final_macro_f1")
     comparable_scores = all(not isinstance(v, bool) and isinstance(v, (int, float)) and 0 <= v <= 1 and math.isfinite(v)
@@ -178,7 +205,7 @@ def finalize_acceptance(report, *, recovery=False, minimum_rounds=4):
     return 0 if passed else 1
 
 
-def recovery_test(source, out, base, gateway, report):
+def recovery_test(source, out, base, gateway, report, runtime=None):
     """Inject weights only; real 27B chooses both actions without forced replies."""
     original = json.loads((source/"live-report.json").read_text(encoding="utf-8"))
     if original["status"] != "completed" or original["model"] != MODEL:
@@ -206,7 +233,7 @@ def recovery_test(source, out, base, gateway, report):
     selected = "fault-injected-parent"
     registry[selected] = (fault,artifact_receipt(fault,selected))
     _,validation = load_pair(out/"data/train.jsonl",out/"data/validation.jsonl")
-    measured = Measurements(out,validation,base.parent)
+    measured = measurements(out,validation,base.parent,runtime)
     for identifier,(directory,receipt) in registry.items():
         measured.measure(directory,receipt["artifact"],identifier)
     report.update(status="running", scope="real_27b_sdk_separate_weight_fault_recovery",
@@ -219,7 +246,7 @@ def recovery_test(source, out, base, gateway, report):
     for index in (1,2):
         directory,receipt = registry[selected]
         host = RealModelHost(out,directory/receipt["artifact"]["checkpoint_paths"][0],index,history,state,
-                             measurements=measured,gateway=gateway,artifact_namespace="recovery-")
+                             measurements=measured,gateway=gateway,runtime=runtime,artifact_namespace="recovery-")
         host.frame["parent_artifact"] = receipt
         host.frame["artifacts"] = [value[1] for identifier,value in registry.items() if identifier != selected]
         host.artifact_dirs = {identifier:value[0] for identifier,value in registry.items()}
@@ -237,16 +264,24 @@ def recovery_test(source, out, base, gateway, report):
         report["rounds"].append(row)
         history.append({"id":f"real-recovery-history-{index}",**host.record})
         if index == 1:
-            recovered_sha = measured.by_id[selected]["checkpoint_sha256"]
-            report.update(rollback_selected=row["action"]=="rollback" and selected!="fault-injected-parent",
-                          recovered_macro_f1=row["macro_f1"],recovered_checkpoint_sha256=recovered_sha,
+            rollback_selected = row["action"]=="rollback" and selected!="fault-injected-parent"
+            recovered_sha = measured.by_id[selected]["checkpoint_sha256"] if rollback_selected else None
+            report.update(rollback_selected=rollback_selected,
+                          recovered_macro_f1=row["macro_f1"] if rollback_selected else None,
+                          recovered_checkpoint_sha256=recovered_sha,
                           historical_read_chunks=sum(f["type"]=="artifact_read_request" for f in host.frames))
         else:
-            report["next_round_used_recovered_parent"] = host.record["configuration"]["parent_checkpoint_sha256"] == recovered_sha
+            report["next_round_used_recovered_parent"] = bool(recovered_sha and
+                host.record["configuration"]["parent_checkpoint_sha256"] == recovered_sha)
         report.update(model_calls=gateway.attempts,real_verified_model_calls=len(gateway.verified))
         write_json(out/"live-report.json",report)
         print(json.dumps({"event":"recovery_round_finished",**{k:row[k] for k in ("round","action","selected_artifact_id","macro_f1")}},ensure_ascii=False),flush=True)
-    report.update(status="completed",audit=audit_summary(out),finished_at=datetime.now(timezone.utc).isoformat())
+    directory, selected_receipt = registry[selected]
+    shutil.copytree(directory, out/"selected-model")
+    shutil.copytree(state, out/"selected-state")
+    write_json(out/"selected-artifact.json", selected_receipt)
+    report.update(status="completed",audit=audit(out,runtime), selected_artifact_id=selected,
+                  finished_at=datetime.now(timezone.utc).isoformat())
 
 
 def main():
@@ -257,6 +292,10 @@ def main():
     parser.add_argument("--rounds", type=int, default=4)
     parser.add_argument("--max-rounds", type=int, default=6)
     parser.add_argument("--max-model-calls", type=int, default=16)
+    parser.add_argument("--image", help="Use this Docker image for both train and predict")
+    parser.add_argument("--expected-image-id", help="Refuse an image different from the delivered image ID")
+    parser.add_argument("--docker-executable", default="docker")
+    parser.add_argument("--docker-context")
     parser.add_argument("--recovery-from",type=Path,
                         help="Separate two-round fault drill using a completed real-model session")
     args = parser.parse_args()
@@ -278,12 +317,18 @@ def main():
               "model":MODEL, "official_host_verified":False, "official_hidden_score":None,
               "cloud_experiment_record_created":False, "rounds":[], "model_calls":[]}
     write_json(out/"live-report.json", report)
-    gateway = None
+    gateway, runtime = None, None
     try:
+        if args.image:
+            runtime = DockerRuntime(args.image, executable=args.docker_executable,
+                                    context=args.docker_context, expected_id=args.expected_image_id)
+            report["runtime"] = runtime.preflight()
+            report["scope"] = "real_27b_sdk_1.0.4_in_actual_docker_image"
+            write_json(out/"live-report.json", report)
         ensure_model(config, key)
         if args.recovery_from:
             gateway = RealGateway(config,key,out,args.max_model_calls)
-            recovery_test(args.recovery_from.resolve(),out,base,gateway,report)
+            recovery_test(args.recovery_from.resolve(),out,base,gateway,report,runtime)
             exit_code = finalize_acceptance(report,recovery=True)
             write_json(out/"live-report.json",report)
             print(json.dumps({"event":"recovery_completed" if exit_code == 0 else "recovery_requirements_unmet",
@@ -296,7 +341,7 @@ def main():
         (out/"initial").mkdir()
         shutil.copyfile(base/"checkpoint.npz", out/"initial/checkpoint.npz")
         _, validation = load_pair(out/"data/train.jsonl", out/"data/validation.jsonl")
-        measured = Measurements(out, validation, base.parent)
+        measured = measurements(out, validation, base.parent,runtime)
         initial = artifact_receipt(out/"initial", "initial")
         measured.measure(out/"initial", initial["artifact"], "initial")
         registry = {"initial":(out/"initial",initial)}
@@ -308,7 +353,7 @@ def main():
         for index in range(1, args.max_rounds+1):
             directory, parent_receipt = registry[selected]
             host = RealModelHost(out, directory/parent_receipt["artifact"]["checkpoint_paths"][0],
-                                 index, history, state, measurements=measured, gateway=gateway)
+                                 index, history, state, measurements=measured, gateway=gateway, runtime=runtime)
             host.frame["parent_artifact"] = parent_receipt
             host.frame["artifacts"] = [value[1] for identifier,value in registry.items() if identifier != selected]
             host.artifact_dirs = {identifier:value[0] for identifier,value in registry.items()}
@@ -342,7 +387,7 @@ def main():
         write_json(out/"selected-artifact.json", selected_receipt)
         report.update(status="completed", gain=report["final_macro_f1"]-report["baseline_macro_f1"],
                       at_least_three_complete_records=report["complete_history_experiment_decision_records"]>=3,
-                      audit=audit_summary(out), finished_at=datetime.now(timezone.utc).isoformat())
+                      audit=audit(out,runtime), finished_at=datetime.now(timezone.utc).isoformat())
     except BaseException as error:
         report.update(status="failed", error_type=type(error).__name__,
                       finished_at=datetime.now(timezone.utc).isoformat())

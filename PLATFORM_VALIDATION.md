@@ -1,8 +1,12 @@
 # 正式闭环与平台验收
 
+最新 v4 云端实测：实际 Docker 镜像、12 次真实 27B 调用、四轮正常训练、三次非空历史实验、两轮独立故障回滚通过；公开 Macro-F1 `0.714030 → 0.798702`。[云端实验](https://swanlab.cn/@1218/gas-b/runs/928d73e54bbc4c46bfd28e67487d571e/chart)状态 **FINISHED**，121 条文本、10 个关键指标点及完整归档已下载核验。见[完整报告](docs/CLOUD_TEST_20261122.md)及[复现/下载命令](docs/CLOUD_EXPERIMENTS.md)。这仍是公开数据上的本地宿主模拟，正式隐藏集成绩未验证。
+
+此前未接云端的独立 v4 测试为 `0.714030 → 0.838108`，真实模型选择与本次不同，见[历史报告](runtime/image-real-27b-v4-20261122/REAL_IMAGE_TEST_REPORT.md)。旧 v3 的真实回滚失败记录继续保留。
+
 正式入口为 `harness.py train/predict`，协议为 SDK 1.0.4 的 `contest.harness.workspace.v2`。
 `scripts/closed_loop_validation.py` 仍是历史回放工具；它的批次标签反馈机制不进入正式入口。
-按用户要求，本次不审核《实验记录规范》。以下文件是系统运行证据，不代表完成该规范或云端记录验收。
+按用户要求，本次不审核《实验记录规范》。云端完整运行证据已完成留档及回读，不代替该规范的字段验收或正式平台提交。
 
 2026-11-22 已新增本地真实 27B 的 SDK 测试：正常四轮形成三次完整历史实验记录，公开 Macro-F1 0.714030 → 0.798702；真实模型另行选择回滚并验证下一轮父产物。共 14 次模型响应（包含修复前两次空 JSON 回复），原始 API 响应与 SDK 回执已逐条核对。见 [真实测试说明](docs/REAL_SDK_REHEARSAL.md) 和 [核验结果](runtime/real-27b-sdk-20261122-results/verification.json)。这些是本地模拟宿主和 PyTRiO 提供方请求 ID，仍不是正式宿主模型绑定、计量或隐藏集成绩证据。
 
@@ -75,7 +79,7 @@ docker run --rm --network none --read-only gas-a-rsi:sdk104 describe
 ```
 
 脚本以非 root 镜像用户运行，禁网、只读根文件系统、2 CPU、4 GiB 内存；train 仅只读挂载授权数据、父产物与上轮状态，工作目录使用 4 GiB tmpfs。predict 仅挂载选中产物，不挂载训练数据，并测试逐行刷新。容器检查仍使用离线模型替身。
-镜像构建需要基础镜像和 NumPy wheel；正式运行不下载依赖。当前机器未安装 Docker，本地单元测试不能替代该项。
+镜像构建需要基础镜像和 NumPy wheel；正式运行不下载依赖。2026-11-22 已使用本机 Docker Desktop 29.9.3 构建并完成实际容器验收：非 root、只读根目录、禁网、2 CPU/4 GiB、十轮离线实验及独立故障回滚均通过；镜像及材料合计 59.44 MiB。详见 [镜像交付说明](docs/IMAGE_RELEASE_20261122.md)。
 
 ## 仍需在比赛平台完成
 

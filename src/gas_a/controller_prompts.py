@@ -5,7 +5,7 @@ The host attaches the official prompt. These are participant instructions only.
 import hashlib
 import json
 
-VERSION = "gas-a-controller-zh-v3"
+VERSION = "gas-a-controller-zh-v4"
 EPOCH_POLICY_VERSION = "same-promotion-gate-per-epoch-v1"
 
 PLAN = """你是任务 A 的受控工业模型实验负责人。目标是在同一份授权公开验证集上，找到能真正通过上线门槛的 Macro-F1 改进，而非只生成更高但不可上线的候选。
@@ -16,9 +16,11 @@ PLAN = """你是任务 A 的受控工业模型实验负责人。目标是在同�
 hypothesis 用简短文字说明：哪类错误、拟检验机制、预期改善的指标及可能代价。reason 引用实际指标和可用历史 id，解释为何选择它及失败时如何拒绝；预测收益必须标为假设，不能写成实测。只返回 response_schema 的五个字符串字段，不返回思考过程、Markdown、代码、额外超参数或额外字段。
 训练只使用公开 train；公开 validation 可评估和选版。隐藏标签/遥测不可用，不能由 id、文件名或匿名标识推断。不可放宽门槛、重置父权重/Adam/scaler、伪造调用号或改写测量。"""
 
-SELECT = """你是任务 A 的上线审核者。本轮实验已经完成，只根据本轮同范围测量和硬门槛选择产物，不再提出一个未经执行的新实验。
-selected_artifact_id 必须来自 response_schema 的允许列表。候选最高 F1 不等于可上线；admission 和 candidate_gate 的类别保护及最小收益必须同时满足。若有多个合格版本，以可比的 Macro-F1 选择更优者，同分保留父产物。不得为完成任务而放宽召回约束，也不得把不合格候选选进来。
-宿主回执的公开测量是权威依据。host_admission 由程序核对范围、摘要和数值；未通过的候选不可选择。scope 或摘要未知时保留父产物，不用本地高分绕过限制。experiment_failure 表示本地实验已失败，不能把部分文件称为新模型；应依据失败证据保留父产物。不得用旧历史分数替换本轮复评结果，也不得将任何公开验证分数称为隐藏集成绩。
+SELECT = """你是任务 A 的上线审核者。本轮评估已经完成，只根据本轮同范围测量和硬门槛选择产物，不再提出一个未经执行的新实验。
+selected_artifact_id 必须来自 response_schema 的允许列表。先识别 action，再使用对应证据：
+experiment：只有本轮新候选同时通过 candidate_gate 和 host_admission 才可上线；host_candidate_receipt、candidate_gate、host_admission 仅描述这个新候选。其公开范围、验证摘要或测量未知/冲突时不得用本地高分绕过限制。experiment_failure 表示本地训练失败，部分文件不是可选新模型。
+rollback：历史产物已通过 SDK 恢复并在本轮公开验证集重新运行。historical_admission 列出当前验证摘要、fresh_metrics、当前类别保护 gate 和最终允许资格；这是本轮复评，不能误称旧历史分数。新候选相关字段为 null 表示本轮没有新候选，不表示历史回滚不合格，也不需要为回滚制造新的 candidate_response。对 historical_admission 中 eligible=true 且在允许列表的历史 ID，使用其 fresh_metrics 与父模型本轮分数比较。
+observe：无新实验结果时保留父产物。所有动作均不得放宽 admission 的类别召回和最小收益约束。比较完整预测器的同范围 Macro-F1，选择有实测支持的更优合格版本，同分保留父产物。不得用旧历史记录中的分数替换本轮复评结果，也不得将任何公开验证分数称为隐藏集成绩。
 reason 简短列出：同口径父/候选/历史分数、关键类别召回或拒绝门槛、最终 ID 与选择理由。若看到主组件 epoch 指标和完整路由指标，必须区分范围；有可行 epoch 的诊断不等于该 epoch 已导出或已上线。
 召回门槛相对当轮父模型，不保证多轮累计下降相对初始基线仍在同一范围；整体 F1 提高也不证明每个气体类别都改善。
 只返回 response_schema 的两个字符串字段，不输出思考过程、Markdown 或额外字段。保留父模型是允许的真实结果，不能伪称已提升。"""
@@ -99,9 +101,22 @@ def enrich_plan(request, controller, train, validation, policy):
 
 
 def enrich_selection(request, controller, validation_sha, candidate_gate, checkpoint_selection):
+    allowed = request["response_schema"]["selected_artifact_id"]
+    historical = {}
+    for identifier, item in request["same_local_validation"].get("historical", {}).items():
+        fresh = (item.get("reevaluated_this_round") is True
+                 and item.get("validation_sha256") == validation_sha)
+        historical[identifier] = {
+            "eligible": bool(fresh and item["gate"].get("eligible") and identifier in allowed),
+            "measurement_source": "restored_artifact_current_public_re_evaluation" if fresh else "unverified",
+            "validation_sha256": item.get("validation_sha256"),
+            "checkpoint_sha256": item.get("checkpoint_sha256"),
+            "fresh_metrics": item.get("metrics") if fresh else None, "gate": item["gate"]}
     return {**request, "controller_prompt": {"version": VERSION, "instruction": SELECT},
             "admission": admission(request["same_local_validation"]["parent"], controller),
             "local_validation_sha256": validation_sha, "candidate_gate": candidate_gate,
+            "new_candidate_admission_applicable": request.get("candidate_artifact_id") is not None,
+            "host_admission_scope": "new_candidate_only", "historical_admission": historical,
             "checkpoint_selection": checkpoint_selection}
 
 

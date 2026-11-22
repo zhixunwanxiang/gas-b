@@ -57,8 +57,9 @@ def artifact_receipt(directory, identifier, descriptor=None, primary="checkpoint
 
 class Measurements:
     """Host-owned labels; the predictor receives features only, one row at a time."""
-    def __init__(self, root, validation, dataset_root):
+    def __init__(self, root, validation, dataset_root, *, prediction_command=None, prediction_cleanup=None):
         self.root, self.validation, self.dataset_root = root, validation, dataset_root
+        self.prediction_command, self.prediction_cleanup = prediction_command, prediction_cleanup
         self.cache, self.by_id = {}, {}
         self.counter = 0
         (root / "measurements").mkdir()
@@ -86,7 +87,8 @@ class Measurements:
                 (output / "outputs.jsonl").open("w", encoding="utf-8") as outputs:
             env = environment()
             env["CONTEST_ARTIFACT_PATH"] = str(primary)
-            argv = adapter("predict", directory, Path(tmp), output / "access.jsonl", self.dataset_root)
+            argv = (self.prediction_command(directory, primary, output) if self.prediction_command else
+                    adapter("predict", directory, Path(tmp), output / "access.jsonl", self.dataset_root))
             process = subprocess.Popen(argv, cwd=ROOT, env=env, stdin=subprocess.PIPE,
                                        stdout=subprocess.PIPE, stderr=stderr, text=True, encoding="utf-8")
             lines = queue.Queue()
@@ -126,6 +128,8 @@ class Measurements:
                     process.wait(timeout=10)
                 process.stdin.close()
                 process.stdout.close()
+                if self.prediction_cleanup:
+                    self.prediction_cleanup(argv)
         metric = score_predictions(np.asarray(probabilities), self.validation["y"], time.perf_counter() - started)
         result = {"metrics": metric, "measured_at": datetime.now(timezone.utc).isoformat(), "directory": str(output.relative_to(self.root)),
                   "validation_sha256": self.validation["sha256"], "checkpoint_sha256": digest(primary),

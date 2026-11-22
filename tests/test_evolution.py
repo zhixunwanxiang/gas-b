@@ -139,6 +139,15 @@ class EvolutionTest(unittest.TestCase):
         self.assertIn("Restored and selected historical", host.record["change_summary"])
         self.assertIsNone(host.candidate)
         self.assertTrue(any(f["type"] == "artifact_read_request" for f in host.frames))
+        selection = json.loads(host.messages[-1][0]["content"])
+        self.assertIsNone(selection["candidate_gate"])
+        self.assertIsNone(selection["host_candidate_receipt"])
+        self.assertFalse(selection["new_candidate_admission_applicable"])
+        admission = selection["historical_admission"]["historical-good"]
+        self.assertTrue(admission["eligible"])
+        self.assertEqual(admission["validation_sha256"], digest(self.root / "data/validation.jsonl"))
+        self.assertEqual(admission["measurement_source"], "restored_artifact_current_public_re_evaluation")
+        self.assertAlmostEqual(admission["fresh_metrics"]["macro_f1"], 1.)
         next_host = OfflineHost(self.root, historical / "checkpoint.npz", 2, [{"id": "recovery", **host.record}], state,
                                 experiment="conservative_head")
         next_host.frame["parent_artifact"] = receipt

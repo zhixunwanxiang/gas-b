@@ -47,7 +47,7 @@ def receipt(directory, identifier, descriptor):
     return {"artifact_id": identifier, **value, "artifact_sha256": "sha256:" + hashlib.sha256(encoded).hexdigest()}
 
 
-def exchange(host, command, env, output, container_name=None):
+def exchange(host, command, env, output, container_name=None, docker_argv=None):
     with (output / "stderr.log").open("w", encoding="utf-8") as stderr, \
             (output / "protocol.jsonl").open("w", encoding="utf-8") as transcript:
         process = subprocess.Popen(command, cwd=ROOT, env=env, stdin=subprocess.PIPE,
@@ -92,7 +92,8 @@ def exchange(host, command, env, output, container_name=None):
                 stream.close()
             if container_name:
                 # Only the uniquely named container created by this invocation.
-                subprocess.run(["docker", "rm", "-f", container_name], capture_output=True, timeout=30)
+                subprocess.run([*(docker_argv or ["docker"]), "rm", "-f", container_name],
+                               env=env, capture_output=True, timeout=30)
 
 
 def check_prediction(root, directory, descriptor, image):

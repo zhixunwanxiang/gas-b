@@ -164,7 +164,8 @@ def _restore_history(rnd, history, run, validation, before, controller):
             model = load_predictor(primary, validation["paths"], resolve_file=resolve_file)
             metric = evaluate(model, validation)
             restored[identifier] = {"metrics": metric, "gate": promotion_gate(before, metric, controller),
-                                    "checkpoint_sha256": digest(primary), "seed": model.meta["seed"]}
+                                    "checkpoint_sha256": digest(primary), "seed": model.meta["seed"],
+                                    "reevaluated_this_round": True, "validation_sha256": validation["sha256"]}
         except (ValueError, OSError, KeyError) as error:
             restored[identifier] = {"error": str(error), "gate": {"eligible": False}}
     return restored
