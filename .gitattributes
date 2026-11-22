@@ -1,0 +1,8 @@
+* text=auto eol=lf
+
+# Keep archived input and checkpoint bytes unchanged for SHA-256 verification.
+data/** -text
+models/** -text
+*.npz binary
+*.whl binary
+*.tar.gz binary

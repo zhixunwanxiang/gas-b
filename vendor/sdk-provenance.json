@@ -1,0 +1,13 @@
+{
+  "name": "contest-harness",
+  "version": "1.0.4",
+  "archive": "contest-harness-sdk-1.0.4.tar.gz",
+  "sha256": "7afd282d6b5fd889d64d0515a67d169806970e36200689b18d2040026167a4af",
+  "source": "User-supplied SDK 1.0.4 archive; extracted sources unchanged.",
+  "requires_host_upload_protocol": "chunked-v1",
+  "previous_archives_retained": [
+    "contest-harness-sdk-1.0.2.tar.gz"
+  ],
+  "wheel": "contest_harness-1.0.4-py3-none-any.whl",
+  "wheel_sha256": "e2ae3f1091e0e3bfaded00cdeb8543d2fc834270d6d0df2202217b570456d826"
+}

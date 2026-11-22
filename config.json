@@ -1,0 +1,174 @@
+{
+  "model_sha256": {
+    "start": "sha256:3ffa9a2d9fa442fbc7d2fbac1ed4e9d6adf3d7489562458d4841f26bffddc352",
+    "reference": "sha256:fd1e08b2aad08b2e9754f9b2dfdc029481c0da7ecdedca0abb0ec6fcc818c757",
+    "home_trunk": "sha256:263c45b3fffbf57ddf6f30028fc76ae7a24a190b89cfdcb85c5deda06b17a13f",
+    "home_router": "sha256:f4f0540b80c1cdb732195bd22b07011e675981ed49a10aaa78b52616f2dda229",
+    "five_sensor": "sha256:f7eac44805651c317856445302788ed440bb24844765ff42189010855e29ffdc",
+    "four_sensor": "sha256:0ee3c9b5ac70b01c011b4f18d9f07c9f03cd7147cc6fc6b5e28b926a67646386"
+  },
+  "cutoffs": {
+    "0": {
+      "cut": 0.5
+    },
+    "1": {
+      "cut": 0.65
+    }
+  },
+  "training": {
+    "limits": {
+      "max_epochs": 32,
+      "max_seconds_per_candidate": 30,
+      "select_best_epoch": true,
+      "early_stopping_patience": 6,
+      "checkpoint_gate": {
+        "reject_zero_target_recall": true,
+        "target_recall_max_drop": 0.02,
+        "max_parent_fixed_f1_drop": 0.02,
+        "min_macro_f1_gain": 0.002,
+        "max_accuracy_drop": 0.02,
+        "max_class_recall_drop": 0.15,
+        "minimum_class_support": 20,
+        "rollback_macro_f1_drop": 0.01,
+        "minimum_class_recall": {
+          "Acetaldehyde": 0.5
+        },
+        "adaptive": true,
+        "hard_minimum_class_recall": {}
+      }
+    },
+    "home": {
+      "epochs": 1,
+      "learning_rate": 0.00065,
+      "balance": 0.35,
+      "weak_boost": 1.0,
+      "l2": 0.0002,
+      "label_smoothing": 0.02
+    },
+    "sensors": {
+      "four_sensor": {
+        "name": "without_13",
+        "learning_rate": 0.003,
+        "epochs": 24,
+        "minimum_epochs": 16,
+        "balance": 0.5,
+        "weak_boost": 1.5,
+        "class_boosts": {
+          "Acetaldehyde": 2
+        },
+        "l2": 0.001,
+        "batch_size": 128,
+        "kept_sensors": [
+          3,
+          14,
+          15,
+          16
+        ]
+      },
+      "five_sensor": {
+        "name": "reference_sparse128",
+        "learning_rate": 0.003,
+        "epochs": 24,
+        "minimum_epochs": 16,
+        "balance": 0.5,
+        "weak_boost": 1.5,
+        "class_boosts": {
+          "Acetaldehyde": 2
+        },
+        "l2": 0.001,
+        "batch_size": 128,
+        "kept_sensors": [
+          3,
+          13,
+          14,
+          15,
+          16
+        ]
+      }
+    }
+  },
+  "acceptance": {
+    "3": {
+      "data_sha256": "sha256:a4c7a1a6744df32f0ca139c75c3b4dade7cc99f57a7785d28cb0f62577dd2061",
+      "prediction_sha256": "7d43479503bc654c1dc9215d1abece236477277635fdf16163166b3a774a565b"
+    },
+    "4": {
+      "data_sha256": "sha256:bd76f86be34ffe89f46a27c6fc2b5b8c6ebfcf984dff4b3e5befc76d98034b7f",
+      "prediction_sha256": "59b7dea06e96066c6fa82fda52b626163fac2a3685bec8b8b5b12d40641f9984"
+    },
+    "5": {
+      "data_sha256": "sha256:3f95cb6e4a39a94bbacd2f1984f1754c9fb5eb3221812975ad70edbcea7abaec",
+      "prediction_sha256": "c2fc0ea550fca47b129fcff58e0ff145dff439101797cd5d75719c574b84af1d"
+    },
+    "6": {
+      "data_sha256": "sha256:83348c504105a5aa5264d1209f2a5d7ba7d9c8bcae60290395f201ac4708ff95",
+      "prediction_sha256": "59c17fc58731d30fe843a39086560a592625df97473031a10b13f68aeb00298a"
+    },
+    "7": {
+      "data_sha256": "sha256:3168cb56d5c9bc29c36184e2e73c9f3474adb3c4a893b1ce0d88b6c47698cfdb",
+      "prediction_sha256": "ed3eaaa77780a744b9b57d4af6640d03f2f85bedd205945fd4219a8cad3a01f7"
+    },
+    "8": {
+      "data_sha256": "sha256:296346b932893ea18c513e23ac5b660f35e1c499fde8254d4804a2ce8a1b4ca7",
+      "prediction_sha256": "f7b5b0f0e9928e2062452ce997d1760189153e89c6185b89635c9f20335244e3"
+    },
+    "9": {
+      "data_sha256": "sha256:e019f11f4fa8336ab1f41f7503eb456b3679da0a84eb8032fe6cef90f0547826",
+      "prediction_sha256": "bb0eb951fe207eb288255863e023e5196930a8637bcfd4f9299636b974c4e3ef"
+    },
+    "10": {
+      "data_sha256": "sha256:30011067c7c05c2b01038f84c73af0c6f1820b622fa2b0ad89111cb4c649f791",
+      "prediction_sha256": "067bf77e82e70854e03dd19490add899b642004fd428049b857a9bb7ec7f74d1"
+    }
+  },
+  "acceptance_matrix": [
+    [
+      2056,
+      8,
+      21,
+      13,
+      26,
+      187
+    ],
+    [
+      31,
+      2093,
+      6,
+      1,
+      107,
+      256
+    ],
+    [
+      76,
+      6,
+      1057,
+      0,
+      98,
+      221
+    ],
+    [
+      591,
+      47,
+      1,
+      159,
+      251,
+      748
+    ],
+    [
+      83,
+      30,
+      111,
+      20,
+      1786,
+      377
+    ],
+    [
+      273,
+      0,
+      0,
+      88,
+      80,
+      1313
+    ]
+  ]
+}

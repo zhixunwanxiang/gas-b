@@ -1,0 +1,12 @@
+**
+!Dockerfile
+!requirements.txt
+!harness.py
+!contest_submission.py
+!submission_config.json
+!src/
+!src/**
+!vendor/
+!vendor/contest_harness-1.0.4-py3-none-any.whl
+**/__pycache__/
+**/*.py[cod]

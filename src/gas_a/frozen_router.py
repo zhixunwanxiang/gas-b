@@ -1,0 +1,263 @@
+"""Select routing on authorized public validation; predict without label feedback."""
+from collections import deque
+from copy import deepcopy
+import json
+import os
+from pathlib import Path, PurePosixPath
+import shutil
+import tempfile
+import time
+
+import numpy as np
+
+from .home_training import binary_cutoffs, train_home
+from .model import Model as HomeModel
+from .router import HomeExpert, PAIRS, pair_codes
+from .signals import Flatline, correct, home_probabilities
+from .sensor_training.data import evaluate, load_model, score_predictions
+from .sensor_training.io import CLASSES, digest, write_json
+from .sensor_training.optimize import train_candidate
+
+FORMAT = "gas-a.frozen-four-sensor.v1"
+MANIFEST = "routing.json"
+COMPONENTS = ("four_sensor", "five_sensor", "home_trunk", "home_router")
+
+
+def _relative(root, name):
+    if (not isinstance(name, str) or not name or "\\" in name or ":" in name
+            or PurePosixPath(name).is_absolute() or any(p in ("", ".", "..") for p in name.split("/"))):
+        raise ValueError("Bundle paths must be relative artifact paths")
+    return Path(root).joinpath(*PurePosixPath(name).parts)
+
+
+def _new_stream(reference):
+    return {"drift": (deque(maxlen=128), np.zeros(128), 0),
+            "flatline": Flatline(reference.scale[96:104])}
+
+
+def _expert_scores(models, policy, x, stream):
+    reference = models["four_sensor"]
+    alarm = stream["flatline"].predict(x[:, 96:104])
+    if policy["feature_correction"]:
+        adjusted, stream["drift"] = correct(x, reference, stream["drift"])
+    else:
+        adjusted = x
+    four = (reference.predict(x) + reference.predict(adjusted)) * .5
+    five_model = models["five_sensor"]
+    five = (five_model.predict(x) + five_model.predict(adjusted)) * .5
+    home = home_probabilities(HomeExpert(models["home_trunk"], models["home_router"]),
+                              adjusted, policy["cutoffs"])
+    return four, five, home, alarm
+
+
+def route_scores(scores, policy):
+    four, five, home, alarm = scores
+    challenger = (1 - policy["inner_weight"]) * home + policy["inner_weight"] * five
+    codes = pair_codes(four.argmax(1), challenger.argmax(1))
+    selected = ~alarm & np.isin(codes, policy["active_pairs"])
+    result = four.copy()
+    outer = policy["outer_weight"]
+    result[selected] = (1 - outer) * four[selected] + outer * challenger[selected]
+    return result
+
+
+class FrozenRouter:
+    """Immutable label-selected policy; streaming state contains features only."""
+    def __init__(self, models, manifest, component_paths, manifest_path):
+        self.models = models
+        self.manifest = manifest
+        self.component_paths = component_paths
+        self.manifest_path = manifest_path
+        self.meta = models["four_sensor"].meta
+        self.policy = deepcopy(manifest["policy"])
+        self._stream = _new_stream(models["four_sensor"])
+
+    def predict(self, x):
+        # Independent evaluation starts from the same empty state as a new process.
+        x = np.asarray(x, dtype=np.float64)
+        scores = _expert_scores(self.models, self.policy, x, _new_stream(self.models["four_sensor"]))
+        return route_scores(scores, self.policy)
+
+    def predict_one(self, x):
+        return route_scores(_expert_scores(self.models, self.policy, x, self._stream), self.policy)
+
+
+def load_predictor(checkpoint, paths=None, resolve_file=None):
+    """Load a plain MLP or its complete frozen bundle; verify every used component."""
+    checkpoint = Path(checkpoint)
+    resolve_file = (lambda path: path) if resolve_file is None else resolve_file
+    anchor = load_model(resolve_file(checkpoint), paths)
+    marker = anchor.meta.get("prediction_bundle")
+    if marker is None:
+        return anchor
+    if not isinstance(marker, dict) or marker.get("format") != FORMAT:
+        raise ValueError("Unsupported prediction bundle")
+    root = checkpoint.parent
+    manifest_path = resolve_file(_relative(root, marker.get("manifest")))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if (manifest.get("format") != FORMAT or manifest.get("classes") != CLASSES
+            or set(manifest.get("components", {})) != set(COMPONENTS)):
+        raise ValueError("Invalid frozen routing manifest")
+    policy = manifest["policy"]
+    if (set(policy) != {"inner_weight", "outer_weight", "active_pairs", "cutoffs", "feature_correction"}
+            or type(policy["feature_correction"]) is not bool
+            or any(isinstance(policy[k], bool) or not isinstance(policy[k], (int, float))
+                   or not np.isfinite(policy[k]) or not 0 <= policy[k] <= 1
+                   for k in ("inner_weight", "outer_weight"))
+            or not isinstance(policy["active_pairs"], list)
+            or len(set(policy["active_pairs"])) != len(policy["active_pairs"])
+            or any(type(c) is not int or c not in [6*a+b for a,b in PAIRS] for c in policy["active_pairs"])
+            or set(policy["cutoffs"]) != {"0", "1"}
+            or any(not 0 < policy["cutoffs"][k]["cut"] < 1 for k in ("0", "1"))):
+        raise ValueError("Invalid frozen routing policy")
+    models, component_paths = {}, {}
+    for role in COMPONENTS:
+        entry = manifest["components"][role]
+        path = resolve_file(_relative(root, entry["path"]))
+        if digest(path) != entry["sha256"]:
+            raise ValueError(f"Routing component digest mismatch: {role}")
+        if role == "four_sensor" and path.resolve() != checkpoint.resolve():
+            raise ValueError("Primary checkpoint must be the routed four-sensor component")
+        model = load_model(path, anchor.meta["paths"]) if role in COMPONENTS[:2] else HomeModel.load(path)
+        if (model.meta["classes"] != CLASSES or model.meta["paths"] != anchor.meta["paths"]
+                or not np.array_equal(model.mean, anchor.mean) or not np.array_equal(model.scale, anchor.scale)):
+            raise ValueError("Routing components have incompatible task or standardization")
+        models[role], component_paths[role] = model, path
+    return FrozenRouter(models, manifest, component_paths, manifest_path)
+
+
+def checkpoint_paths(checkpoint):
+    model = load_predictor(checkpoint)
+    if not isinstance(model, FrozenRouter):
+        return [Path(checkpoint).name]
+    root = Path(checkpoint).parent
+    return [model.component_paths[role].relative_to(root).as_posix() for role in COMPONENTS]
+
+
+def calibrate_policy(models, validation, cutoffs, search):
+    """Compare a bounded family of class-pair policies using validation labels only."""
+    weights = search["inner_weights"]
+    minimum_support, minimum_gain = search["minimum_support"], search["minimum_macro_f1_gain"]
+    corrections = search["correction_choices"]
+    if (not isinstance(weights, list) or not weights or len(weights) > 5
+            or any(isinstance(w, bool) or not isinstance(w, (int, float)) or not np.isfinite(w) or not 0 <= w <= 1 for w in weights)
+            or type(minimum_support) is not int or minimum_support < 1
+            or not isinstance(corrections, list) or not corrections or len(corrections) > 2
+            or any(type(v) is not bool for v in corrections)
+            or not isinstance(minimum_gain, (int, float)) or not np.isfinite(minimum_gain) or minimum_gain < 0):
+        raise ValueError("Invalid bounded routing search")
+    base = {"inner_weight": .75, "outer_weight": .6, "active_pairs": [], "cutoffs": cutoffs,
+            "feature_correction": False}
+    y = validation["y"]
+    best_policy = deepcopy(base)
+    baseline = score_predictions(models["four_sensor"].predict(validation["x"]), y)
+    best = baseline
+    trials = []
+    for correction in corrections:
+        mode = dict(base, feature_correction=correction)
+        scores = _expert_scores(models, mode, validation["x"], _new_stream(models["four_sensor"]))
+        for weight in weights:
+            policy = dict(mode, inner_weight=weight, active_pairs=[])
+            challenger = (1-weight) * scores[2] + weight * scores[1]
+            codes = pair_codes(scores[0].argmax(1), challenger.argmax(1))
+            current = score_predictions(scores[0], y)
+            for a, b in PAIRS:
+                code = 6*a+b
+                support = int(np.count_nonzero(~scores[3] & (codes == code)))
+                if support < minimum_support:
+                    continue
+                proposal = dict(policy, active_pairs=[*policy["active_pairs"], code])
+                metric = score_predictions(route_scores(scores, proposal), y)
+                accepted = metric["macro_f1"] > current["macro_f1"] + max(1e-12, minimum_gain)
+                trials.append({"feature_correction": correction, "inner_weight": weight,
+                               "pair": [CLASSES[a], CLASSES[b]], "support": support,
+                               "macro_f1": metric["macro_f1"], "accepted": accepted})
+                if accepted:
+                    policy, current = proposal, metric
+            if current["macro_f1"] > best["macro_f1"] + 1e-12:
+                best_policy, best = deepcopy(policy), current
+    return best_policy, {"scope": "authorized_public_validation", "validation_sha256": validation["sha256"],
+                         "validation_rows": len(y), "four_sensor_metrics": baseline, "selected_metrics": best,
+                         "search": search, "trials": trials}
+
+
+def _replace_checkpoint(model, target):
+    handle, temporary = tempfile.mkstemp(prefix=".bundle-", suffix=".npz", dir=target.parent)
+    os.close(handle)
+    Path(temporary).unlink()  # Model.save exclusively creates a new file.
+    try:
+        model.save(temporary)
+        os.replace(temporary, target)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def build_bundle(parent_path, parent_predictor, train, validation, candidate, spec, diagnosis, limits, started):
+    """Continue each expert from its actual parent, then select and freeze routing."""
+    from .continuation import state_identity
+    def remaining():
+        value = limits["max_seconds_per_candidate"] - (time.monotonic() - started)
+        if value <= 0:
+            raise TimeoutError("Routed candidate exceeded CPU wall-time budget")
+        return value
+    routing = spec["routing"]
+    anchor_path = candidate / "checkpoint.npz"
+    primary = load_model(anchor_path)
+    if primary.meta["hidden"] != 32 or primary.meta.get("hidden_layers", 1) != 1:
+        raise ValueError("The routed home expert requires a 128-32-6 parent or an explicit compatible migration")
+    parents = parent_predictor.component_paths if isinstance(parent_predictor, FrozenRouter) else {}
+    five_parent = parents.get("five_sensor", parent_path)
+    home_parent = parents.get("home_trunk", parent_path)
+    aux_work = Path(tempfile.mkdtemp(prefix="routing-training-", dir=candidate.parent))
+    aux = candidate / "routing"
+    aux.mkdir()
+    five_before = load_model(five_parent, train["paths"])
+    five_report = train_candidate(five_parent, train, validation, aux_work / "five_sensor",
+                                  routing["five_sensor"], diagnosis,
+                                  dict(limits, max_seconds_per_candidate=remaining()))
+    shutil.copyfile(aux_work / "five_sensor/checkpoint.npz", aux / "five_sensor.npz")
+    remaining()
+    home_before = HomeModel.load(home_parent)
+    if isinstance(parent_predictor, FrozenRouter):
+        old_router = parent_predictor.models["home_router"]
+        if any(not np.array_equal(getattr(home_before, group)[k], getattr(old_router, group)[k])
+               for group in ("params", "first", "second") for k in home_before.params):
+            raise ValueError("Home branches require an explicit migration when their neural states differ")
+    train_home(home_before, train, routing["home"], aux)
+    cutoffs = binary_cutoffs(home_before, train["x"], train["y"])
+    cutoffs = {k: {"cut": value["cut"]} for k, value in cutoffs.items()}
+    models = {"four_sensor": load_model(anchor_path), "five_sensor": load_model(aux / "five_sensor.npz"),
+              "home_trunk": HomeModel.load(aux / "home_trunk.npz"), "home_router": HomeModel.load(aux / "home_router.npz")}
+    for role in ("home_trunk", "home_router"):
+        model = models[role]
+        if (model.meta["steps"] <= home_before.meta["steps"] or not np.array_equal(model.mean, home_before.mean)
+                or not np.array_equal(model.scale, home_before.scale)
+                or any(not np.array_equal(getattr(model, group)[k], getattr(home_before, group)[k])
+                       for group in ("params", "first", "second") for k in ("w1", "b1"))):
+            raise ValueError("Home expert did not preserve and continue the actual parent state")
+    policy, calibration = calibrate_policy(models, validation, cutoffs, routing["selection"])
+    remaining()
+    anchor = models["four_sensor"]
+    anchor.meta["prediction_bundle"] = {"format": FORMAT, "manifest": MANIFEST}
+    _replace_checkpoint(anchor, anchor_path)
+    files = {"four_sensor": anchor_path, **{k: aux / (k + ".npz") for k in COMPONENTS[1:]}}
+    parameter_count = sum(model.meta["parameter_count"] for model in models.values())
+    parameter_count += sum(len(head["w"]) + 1 for head in models["home_router"].meta["private_joint_rescue"].values())
+    manifest = {"format": FORMAT, "classes": CLASSES, "policy": policy, "calibration": calibration,
+                "prediction_parameter_count": parameter_count,
+                "components": {k: {"path": p.relative_to(candidate).as_posix(), "sha256": digest(p)} for k,p in files.items()}}
+    write_json(candidate / MANIFEST, manifest)
+    write_json(candidate / "routing_training.json", {
+        "gradient_and_memory_scope": "authorized_training_rows_only", "route_selection_scope": "authorized_public_validation",
+        "five_sensor": five_report, "five_sensor_initial_state": state_identity(five_before),
+        "home": {"parent_checkpoint_sha256": digest(home_parent),
+                 "router_parent_checkpoint_sha256": digest(parents.get("home_router", parent_path)),
+                 "initial_state": state_identity(home_before),
+                 "trunk_final_state": state_identity(models["home_trunk"]),
+                 "router_final_state": state_identity(models["home_router"]), "training_rows": len(train["y"])},
+    })
+    predictor = load_predictor(anchor_path, train["paths"])
+    measured = evaluate(predictor, validation)
+    if abs(measured["macro_f1"] - calibration["selected_metrics"]["macro_f1"]) > 1e-12:
+        raise ValueError("Exported router differs from the selected public-validation policy")
+    return measured, manifest
