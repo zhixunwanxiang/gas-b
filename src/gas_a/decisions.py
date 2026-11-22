@@ -1,15 +1,19 @@
 """Train-only decision calibration and a relative-sensor ethanol/acetaldehyde head."""
+# 辅助判别头与校准工具：为容易混淆的类别构建受限修正，参数随模型元数据保存。
+# 调用方必须传入授权训练/校准划分；预测阶段只应用已拟合参数，不接收标签。
 import hashlib
 
 import numpy as np
 
 
 def training_parts(train):
+    # 在授权训练集内部按类划分拟合/保留部分，供辅助头训练和校准使用，不拆用外部验证集。
     labels = np.asarray(train["y"])
     ids = train["ids"]
     calibration = np.zeros(len(labels), dtype=bool)
     for cls in np.unique(labels):
         positions = np.flatnonzero(labels == cls)
+        # ID 哈希只在已知训练标签的类别内部确定可复现的划分顺序，不作为预测特征或标签反推渠道。
         order = sorted(positions, key=lambda i: hashlib.sha256(("gas-cal-v1|" + str(ids[i])).encode()).digest())
         calibration[order[:len(order) // 5]] = True
     def subset(mask):
@@ -98,6 +102,7 @@ def fit_pair(z, y, strength):
 
 
 def apply_decisions(p, z, meta):
+    # 仅应用元数据中已存在的偏置和判别头；当前样本没有标签，也不会在这里拟合新参数。
     head = meta.get("ethanol_ade_head")
     if head is not None:
         rows = np.flatnonzero(np.isin(p.argmax(axis=1), (0,3)))

@@ -1,4 +1,7 @@
 """提供显式启用的时间窗口选择和实测前向反馈，不使用目标窗口数据训练。"""
+# 本地/历史回放的受限自适应策略工具，包含已授权窗口反馈与影子预测评估。
+# 窗口标签必须来自被允许的公开反馈；这些函数的存在不代表 SDK 会提供隐藏标签。
+# 正式入口的策略状态和晋升门槛在 gas_a.evolution，二者的配置字段不能混用。
 import math
 from .data import evaluate, load_model, score_predictions
 from .io import CLASSES, digest, history, read_json, stamp

@@ -1,4 +1,6 @@
 """Local tools with explicit baseline/resume, public data, and selected model paths."""
+# 显式路径的本地训练/预测/评估命令：由用户指定官方基线或实际已选检查点。
+# 这些工具不替代平台的 rnd.history、真实模型调用、产物上传及 finish 回执。
 import argparse
 import json
 import os
@@ -17,6 +19,8 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def train_main(argv=None):
+    # 官方基线模式核对 baseline-info 摘要；续训模式必须显式给出模型和公开数据路径。
+    # 它只做数值实验，不自动完成平台真实模型规划/选版和提交回执。
     parser = argparse.ArgumentParser(description="Continue an explicit official baseline or selected checkpoint on public JSONL.")
     origin = parser.add_mutually_exclusive_group(required=True)
     origin.add_argument("--baseline-dir", type=Path, help="official package containing checkpoint.npz, baseline-info.json, public/")
@@ -92,6 +96,7 @@ def train_main(argv=None):
 
 
 def predict_main(argv=None):
+    # 加载明确指定的完整产物，通过 SDK 的逐行服务返回结果，日志与协议输出分离。
     parser = argparse.ArgumentParser(description="Predict JSONL from an explicit selected checkpoint; flush every row.")
     parser.add_argument("--checkpoint", required=True, type=Path)
     parser.add_argument("--input", type=Path, help="JSONL requests; defaults to stdin")
@@ -114,6 +119,7 @@ def predict_main(argv=None):
 
 
 def evaluate_main(argv=None):
+    # 以调用者明确提供的授权带标签数据测量指定模型，不将该分数标为隐藏测试成绩。
     parser = argparse.ArgumentParser(description="Evaluate any selected task A checkpoint against explicit public validation JSONL.")
     parser.add_argument("--checkpoint", required=True, type=Path)
     parser.add_argument("--validation", required=True, type=Path)

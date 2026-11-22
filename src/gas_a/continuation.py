@@ -1,4 +1,6 @@
 """Record and verify the actual parent state used by every continuation path."""
+# 续训证明与完整预测器衔接：核对宿主父检查点，记录权重、Adam、标准化和累计训练状态。
+# 单个神经组件的 epoch 分数与完整路由包分数分别记录，最终选版比较完整预测器。
 import hashlib
 from pathlib import Path
 import json
@@ -12,12 +14,14 @@ from .sensor_training.optimize import train_candidate
 
 
 def _arrays(values):
+    # 为每个数值张量保存原始字节摘要、dtype 和形状，使权重与优化器继承关系可独立核验。
     return {name: {"sha256": "sha256:" + hashlib.sha256(value.tobytes()).hexdigest(),
                    "dtype": str(value.dtype), "shape": list(value.shape)}
             for name, value in sorted(values.items())}
 
 
 def state_identity(model):
+    # 同时记录权重、Adam 一二阶矩、scaler、seed、目标尺度和累计 epoch/step，避免只证明权重被读过。
     return {"epochs": model.meta["epochs"], "steps": model.meta["steps"],
             "seed": model.meta["seed"], "target_mean": model.meta["target_mean"],
             "target_scale": model.meta["target_scale"],
@@ -29,6 +33,8 @@ def state_identity(model):
 def continue_candidate(parent_path, train, validation, directory, spec, diagnosis, limits,
                        *, expected_parent_sha256=None, parent_artifact_id=None):
     """Load the supplied parent, continue it, and persist a verifiable parent/child record."""
+    # 先核对父文件，再训练主组件；如需路由则从各实际父组件构建完整新包。
+    # 导出后重新加载并核对父文件未改、scaler 未改、计数增加，最后写入父子状态证据。
     from .frozen_router import FrozenRouter, build_bundle, load_predictor
     started, cpu_started = time.monotonic(), time.process_time()
     parent_path = Path(parent_path)
@@ -44,11 +50,13 @@ def continue_candidate(parent_path, train, validation, directory, spec, diagnosi
         from .sensor_training.data import evaluate
         # A routed parent is compared as a complete predictor, never silently
         # replaced by its primary component's weaker validation score.
+        # 逐 epoch 参考仍是完整父预测器；不能为了让新主组件容易过关而换成较弱的主组件父分数。
         primary_limits["controller_checkpoint_reference"] = evaluate(parent_predictor, validation)
         primary_limits["controller_checkpoint_reference_sha256"] = parent_sha
     report = train_candidate(parent_path, train, validation, directory, spec, diagnosis, primary_limits)
     if spec.get("routing") or isinstance(parent_predictor, FrozenRouter):
         from .sensor_training.data import evaluate
+        # 把神经主组件指标另存 anchor 字段，完整路由的最终收益不得混用逐 epoch 主组件曲线。
         report["anchor_validation_before"] = report["validation_before"]
         report["anchor_validation_after"] = report["validation_after"]
         report["validation_before"] = evaluate(parent_predictor, validation)
@@ -70,6 +78,7 @@ def continue_candidate(parent_path, train, validation, directory, spec, diagnosi
         write_json(Path(directory) / "experiment.json", report)
     child_path = Path(directory) / "checkpoint.npz"
     child = load_model(child_path, train["paths"])
+    # 比较导出后的真实文件状态，核对 scaler/seed/目标尺度未改及累计训练量增加，而非只相信报告文字。
     preserved = (
         np.array_equal(parent.mean, child.mean) and np.array_equal(parent.scale, child.scale)
         and all(parent.meta[k] == child.meta[k] for k in ("seed", "target_mean", "target_scale"))

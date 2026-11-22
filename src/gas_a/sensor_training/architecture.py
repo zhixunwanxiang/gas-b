@@ -1,4 +1,6 @@
 """任务 A 的显式架构迁移：嵌入父权重与 Adam 状态，扩宽及添加恒等残差层。"""
+# 可选架构扩展：保留父网络有效块及 Adam 状态，新增连接按保函数规则初始化，新残差层初始为恒等映射。
+# 扩展后、续训前验证预测一致；平台默认菜单是否启用架构变化仍由上层配置和调用路径决定。
 import copy
 import json
 import math
@@ -214,6 +216,7 @@ def load_checkpoint(path):
 
 def migrate_parent(parent, request, parent_sha):
     """只扩展父模型；旧张量及 Adam 矩逐元素保留，新张量的 Adam 矩为零。"""
+    # 扩宽/加层先嵌入父参数与动量，新增有效通路初始化为零或恒等，再由调用方验证预测未变。
     parent.validate()
     if (parent.meta.get("profile") != "A" or parent.meta["task"] != "classification"
             or parent.meta["classes"] != CLASSES or len(parent.meta["paths"]) != 128

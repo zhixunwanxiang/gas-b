@@ -1,4 +1,6 @@
 """Continue an explicitly supplied baseline/resume checkpoint; retain train_home for local analysis."""
+# 本地重建工具：命令行走显式父模型续训，历史 home 重建保留为兼容工具。
+# 命令行参数与实际数据来源决定执行范围，不通过固定文件名猜测平台输入。
 import os
 from pathlib import Path
 import sys

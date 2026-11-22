@@ -1,4 +1,6 @@
 """任务 A 的数据和模型边界：仅接收 128 维特征，隔离 train/validation 并统一评估指标。"""
+# 数据边界：id 和 answer 均不能成为特征，输入固定为 128 维 features。
+# train 与 validation 必须有相同特征顺序且样本 ID 不重叠；评估不修改模型状态。
 import numpy as np
 from .io import CLASSES
 from .reference.data import read_dataset, json_value
@@ -52,6 +54,7 @@ def load_data(path, expected_paths=None):
 
 def load_pair(train_path, validation_path):
     """按相同特征 schema 加载 train 和 validation，并拒绝两者出现相同样本 ID。"""
+    # id 只用于样本唯一性和划分交叉检查；同名或匿名标识不参与特征，也不用于推断标签。
     train = load_data(train_path)
     # validation 沿用 train 的特征路径与顺序，防止维度相同但语义错位。
     validation = load_data(validation_path, train["paths"])
@@ -91,6 +94,8 @@ def evaluate(model, data):
 
 def score_predictions(probabilities, expected, prediction_seconds=0.0):
     """直接为已保存的预测计算指标，不重新推理或更新模型。"""
+    # 混淆矩阵的行是真实类别、列是预测类别，F1=2TP/(真实支持数+预测数)。
+    # 遵循参考口径，只平均真实或预测出现过的类别；不能把它与固定补零六类口径混算。
     probabilities = np.asarray(probabilities)
     expected = np.asarray(expected)
     if (probabilities.shape != (len(expected), 6) or not len(expected)

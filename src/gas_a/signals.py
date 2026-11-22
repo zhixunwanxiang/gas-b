@@ -1,4 +1,6 @@
 """Feature-only DAT reads, delayed labels, causal drift correction, and expert fusion."""
+# 特征流工具：DAT 读取和延迟标签用于历史回放，Flatline/correct/专家融合也供冻结路由使用。
+# 正式 predict 只使用其中的特征处理路径；reveal_labels 不能成为平台预测的依赖。
 from collections import deque
 from pathlib import Path
 import numpy as np
@@ -35,6 +37,7 @@ def dat_inputs(path, paths):
 
 def reveal_labels(path, features):
     """确认 DAT 文件与预测提交时的摘要一致后再解析标签，防止评分数据被替换。"""
+    # 仅供已授权公开 DAT 的历史回放使用；先核对预测提交时的文件摘要，再允许揭示同批标签。
     if digest(path) != features["sha256"]:
         raise ValueError("Window changed after prediction commitment")
     labels = []
@@ -56,6 +59,7 @@ class Flatline:
         self.window = deque(maxlen=8)
 
     def predict(self, readings):
+        # 平线检测随特征顺序推进，只使用当前及过去特征；不会查看未来样本或真实分类结果。
         out = np.zeros(len(readings), dtype=bool)
         for i, row in enumerate(readings):
             self.window.append(row / self.scale)
@@ -65,6 +69,7 @@ class Flatline:
 
 
 def correct(x, reference, state):
+    # 特征修正维护滚动窗口和累计状态，调用方决定是否启用；这不是标签监督的误差校正。
     buf, shift, count = state
     corrected = np.empty_like(x, dtype=float)
     for i, z in enumerate((x - reference.mean) / reference.scale):
@@ -77,6 +82,7 @@ def correct(x, reference, state):
 
 
 def home_probabilities(bundle, adjusted, cutoffs):
+    # 用已训练的全输入专家和成对判别头生成概率，阈值来自训练阶段保存的 cutoffs。
     left, right, logits = bundle.inputs(adjusted)
     probabilities = (left + right) / 2
     initial = probabilities.argmax(1)

@@ -1,4 +1,7 @@
 """Real 27B + immutable image, with a live SwanLab experiment audit trail."""
+# 完整真实测试总控：固定镜像与源码 → 创建一个私有云端 Run → 正常阶段 → 独立故障回滚 → 归档和回读。
+# 内部六个或更多 SDK 回合属于同一组实验，不能把三次历史实验记录说成三组独立重复测试。
+# 这是会产生真实模型费用的宿主脚本，比赛镜像不包含密钥和该网络调用环境。
 import argparse
 from datetime import datetime, timezone, timedelta
 import hashlib
@@ -21,6 +24,7 @@ DEFAULT_IMAGE_ID = "sha256:388fb0d9721fa11d0cb9befcb6dee6dbadb23597dfdb59415913d
 
 
 def snapshot(out, baseline):
+    # 复制本次精确运行源码、SDK wheel 和官方公开输入，记录源码摘要；不包含 .env 或本机归档权重。
     files = list((ROOT / "src/gas_a").rglob("*.py"))
     files += [ROOT / name for name in ("harness.py", "contest_submission.py", "submission_config.json", "Dockerfile",
               ".dockerignore", ".python-version", "requirements.txt", "requirements-platform.txt", "run.py", "rebuild_models.py",
@@ -45,6 +49,8 @@ def snapshot(out, baseline):
 
 
 def main():
+    # 预检完整通过后才调用真实模型；外层 journal 为整组运行留档，finally 负责终态收尾。
+    # 正常或回滚未达标、云端内容回查失败都会返回非零退出码，不能只凭进程跑完宣布通过。
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -76,6 +82,7 @@ def main():
                             context=args.docker_context, expected_id=args.expected_image_id)
     probe = runtime.preflight()
     source = snapshot(out, baseline)
+    # 镜像文件采用字节摘要比对，注释变化也会使旧镜像与当前源码不一致；需要源码一致时应重新构建镜像。
     app_files = {name: digest for name, digest in source.items()
                  if name.startswith("src/") or name in ("harness.py", "contest_submission.py", "submission_config.json",
                                                        "requirements.txt", "vendor/contest_harness-1.0.4-py3-none-any.whl")}
@@ -95,20 +102,24 @@ def main():
                    "public_validation_only": True, "hidden_labels_available": False}
     timestamp = datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m%d-%H%M%S")
     journal = CloudJournal(swanlab, config, out, task_config, "gas-a-v4-real-cloud-" + timestamp)
+    # 只给原网关和已完成回合增加留档包装，不替换真实模型返回或绕开选手硬门槛。
     original_gateway, original_round = live.RealGateway, live.run_native_round
 
     class LoggedGateway(original_gateway):
         def invoke(self, frame, start):
+            # 在原真实网关前后留档，实际请求仍由原实现发送；原始响应按原样交回选手 SDK。
             journal.before_call(frame, start)
             call_id, response, bound = super().invoke(frame, start)
             journal.after_call(call_id, response, bound)
             return call_id, response, bound
 
     def logged_round(host, directory, state, dataset_root):
+        # 先执行真实协议回合并拿到完成确认，再记云端 round_record，防止把启动成功算作回合完成。
         original_round(host, directory, state, dataset_root)
         journal.after_round(host)
 
     def run_phase(phase, budget, recovery=None):
+        # 正常和回滚复用同一云端 Run，但各自使用新输出目录与单独调用预算；代码不注入预设 AI 决定。
         journal.phase = phase
         argv = ["test_real_sdk.py", "--baseline-dir", str(baseline), "--output", str(out / phase),
                 "--env-file", str(args.env_file), "--image", args.image, "--expected-image-id", args.expected_image_id,
@@ -137,6 +148,7 @@ def main():
             print(json.dumps({"event": "cloud_run_started", "url": journal.receipt["url"]}), flush=True)
             result["normal_exit_code"] = run_phase("normal", args.normal_max_calls)
             write_receipt(out / "suite.json", result)
+            # 正常阶段先满足公开基线和三次历史实验要求，再用同一组历史产物做独立回滚演练。
             if result["normal_exit_code"] == 0:
                 result["recovery_exit_code"] = run_phase("recovery", args.recovery_max_calls, out / "normal")
             passed = result["normal_exit_code"] == 0 and result["recovery_exit_code"] == 0
@@ -150,6 +162,7 @@ def main():
                           "suite/complete_history_cycles": sum(r["complete_history_experiment_decision"] for r in journal.rounds)})
             result["status"] = "experiment_completed" if passed else "requirements_unmet"
             write_receipt(out / "suite.json", result)
+            # 先把模型、协议、状态、公开输入和精确源码归档上传，再结束云端实验；云端回读验证发生在结束之后。
             journal.archive()
             finish_state = "success" if passed else "crashed"
         except BaseException as caught:

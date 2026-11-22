@@ -1,4 +1,6 @@
 """Dynamic task-A entry: platform commands, local continuation, and explicit replay."""
+# 本地统一命令分发：平台 describe/train/predict 与本地工具分别走各自入口。
+# 历史 replay 依赖批后公开标签反馈，不用于平台的独立逐行预测。
 import os
 from pathlib import Path
 import sys

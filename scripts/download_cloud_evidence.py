@@ -1,4 +1,6 @@
 """Download and check an experiment's evidence ZIP; no model calls or cloud writes."""
+# 只读证据恢复：可从云端独立下载 ZIP，或按本地事件日志核对文本、关键指标和归档。
+# 不创建/恢复云端运行、不调用模型、不自动解压，也不覆盖已有下载目标。
 import argparse
 import base64
 import hashlib
@@ -16,6 +18,8 @@ from scripts.live_platforms import SWANLAB_HOST, check_run, load_env
 
 def download_bundle(remote, output):
     """Validate all chunk metadata and hashes before creating a new local file."""
+    # 只接受 HTTPS 媒体 URL，授权签名由媒体地址携带，不附加宿主 API 密钥。
+    # 核对清单、分块序号/数量/整包身份、每块与整包摘要后才独占新建 ZIP 文件，避免覆盖旧证据。
     output = Path(output)
     if output.exists():
         raise FileExistsError("Output already exists; choose a new file")
@@ -56,6 +60,7 @@ def download_bundle(remote, output):
 
 
 def main():
+    # 下载模式只需云端 Run 路径；本地核验模式需要完整事件日志并额外比对文本和标量。
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env-file", type=Path, default=ROOT / ".env")
     mode = parser.add_mutually_exclusive_group(required=True)

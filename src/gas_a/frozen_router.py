@@ -1,4 +1,7 @@
 """Select routing on authorized public validation; predict without label feedback."""
+# 正式无标签路由包：训练阶段用授权公开验证集选择路由，导出后冻结权重和类别对策略。
+# 预测时只允许更新由已见特征形成的流状态，既不读取真实标签，也不等待批后反馈。
+# 主检查点、路由清单和全部专家组件共同构成一个产物，加载与回滚必须校验完整集合。
 from collections import deque
 from copy import deepcopy
 import json
@@ -24,6 +27,7 @@ COMPONENTS = ("four_sensor", "five_sensor", "home_trunk", "home_router")
 
 
 def _relative(root, name):
+    # 路由清单只接受产物内的普通相对路径，拒绝盘符、反斜杠和上级目录引用。
     if (not isinstance(name, str) or not name or "\\" in name or ":" in name
             or PurePosixPath(name).is_absolute() or any(p in ("", ".", "..") for p in name.split("/"))):
         raise ValueError("Bundle paths must be relative artifact paths")
@@ -31,11 +35,13 @@ def _relative(root, name):
 
 
 def _new_stream(reference):
+    # 为一个新预测流建立空的特征窗口与平线检测器，不保存任何标签或误差反馈。
     return {"drift": (deque(maxlen=128), np.zeros(128), 0),
             "flatline": Flatline(reference.scale[96:104])}
 
 
 def _expert_scores(models, policy, x, stream):
+    # 计算四/五传感器及全输入专家分数；可选特征修正与平线告警仅由已见输入产生。
     reference = models["four_sensor"]
     alarm = stream["flatline"].predict(x[:, 96:104])
     if policy["feature_correction"]:
@@ -51,7 +57,10 @@ def _expert_scores(models, policy, x, stream):
 
 
 def route_scores(scores, policy):
+    # 先融合 home/five 挑战者，再仅对冻结的类别对且无平线告警的样本融合挑战者与 four。
+    # 类别对及权重来自导出策略，预测时不根据真实标签重新选择路由。
     four, five, home, alarm = scores
+    # 内层权重决定 home/five 占比，外层权重只用于已启用类别对；平线告警样本保留 four。
     challenger = (1 - policy["inner_weight"]) * home + policy["inner_weight"] * five
     codes = pair_codes(four.argmax(1), challenger.argmax(1))
     selected = ~alarm & np.isin(codes, policy["active_pairs"])
@@ -64,6 +73,7 @@ def route_scores(scores, policy):
 class FrozenRouter:
     """Immutable label-selected policy; streaming state contains features only."""
     def __init__(self, models, manifest, component_paths, manifest_path):
+        # 复制冻结策略并创建该进程专属特征流状态，防止外部字典修改改变已加载策略。
         self.models = models
         self.manifest = manifest
         self.component_paths = component_paths
@@ -74,16 +84,20 @@ class FrozenRouter:
 
     def predict(self, x):
         # Independent evaluation starts from the same empty state as a new process.
+        # 批量独立评估从空状态开始，确保每次公开测量不继承之前评测的特征窗口。
         x = np.asarray(x, dtype=np.float64)
         scores = _expert_scores(self.models, self.policy, x, _new_stream(self.models["four_sensor"]))
         return route_scores(scores, self.policy)
 
     def predict_one(self, x):
+        # 平台逐行预测沿用本进程特征流状态；它与整批从空状态按顺序处理保持相同语义。
         return route_scores(_expert_scores(self.models, self.policy, x, self._stream), self.policy)
 
 
 def load_predictor(checkpoint, paths=None, resolve_file=None):
     """Load a plain MLP or its complete frozen bundle; verify every used component."""
+    # 先加载主 MLP，再依据标记读取清单；每个组件都需通过路径、摘要、类别顺序和 scaler 一致性检查。
+    # resolve_file 由 SDK 场景注入，用于强制所有被引用组件都已在产物声明中出现。
     checkpoint = Path(checkpoint)
     resolve_file = (lambda path: path) if resolve_file is None else resolve_file
     anchor = load_model(resolve_file(checkpoint), paths)
@@ -111,6 +125,7 @@ def load_predictor(checkpoint, paths=None, resolve_file=None):
             or any(not 0 < policy["cutoffs"][k]["cut"] < 1 for k in ("0", "1"))):
         raise ValueError("Invalid frozen routing policy")
     models, component_paths = {}, {}
+    # 对所有实际使用的组件逐一验证字节摘要与 scaler，防止部分回滚或混装不同版本。
     for role in COMPONENTS:
         entry = manifest["components"][role]
         path = resolve_file(_relative(root, entry["path"]))
@@ -127,6 +142,7 @@ def load_predictor(checkpoint, paths=None, resolve_file=None):
 
 
 def checkpoint_paths(checkpoint):
+    # 声明完整路由需要的四个检查点；只上传主 MLP 会使平台恢复后无法重建同一预测器。
     model = load_predictor(checkpoint)
     if not isinstance(model, FrozenRouter):
         return [Path(checkpoint).name]
@@ -136,6 +152,8 @@ def checkpoint_paths(checkpoint):
 
 def calibrate_policy(models, validation, cutoffs, search):
     """Compare a bounded family of class-pair policies using validation labels only."""
+    # 在有上限的修正开关/融合权重菜单中，逐个类别对尝试加入路由。
+    # 支持数不足或没有严格公开验证增益的类别对不启用；最后还必须通过外层整体晋升门槛。
     weights = search["inner_weights"]
     minimum_support, minimum_gain = search["minimum_support"], search["minimum_macro_f1_gain"]
     corrections = search["correction_choices"]
@@ -146,6 +164,7 @@ def calibrate_policy(models, validation, cutoffs, search):
             or any(type(v) is not bool for v in corrections)
             or not isinstance(minimum_gain, (int, float)) or not np.isfinite(minimum_gain) or minimum_gain < 0):
         raise ValueError("Invalid bounded routing search")
+    # 初始 active_pairs 为空，相当于安全保留 four；只有得到公开验证增益的类别对才逐步开启。
     base = {"inner_weight": .75, "outer_weight": .6, "active_pairs": [], "cutoffs": cutoffs,
             "feature_correction": False}
     y = validation["y"]
@@ -163,6 +182,7 @@ def calibrate_policy(models, validation, cutoffs, search):
             current = score_predictions(scores[0], y)
             for a, b in PAIRS:
                 code = 6*a+b
+                # 支持数按实际会触发这条路由的样本统计；过少样本不据此校准一个新分支。
                 support = int(np.count_nonzero(~scores[3] & (codes == code)))
                 if support < minimum_support:
                     continue
@@ -182,6 +202,7 @@ def calibrate_policy(models, validation, cutoffs, search):
 
 
 def _replace_checkpoint(model, target):
+    # 在同一目录写新临时检查点后原子替换，避免清单标记写入一半留下损坏模型。
     handle, temporary = tempfile.mkstemp(prefix=".bundle-", suffix=".npz", dir=target.parent)
     os.close(handle)
     Path(temporary).unlink()  # Model.save exclusively creates a new file.
@@ -194,8 +215,11 @@ def _replace_checkpoint(model, target):
 
 def build_bundle(parent_path, parent_predictor, train, validation, candidate, spec, diagnosis, limits, started):
     """Continue each expert from its actual parent, then select and freeze routing."""
+    # 主组件由前序训练完成，辅助专家分别从真实父路径续训，共享本候选剩余时间预算。
+    # 训练完成后校准并冻结路由，保存全部组件摘要，再重载完整包验证导出预测与选版测量一致。
     from .continuation import state_identity
     def remaining():
+        # 每个子阶段都扣除前面已经消耗的墙钟时间，不能给每个专家重置一份完整候选预算。
         value = limits["max_seconds_per_candidate"] - (time.monotonic() - started)
         if value <= 0:
             raise TimeoutError("Routed candidate exceeded CPU wall-time budget")
@@ -226,6 +250,7 @@ def build_bundle(parent_path, parent_predictor, train, validation, candidate, sp
     home_report = train_home(home_before, train, routing["home"], aux,
                              max_epochs=limits["max_epochs"],
                              deadline=started + limits["max_seconds_per_candidate"])
+    # 成对头阈值使用 train 内折外结果，公开 validation 只决定完整专家融合及类别对。
     cutoffs = binary_cutoffs(home_before, train["x"], train["y"])
     cutoffs = {k: {"cut": value["cut"]} for k, value in cutoffs.items()}
     models = {"four_sensor": load_model(anchor_path), "five_sensor": load_model(aux / "five_sensor.npz"),
@@ -240,6 +265,7 @@ def build_bundle(parent_path, parent_predictor, train, validation, candidate, sp
     policy, calibration = calibrate_policy(models, validation, cutoffs, routing["selection"])
     remaining()
     anchor = models["four_sensor"]
+    # 先把主检查点标记为完整路由入口，再计算各组件摘要和清单，保证平台从主文件能找回整包。
     anchor.meta["prediction_bundle"] = {"format": FORMAT, "manifest": MANIFEST}
     _replace_checkpoint(anchor, anchor_path)
     files = {"four_sensor": anchor_path, **{k: aux / (k + ".npz") for k in COMPONENTS[1:]}}
@@ -258,6 +284,7 @@ def build_bundle(parent_path, parent_predictor, train, validation, candidate, sp
                  "trunk_final_state": state_identity(models["home_trunk"]),
                  "router_final_state": state_identity(models["home_router"]), "training_rows": len(train["y"])},
     })
+    # 必须按最终磁盘文件重载复评，验证组件复制和清单导出没有改变训练时测得的预测。
     predictor = load_predictor(anchor_path, train["paths"])
     measured = evaluate(predictor, validation)
     if abs(measured["macro_f1"] - calibration["selected_metrics"]["macro_f1"]) > 1e-12:

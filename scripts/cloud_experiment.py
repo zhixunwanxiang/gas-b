@@ -3,6 +3,9 @@
 Public-cloud Text media store complete JSON records and a reversible evidence
 archive; swanlab.save() is not used (it is private-deployment-only).
 """
+# 宿主端云端留档：记录真实请求回复、每轮证据、指标和完整归档，然后只读回查内容与终态。
+# 一个 CloudJournal 对应一个 SwanLab Run，可包含多个 SDK 回合；完整历史实验次数由每轮实际记录计算。
+# API 密钥只在宿主使用；公有云归档使用 Text 分块，不使用仅适用于私有部署的 swanlab.save。
 import base64
 import hashlib
 import json
@@ -17,6 +20,7 @@ from scripts.live_platforms import SWANLAB_HOST, write_receipt, verify_finish
 
 
 def json_text(value):
+    # 固定键序并禁止 NaN，保证本地事件和云端 Text 的字节摘要可直接比较。
     return json.dumps(value, ensure_ascii=False, sort_keys=True, allow_nan=False, separators=(",", ":"))
 
 
@@ -25,6 +29,7 @@ def sha(data):
 
 
 def media_items(payload):
+    # 展开 SwanLab 媒体的键、记录步数和文件条目；媒体步数仍使用 index 字段。
     for series in payload.get("list", []):
         for point in series.get("metrics", []):
             for item in point.get("items", []):
@@ -33,6 +38,7 @@ def media_items(payload):
 
 class CloudJournal:
     def __init__(self, sdk, config, output, experiment_config, name):
+        # 先生成本次独有的 Run ID 并持久化回执，再做任何云端初始化，便于中断后追踪。
         self.sdk, self.config, self.output = sdk, config, Path(output)
         self.experiment_config, self.name = experiment_config, name
         self.run, self.api = None, None
@@ -53,6 +59,7 @@ class CloudJournal:
     @classmethod
     def resume_verification(cls, sdk, output):
         """Rebuild only the read-back state; never init, resume, or finish a run."""
+        # 仅从既有回执和事件日志重建核验状态，不调用 init/resume/finish，不重新训练或计费。
         obj = cls.__new__(cls)
         obj.sdk, obj.output = sdk, Path(output)
         obj.receipt = json.loads((obj.output / "cloud-receipt.json").read_text(encoding="utf-8"))
@@ -73,10 +80,13 @@ class CloudJournal:
         return obj
 
     def _check(self, data):
+        # 上传前查找当前宿主密钥原始字节，阻止把授权头或误拼接的凭证写入云端证据。
         if any(secret in data for secret in self.secrets):
             raise ValueError("Refusing to upload credential-containing evidence")
 
     def begin(self):
+        # 拒绝覆盖已有无关 Run，关闭终端/环境/Git 探针并创建本次私有实验。
+        # 只在这里初始化一次，因此正常和回滚各轮都属于同一个 SwanLab Run。
         if self.sdk.has_run():
             raise RuntimeError("An unrelated SwanLab run is already active")
         self.sdk.login(api_key=os.environ["SWANLAB_API_KEY"], host=SWANLAB_HOST, save=False)
@@ -91,6 +101,7 @@ class CloudJournal:
         settings = self.sdk.Settings(interactive=False, api_host=SWANLAB_HOST, web_host="https://swanlab.cn",
             probe={name: False for name in ("hardware", "runtime", "requirements", "conda", "git", "swanlab", "monitor")},
             terminal={"proxy_type": "none"})
+        # 一次总测试仅在这里创建一个云端 Run；每轮通过 log 的不同 step 和 round_record 区分。
         self.run = self.sdk.init(project=self.config["project"], workspace=owner, id=self.run_id,
                                 resume="allow", name=self.name, public=False, config=self.experiment_config,
                                 mode="online", on_online_error="raise", settings=settings,
@@ -102,6 +113,8 @@ class CloudJournal:
         self.emit(texts={"suite/configuration": self.experiment_config})
 
     def emit(self, scalars=None, texts=None):
+        # 先写本地 JSONL，再按同一步数上传标量和完整文本，并保存每条文本摘要。
+        # 网络日志失败保留本地证据并记错，不丢弃已经返回的真实模型响应；最终回读仍会暴露缺失。
         self.step += 1
         values = dict(scalars or {})
         payloads = {}
@@ -126,6 +139,7 @@ class CloudJournal:
             self._save()
 
     def before_call(self, frame, start):
+        # 记录选手通过 SDK 真正发出的模型请求；调用尝试数与已核验响应数分开统计。
         self.emit(scalars={"calls/attempted": len(self.scalars_for("calls/attempted")) + 1},
                   texts={"calls/request": {"session": self.phase, "round_index": start["round_index"],
                          "sdk_model_request": frame}})
@@ -134,14 +148,18 @@ class CloudJournal:
         return {step: value for (name, step), value in self.scalars.items() if name == key}
 
     def after_call(self, call_id, response, request_messages):
+        # 记录实际提供方响应及绑定后的消息，不替换、补写或改造模型选择。
         self.emit(scalars={"calls/verified": len(self.scalars_for("calls/verified")) + 1},
                   texts={"calls/response": {"session": self.phase, "call_id": call_id,
                          "response": response, "bound_messages": request_messages}})
 
     def after_round(self, host):
+        # 调用方已等待镜像 finish 确认并退出成功，才把本轮状态和训练报告计入完成记录。
+        # 完整历史实验要求正常阶段、非空历史、真实提交候选及实际模型调用，首轮与观察回合不凑数。
         state = host.saved_state
         record = json.loads((state / "decisions.jsonl").read_text(encoding="utf-8").splitlines()[-1])
         finish = host.record
+        # 三次完整记录按真实历史引用+候选提交+模型回执计算，不是三次模型请求或三条页面列表。
         complete = bool(self.phase == "normal" and finish["history_ids"] and host.candidate
                         and finish["model_call_ids"])
         entry = {"session": self.phase, "round_index": host.frame["round_index"],
@@ -180,6 +198,8 @@ class CloudJournal:
         self._save()
 
     def archive(self):
+        # 只归档指定运行目录、复现源码和公开基线普通文件，排除云端凭证/日志探针与镜像 tar。
+        # ZIP 按 384 KiB 原始块转为 base64 Text，记录整包和分块摘要，之后可以完全逆向恢复。
         path = self.output / "evidence-bundle.zip"
         included = []
         roots = ("normal", "recovery", "reproduction", "official-baseline")
@@ -197,6 +217,7 @@ class CloudJournal:
                 self._check(data)
                 zipped.writestr(item.relative_to(self.output).as_posix(), data)
         data = path.read_bytes()
+        # base64 会扩大体积，因此限制原始块大小；单个 Text 是可还原文件块，不是训练指标。
         chunk_size = 384 * 1024
         count = (len(data) + chunk_size - 1) // chunk_size
         self.bundle = {"format": "base64-zip-chunks-v1", "sha256": sha(data), "bytes": len(data),
@@ -211,9 +232,12 @@ class CloudJournal:
         self._save()
 
     def finish(self, state):
+        # 只结束本次 ID 的 Run；即使初始化中断，也不能误关其他活动实验。
+        # finish 返回后另用 API 读取终态，未确认的结果标为 needs_attention，而不是默认完成。
         self.receipt.update(phase="finishing", desired_finish_state=state)
         self._save()
         owned = self.run
+        # 初始化可能创建了 SDK 活动对象但还没返回给 self.run；只在 ID 一致时接管收尾。
         if owned is None and self.sdk.has_run():
             candidate = self.sdk.get_run()
             owned = candidate if candidate.id == self.run_id else None
@@ -233,9 +257,12 @@ class CloudJournal:
         self._save()
 
     def verify_cloud(self):
+        # 等媒体索引完整后逐条下载校验文本，再重组完整 ZIP，并核对关键标量的步数和值。
+        # 索引延迟只触发只读重查；它不能重新调用模型、重发训练或伪造缺失数据。
         if not self.receipt["cloud_finish_verified"]:
             raise RuntimeError("Cloud terminal state is not verified")
         media_keys = {key for key, _ in self.texts}
+        # 云端已结束不代表媒体索引立即完整；只读等待索引，不重新提交日志、模型调用或 finish。
         for attempt in range(6):
             remote = self.api.run(self.receipt["run_path"])
             payload = remote.medias(keys=sorted(media_keys), all=True)
@@ -268,6 +295,7 @@ class CloudJournal:
         assert sha(restored) == self.bundle["sha256"]
         restore_path = self.output / "cloud-downloaded-evidence.zip"
         restore_path.write_bytes(restored)
+        # 完整 Text 已逐条核对；关键标量另比对步骤和值，避免页面曲线来自错误轮次或分数。
         scalar_keys = ["normal/selected_macro_f1", "normal/complete_history_cycle", "recovery/selected_macro_f1"]
         actual = remote.metrics(keys=scalar_keys, all=True)
         verified_values = 0

@@ -2,6 +2,9 @@
 
 The host attaches the official prompt. These are participant instructions only.
 """
+# 27B 决策证据组装：PLAN 用于实验规划，SELECT 用于已有测量后的产物选择。
+# 官方任务提示由宿主注入，这里仅维护选手侧提示和结构化证据，不能重复附加 rnd.prompt。
+# 下面的提示词字符串会实际发送给模型；本次中文说明只使用注释，不修改提示内容。
 import hashlib
 import json
 
@@ -27,6 +30,7 @@ reason 简短列出：同口径父/候选/历史分数、关键类别召回或�
 
 
 def execution_policy(controller, limits):
+    # 把逐 epoch 选择、最终晋升和训练预算绑定为可序列化证据，供历史可比性和实验指纹使用。
     return {"epoch_policy_version": EPOCH_POLICY_VERSION,
             "host_admission_policy_version": "explicit-public-scope-and-digest-v1",
             "promotion_gate": {key: controller[key] for key in (
@@ -35,6 +39,7 @@ def execution_policy(controller, limits):
 
 
 def admission(before, controller):
+    # 把程序门槛转换成模型可直接比较的最低 F1 和逐类召回底线，并明确小样本未保护类别。
     support = controller["minimum_class_support"]
     return {"scope": "same_authorized_public_validation",
             "parent_macro_f1": before["macro_f1"],
@@ -49,6 +54,7 @@ def admission(before, controller):
 
 
 def history_feedback(history, parent_sha, train_sha, validation_sha, policy, menu):
+    # 解释历史失败属于召回超限、宿主拒绝还是无提升，并分别标注父模型/数据/配置是否相同。
     rows = []
     for item in history:
         cfg = item.get("configuration", {})
@@ -80,6 +86,7 @@ def history_feedback(history, parent_sha, train_sha, validation_sha, policy, men
 
 
 def enrich_plan(request, controller, train, validation, policy):
+    # 给规划请求补充实验实际能力、类别增强乘数、有限预算和同条件历史反馈，避免 AI 凭名称猜方案。
     weak = request["diagnosis"]["weak_classes"][0]["label"]
     guide = {}
     for name,spec in request["experiments"].items():
@@ -101,6 +108,8 @@ def enrich_plan(request, controller, train, validation, policy):
 
 
 def enrich_selection(request, controller, validation_sha, candidate_gate, checkpoint_selection):
+    # 新候选准入与历史回滚准入分开提供。历史项必须标为本轮复评且验证摘要相同。
+    # 没有新候选时 candidate_gate 可以为 None；不能把它误读为历史产物也不合格。
     allowed = request["response_schema"]["selected_artifact_id"]
     historical = {}
     for identifier, item in request["same_local_validation"].get("historical", {}).items():
@@ -121,5 +130,6 @@ def enrich_selection(request, controller, validation_sha, candidate_gate, checkp
 
 
 def request_digest(request):
+    # 固定 JSON 键序和分隔符计算请求摘要，用于追踪真实发送的证据版本，不是模型调用回执。
     raw = json.dumps(request, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")).encode()
     return "sha256:" + hashlib.sha256(raw).hexdigest()

@@ -3,6 +3,9 @@
 The platform supplies the checkpoint and public projection. The local replay
 router, archived batches, and packaged experiment weights are not used here.
 """
+# 平台闭环主控：校验合同与父产物 → 读历史和状态 → 监测诊断 → AI 规划 → 训练/回滚 → 测量选版 → 保存并结束。
+# train 只使用宿主授权的公开数据；predict 独立接收特征，不能依赖训练端标签反馈。
+# 模型/上传等 SDK RPC 一旦结果未知必须终止，不能把它们当成本地数值失败继续处理。
 from functools import lru_cache
 import json
 import math
@@ -31,6 +34,7 @@ PREDICT_ARGV = ["python3", "/app/harness.py", "predict"]
 
 
 def _check_task(task, dataset_key):
+    # 分别核对任务类型与数据集代号，拒绝把其他赛题按六分类合同处理。
     if task != "classification" or dataset_key not in (None, "A"):
         raise ValueError("This submission supports task A classification only")
 
@@ -38,10 +42,13 @@ def _check_task(task, dataset_key):
 @lru_cache(maxsize=1)
 def _prediction_model(path, file_identity=None):
     # Cache only within this prediction process. Each measurement gets a new one.
+    # 每个预测进程内缓存一次完整预测器；文件时间/大小参与键，避免同路径文件变化后误用旧对象。
     return load_predictor(Path(path))
 
 
 def _selected_checkpoint(sample, model_dir):
+    # 优先使用宿主指定的产物路径；否则按 SDK 描述选择唯一相对检查点。
+    # 多文件产物必须明确主文件，不能依赖目录扫描顺序；描述中的文件名必须为无穿越的相对路径。
     explicit = os.environ.get("CONTEST_ARTIFACT_PATH")
     if explicit:
         return Path(explicit).resolve()
@@ -59,6 +66,8 @@ def _selected_checkpoint(sample, model_dir):
 
 
 def predict(sample, model_dir):
+    # 仅接受 features，校验维度、数值和模型特征顺序后返回六类分数。
+    # 这里不读取 answer、历史标签或训练数据；同一预测进程中的特征流状态由模型内部维护。
     _check_task(sample.task, sample.dataset_key)
     inputs = sample.inputs
     if not isinstance(inputs, dict) or set(inputs) != {"features"}:
@@ -81,6 +90,7 @@ def predict(sample, model_dir):
     scores /= scores.sum()
     # The SDK requires a unique top score, including for degenerate checkpoints.
     top = int(scores.argmax())
+    # 仅在最高分并列时施加极小扰动，满足 SDK 唯一最高分约束；不会由 id 或标签参与破除平分。
     if np.count_nonzero(scores == scores[top]) > 1:
         scores *= 1 - 1e-12
         scores[top] += 1e-12
@@ -88,6 +98,8 @@ def predict(sample, model_dir):
 
 
 def _parent_checkpoint(rnd):
+    # 以宿主授权的主检查点摘要定位续训起点；文件还需通过 SDK 声明和摘要校验。
+    # 不能用本地默认权重或旧状态记录替代平台选中的父产物。
     expected = rnd.parent.checkpoint_sha256.removeprefix("sha256:")
     for relative in rnd.parent.descriptor["checkpoint_paths"]:
         checkpoint = rnd.parent.path(relative)  # SDK validates declaration and file digest.
@@ -97,6 +109,8 @@ def _parent_checkpoint(rnd):
 
 
 def _decision(rnd, request, fields, token_limit, validate, corrections=1):
+    # 一次完整返回后才解析并校验 JSON，格式错误允许有限次数的纠正请求。
+    # 纠正请求也是真实调用，必须记录其 call_id；RPC 异常发生在 try 之外，不能吞掉后继续会话。
     call_ids, failures, request_hashes = [], [], []
     for attempt in range(corrections + 1):
         # Never catch an RPC failure: its outcome may be unknown to the SDK.
@@ -131,11 +145,14 @@ def _decision(rnd, request, fields, token_limit, validate, corrections=1):
 
 
 def _read_state(state, name):
+    # 可选状态不存在时返回 None，由调用方建立首轮默认状态；文件存在但内容损坏则显式报错。
     path = state / name
     return json_value(path.read_text(encoding="utf-8")) if path.is_file() else None
 
 
 def _restore_history(rnd, history, run, validation, before, controller):
+    # 只恢复 start 帧允许的历史 ID，限制数量，跳过当前父模型并优先检查最近版本。
+    # 恢复后在本轮公开 validation 重跑完整预测器，再计算回滚资格；不直接信任历史分数。
     receipts = {item["artifact_id"]: item for item in rnd.artifacts}
     order = [item.get("selected_artifact_id") for item in reversed(_history_view(history))]
     order.extend(reversed(list(receipts)))
@@ -153,6 +170,7 @@ def _restore_history(rnd, history, run, validation, before, controller):
             continue
         directory = rnd.restore_artifact(identifier, run / f"restored-{len(restored) + 1}")
         try:
+            # 历史产物可包含源码，但这里只把它当作数据文件保存，不导入或执行历史 Python 代码。
             names = set(receipt["artifact"]["checkpoint_paths"] + receipt["artifact"]["code_paths"])
             def resolve_file(path):
                 relative = Path(path).resolve().relative_to(directory.resolve()).as_posix()
@@ -172,6 +190,8 @@ def _restore_history(rnd, history, run, validation, before, controller):
 
 
 def _history_view(records):
+    # 压缩最近十条历史，保留父/数据/配置摘要、门槛和失败证据以支持可比实验判断。
+    # 只是缩减模型上下文；最终 finish 仍引用本轮实际 history() 读取的全部记录 ID。
     result = []
     for item in records[-10:]:
         record = item.get("record", item)
@@ -203,6 +223,7 @@ def _history_view(records):
 
 def _snapshot(candidate):
     # Explicit code sources only: no local models, data, replay outputs, or secrets.
+    # 按明确源码清单复制可复现代码，避免把本机权重、回放数据、运行目录或密钥混入候选。
     paths = [ROOT / name for name in ("harness.py", "contest_submission.py", "submission_config.json")]
     paths.extend(sorted((ROOT / "src" / "gas_a").rglob("*.py")))
     names = []
@@ -216,12 +237,16 @@ def _snapshot(candidate):
 
 
 def train(rnd):
+    # 本轮只执行一个经过真实模型规划的动作：observe、experiment 或 rollback。
+    # 即使保留父模型也需要真实模型决策、保存记录并等待 SDK 的完成确认；每个回合不等于整个程序只能训练一次。
     _check_task(rnd.task.get("task"), rnd.dataset_key)
     # 1.0.4 has no inline fallback. Fail before data loading or model calls.
     if rnd.limits.get("artifact_upload_protocol") != "chunked-v1":
         raise HarnessError("CHUNKED_UPLOAD_UNSUPPORTED", "SDK 1.0.4 requires a host with chunked-v1 uploads")
+    # 阶段 1：加载固定实验菜单与门槛。大模型只能选择允许项，不能在回复里扩大配置权限。
     config = json.loads((ROOT / "submission_config.json").read_text(encoding="utf-8"))
     validate_controller(config["controller"])
+    # 所有新候选和状态先写独立工作目录；/app、父模型、数据和旧状态挂载均按只读对待。
     work = Path(os.environ.get("CONTEST_WORK", "/workspace")).resolve()
     protected = [ROOT, rnd.parent.root, Path(rnd.data.train_path).parent,
                  Path(rnd.data.validation_path).parent]
@@ -232,6 +257,7 @@ def train(rnd):
         raise ValueError("CONTEST_WORK must be outside read-only code, data, model, and state mounts")
     work.mkdir(parents=True, exist_ok=True)
     run = Path(tempfile.mkdtemp(prefix=f"round-{rnd.round_index:02d}-", dir=work))
+    # 阶段 2：读取宿主实际父产物并在本轮公开验证集测量，后续所有增益都相对这一份完整预测器。
     checkpoint = _parent_checkpoint(rnd)
     train_data, validation = load_pair(rnd.data.train_path, rnd.data.validation_path)
     def parent_file(path):
@@ -239,12 +265,15 @@ def train(rnd):
     parent = load_predictor(checkpoint, train_data["paths"], resolve_file=parent_file)
     before = evaluate(parent, validation)
     host_parent = parent_reference(rnd.frame.get("current_validation"), before, validation["sha256"])
+    # 阶段 3：真正读取平台历史。保存引用的 id 是证明“读过历史”的证据，不能自行编造。
     history = rnd.history()
     menu = {spec["name"]: spec for spec in config["experiments"]}
     controller = config["controller"]
     execution = execution_policy(controller, config["limits"])
     training_limits = {**config["limits"], "controller_checkpoint_gate": execution["promotion_gate"]}
+    # SDK 把只读旧状态复制到可写目录；下面只修改副本，最终通过 save_state 显式提交。
     state = rnd.state_workspace(run / "state")
+    # 阶段 4：首轮仅用 train 拟合监测参考，后续沿用，避免参考跟随漂移一起移动而掩盖变化。
     reference = _read_state(state, "monitor_reference.json")
     if reference is None:
         reference = fit_reference(train_data)
@@ -253,6 +282,7 @@ def train(rnd):
     policy = load_policy(_read_state(state, "strategy.json"), menu)
     # State can describe a rejected candidate or a different artifact. It never
     # overrides the host-selected model or carries its strategy across blindly.
+    # 旧状态不一定对应本轮父模型：先恢复模型配套策略，无法配对时退回保守偏好。
     paired = policy["artifact_policies"].get(rnd.parent.artifact_id)
     if paired:
         policy.update(paired)
@@ -260,6 +290,7 @@ def train(rnd):
         policy.update(version=1, preferred_experiment=None)
     diagnosis = diagnose(before, drift, validation["sha256"], policy.get("last_measurement"))
     allowed_menu, blocked = available_experiments(policy, menu, rnd, train_data, validation, controller, execution)
+    # 阶段 5：历史版本也必须在当前验证数据上复评；父测量口径不可比时不开放回滚动作。
     restored = _restore_history(rnd, history, run, validation, before, controller)
     rollback_ids = [identifier for identifier, item in restored.items()
                     if item["gate"]["eligible"] and host_parent["comparable"]]
@@ -277,6 +308,7 @@ def train(rnd):
         if value["action"] != "rollback" and value["target_artifact_id"] != rnd.parent.artifact_id:
             raise ValueError("Observe and experiment must refer to the actual parent")
 
+    # 阶段 6：把监测、诊断、历史、已测量回滚目标和允许菜单交给真实模型，先提出可验证假设。
     plan_request = enrich_plan({
         "phase": "plan", "round_index": rnd.round_index,
         "request": "Use drift, diagnosis, history and bounded strategy evidence to choose observation, one continuation experiment, or a validated historical rollback. Observation is appropriate when no useful experiment remains.",
@@ -306,6 +338,7 @@ def train(rnd):
                      "validation_scope": "authorized_public_validation", "promotion_rules": controller,
                      "host_parent_reference": host_parent}
     change = "Observed authorized public features and validation; retained the actual parent without training."
+    # 阶段 7：仅 experiment 才执行梯度训练。先持久化 started 记录，失败尝试也不能从实验历史中消失。
     if spec is not None:
         weak_class = diagnosis["weak_classes"][0]["label"]
         candidate = run / "candidate"
@@ -329,6 +362,7 @@ def train(rnd):
             append_jsonl(state / "experiment_attempts.jsonl", {**attempt, "status": "failed", **experiment_failure})
         else:
             append_jsonl(state / "experiment_attempts.jsonl", {**attempt, "status": "trained"})
+    # 阶段 8：训练成功才组装候选；路由包必须声明所有专家检查点和清单，不能只上传主权重。
     if report is not None:
         code_paths = _snapshot(candidate)
         if (candidate / "routing.json").is_file():
@@ -344,6 +378,7 @@ def train(rnd):
         write_json(candidate / "planning.json", {"decision": plan, **planning_calls})
         write_json(candidate / "diagnosis.json", diagnosis)
         write_json(candidate / "monitoring.json", drift)
+        # 上传后宿主会重新测量并返回回执。此 RPC 位于本地训练异常捕获范围之外，失败时不继续发请求。
         submitted = rnd.submit_candidate(
             candidate, hypothesis=plan["hypothesis"], change_summary=change,
             configuration=configuration, seed=parent.meta["seed"],
@@ -353,6 +388,7 @@ def train(rnd):
         host_gate = host_candidate_gate(submitted, host_parent, report["validation_after"],
                                         validation["sha256"], controller)
         configuration["host_candidate_gate"] = host_gate
+    # 阶段 9：程序先收紧可选 ID，父产物始终可保留；新候选必须同时通过本地逐类保护与宿主测量门槛。
     eligible = [rnd.parent.artifact_id]
     if submitted and candidate_gate["eligible"] and host_gate["eligible"]:
         eligible.append(submitted["artifact_id"])
@@ -363,6 +399,7 @@ def train(rnd):
         if value["selected_artifact_id"] not in eligible:
             raise ValueError("Model selected an unknown or regressing artifact")
 
+    # 阶段 10：再次调用真实模型，依据已发生的测量选择最终版本；不能把规划中的预期收益当作实验结果。
     selection_request = enrich_selection({
         "phase": "select", "round_index": rnd.round_index,
         "request": "Confirm a guarded experiment promotion, observation, or actual historical rollback using the current public validation. Retain the parent if evidence is insufficient.",
@@ -391,6 +428,7 @@ def train(rnd):
         change = "Restored and selected historical artifact %s after evaluating its complete predictor on the current public validation." % selected
     elif submitted:
         change = "Retained the actual parent checkpoint; the tested candidate was not adopted."
+    # 阶段 11：依据实际采用/拒绝/回滚结果更新策略，实验偏好必须跟最终选中模型配套。
     next_policy = advance_policy(policy, selected=selected, parent_id=rnd.parent.artifact_id,
                                  candidate_id=candidate_id, plan=plan,
                                  attempt_key=fingerprint(rnd.parent.checkpoint_sha256, train_data["sha256"], validation["sha256"], spec, execution) if spec else None,
@@ -412,7 +450,9 @@ def train(rnd):
     }
     append_jsonl(state / "decisions.jsonl", record)
     write_json(run / "round_summary.json", record)
+    # 阶段 12：先提交完整原生状态，再结束本轮。下一轮父模型仍以宿主 start 为准，不由 state 擅自指定。
     rnd.save_state(state)
+    # finish 引用本轮实际读取的历史和真实模型回执，等待宿主确认后由 SDK 结束进程。
     rnd.finish(
         selected_artifact_id=selected, hypothesis=plan["hypothesis"],
         change_summary=change,

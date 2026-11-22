@@ -1,4 +1,6 @@
 """共享文件工具：配置继承、SHA-256 摘要、原子 JSON 写入、JSONL 历史与运行锁。"""
+# 训练文件工具：统一配置、摘要、JSONL 记录和本地写锁。
+# 摘要用于绑定输入/模型版本；锁用于防止本地并发修改注册表，不是平台 SDK 的通信锁。
 import hashlib
 import json
 import os

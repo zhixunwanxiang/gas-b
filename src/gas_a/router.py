@@ -1,4 +1,6 @@
 """Stateful four-sensor route from the natural-order macro-F1 experiment."""
+# 历史反馈路由与共享专家工具：FourSensorRouter 依赖每批预测后的公开标签反馈。
+# 正式入口使用 frozen_router.FrozenRouter；这里只复用 HomeExpert、类别对编码等无标签辅助函数。
 from collections import deque
 from itertools import combinations
 import json
@@ -27,6 +29,7 @@ class HomeExpert:
         self.router = router
 
     def inputs(self, x):
+        # 返回已训练的 trunk/router 概率及成对头分数；这是可被正式冻结路由复用的无标签路径。
         z = self.trunk.normalized(x)
         heads = self.router.meta["private_joint_rescue"]
         odds = []
@@ -37,6 +40,7 @@ class HomeExpert:
 
 
 def pair_codes(left, right):
+    # 对两种预测类别先取小/大值再编码，使同一无序类别对映射到同一个路由槽位。
     return 6 * np.minimum(left, right) + np.maximum(left, right)
 
 
@@ -80,6 +84,7 @@ class FourSensorRouter:
         self.waiting = None
 
     def predict_batch(self, x):
+        # 历史回放必须先完成上一批公开标签反馈才能继续；此状态机不能直接作为 SDK 独立预测入口。
         if self.waiting is not None:
             raise ValueError("The previous batch is still awaiting feedback")
         if self.batch_count == 0:
@@ -103,6 +108,7 @@ class FourSensorRouter:
         return np.where(~alarm & np.isin(outer_codes, list(self.active_pairs)), alternative, base)
 
     def release_labels(self, y):
+        # 校验反馈长度和类别范围，再更新历史类别对统计，影响未来批次；不回写已经提交的预测。
         y = np.asarray(y)
         if self.waiting is None:
             raise ValueError("No batch is awaiting feedback")

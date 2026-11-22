@@ -1,4 +1,6 @@
 """Independent persisted-evidence checks for a completed local closed-loop run."""
+# 历史回放的独立复核：从已保存的预测和授权公开标签重算指标，再核对部署/回滚证据。
+# 这是本地历史结果复核，不会获得平台隐藏标签或创建真实模型回执。
 import argparse
 from copy import deepcopy
 import json

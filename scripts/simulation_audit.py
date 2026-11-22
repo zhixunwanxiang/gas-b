@@ -2,6 +2,8 @@
 
 Not part of the submission image. This is application auditing, not OS isolation.
 """
+# 原生进程审计适配：把授权路径映射给 SDK，并审计 Python 层文件和网络访问。
+# 用于本地演练，不属于提交镜像；应用层审计不能等同于操作系统沙箱隔离。
 import argparse
 import json
 import os

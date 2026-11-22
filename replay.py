@@ -1,4 +1,6 @@
 """Replay the released four-sensor policy on batch3 through batch10."""
+# 历史批次回放入口：先提交本批预测，再揭示已授权的公开标签并更新后续路由。
+# 该反馈流程用于开发回放；正式平台入口是 harness.py，不会调用此回放循环。
 import argparse
 from datetime import datetime
 import hashlib

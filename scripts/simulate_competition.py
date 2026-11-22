@@ -2,6 +2,9 @@
 
 Uses the actual SDK and participant unchanged. No real model or hidden data.
 """
+# 离线宿主替身：真实执行 SDK 和数值训练，但模型决策使用明确标注的本地规则。
+# 宿主持有公开评估标签，预测进程只收特征；原始输入、输出和测量用于独立核算。
+# 不能把此处 offline 调用号作为真实模型调用证据。
 from datetime import datetime, timezone
 import argparse
 import json
@@ -28,6 +31,7 @@ import numpy as np
 
 
 def environment():
+    # 为本地子进程准备统一线程和编码设置；真实模型路径还会额外剥离凭证。
     env = {k: v for k,v in os.environ.items()
            if not k.startswith(("CONTEST_", "PYTRIO_", "SWANLAB_")) and k != "OPENAI_API_KEY"}
     env.update(PYTHONDONTWRITEBYTECODE="1", PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
@@ -35,6 +39,7 @@ def environment():
 
 
 def adapter(command, directory, work, audit, dataset_root, data=None, state=None):
+    # 生成原生审计适配器命令，把本轮授权数据/模型/状态和独立工作目录明确传给子进程。
     argv = [sys.executable, "-B", str(ROOT / "scripts/simulation_audit.py"), command,
             "--model-root", str(directory), "--workspace", str(work), "--audit", str(audit),
             "--dataset-root", str(dataset_root)]
@@ -46,6 +51,7 @@ def adapter(command, directory, work, audit, dataset_root, data=None, state=None
 
 
 def artifact_receipt(directory, identifier, descriptor=None, primary="checkpoint.npz"):
+    # 按实际文件计算完整产物清单与摘要，供 SDK 校验和历史恢复使用，不从文件名推断内容。
     if descriptor is None:
         model = load_predictor(directory / primary)
         manifest = getattr(model, "manifest_path", None)
@@ -65,6 +71,8 @@ class Measurements:
         (root / "measurements").mkdir()
 
     def measure(self, directory, descriptor, identifier):
+        # 宿主持有公开标签，但给预测器的每行请求只有任务和 inputs。
+        # 保存逐行请求/响应，检查下一条输入前已返回，并在宿主侧计算指标；完整产物摘要相同才复用缓存。
         primary = directory / descriptor["checkpoint_paths"][0]
         model = load_predictor(primary)
         files = list(getattr(model, "component_paths", {"primary": primary}).values())
@@ -154,6 +162,7 @@ class EvidenceHost(OfflineHost):
         self.last_candidate_request = None
 
     def plan(self, request):
+        # 离线规则按允许菜单与已尝试方向生成计划，明确属于替身，不得计作真实 27B 建议。
         available = request["experiments"]
         attempted = set()
         for item in request["history"]:
@@ -184,6 +193,7 @@ class EvidenceHost(OfflineHost):
                 "hypothesis": hypothesis, "reason": reason}
 
     def selection(self, request):
+        # 规则只在选手已通过门槛的 ID 中按同范围实测分数选择；同分保留父模型。
         parent = request["parent_artifact_id"]
         eligible = request["response_schema"]["selected_artifact_id"]
         parent_score = self.measurements.by_id[parent]["metrics"]["macro_f1"]
@@ -198,6 +208,7 @@ class EvidenceHost(OfflineHost):
         return {"selected_artifact_id": selected, "reason": reason}
 
     def write(self, text):
+        # 沿用上传/恢复协议并接入独立逐行测量；结束时核对引用历史与调用号确实存在。
         frame = json.loads(text)
         kind = frame["type"]
         append_jsonl(self.store / "events.jsonl", {"at": datetime.now(timezone.utc).isoformat(),
@@ -251,6 +262,7 @@ def run_round(host, directory, state, dataset_root):
 
 
 def session(root, baseline, source_data, rounds, dataset_root):
+    # 连续回合始终使用上轮选中完整产物及保存状态，维护历史和已授权恢复目录。
     root.mkdir()
     shutil.copytree(source_data, root / "data")
     shutil.copytree(baseline, root / "initial")
@@ -298,6 +310,7 @@ def session(root, baseline, source_data, rounds, dataset_root):
 
 
 def recovery_drill(root, session_result, source_data, dataset_root):
+    # 独立故障演练结果与正常收益分开统计，不能把人为注入故障后的恢复幅度当作训练提升。
     root.mkdir()
     shutil.copytree(source_data, root / "data")
     (root / "fault-parent").mkdir()
@@ -347,6 +360,7 @@ def recovery_drill(root, session_result, source_data, dataset_root):
 
 
 def audit_summary(root):
+    # 只汇总审计实际捕获的访问/网络证据，原生应用审计不等同于 Docker 强制隔离。
     files = list(root.rglob("access.jsonl"))
     denied, network, metadata_queries, data_reads = [], [], [], set()
     for p in files:

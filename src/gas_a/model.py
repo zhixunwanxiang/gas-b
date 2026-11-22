@@ -1,4 +1,6 @@
 """Small NumPy MLP + Adam. Checkpoints preserve every state needed to resume."""
+# 扩展 NumPy 模型：保存神经网络、完整 Adam 状态和可选的训练样本记忆/辅助分类头。
+# 新建模型时才计算 scaler；平台续训应使用 load 恢复父状态，不能重新初始化这份模型。
 import hashlib
 import io
 import json
@@ -23,6 +25,7 @@ MAX_CHECKPOINT_BYTES = 16 * 1024 * 1024
 
 class Model:
     def __init__(self, task, paths, classes, x, y, *, hidden=32, seed=42, learning_rate=.003, batch_size=128):
+        # 只用于显式新建模型；同时初始化权重、Adam 矩、scaler 和训练元数据。平台续训使用 load。
         if task not in ("classification", "regression") or not 1 <= hidden <= 128:
             raise ValueError("invalid model configuration")
         if x.ndim != 2 or x.shape[1] != len(paths):
@@ -51,6 +54,7 @@ class Model:
         self.validate()
 
     def validate(self):
+        # 检查元数据、张量维度/dtype、有限值、Adam 二阶矩及辅助预测器字段，拒绝不一致检查点。
         m = self.meta
         if m.get("format") != FORMAT or m.get("device") != "cpu" or m.get("task") not in ("classification", "regression"):
             raise ValueError("unsupported checkpoint")
@@ -157,6 +161,7 @@ class Model:
                 raise ValueError("invalid KNN class adjustments")
 
     def normalized(self, x):
+        # 沿用已保存的均值和尺度，并裁剪极端标准化值；推理不会重新拟合 scaler。
         if x.ndim != 2 or x.shape[1] != len(self.meta["paths"]) or not np.all(np.isfinite(x)):
             raise ValueError("invalid feature matrix")
         return np.clip((x - self.mean) / self.scale, -10, 10)
@@ -166,6 +171,7 @@ class Model:
         return hidden, hidden @ self.params["w2"] + self.params["b2"]
 
     def clear_auxiliary_predictor(self):
+        # 清理下面明确列出的记忆和辅助校准字段，再校验剩余模型状态；其他专家元数据由上层构建流程管理。
         self.memory_x = self.memory_y = self.feature_mask = None
         for name in ("predictor", "knn_neighbors", "knn_distance_power", "knn_class_balance",
                      "knn_mlp_blend", "drift_prune_features", "knn_class_adjustments", "discriminant",
@@ -176,6 +182,7 @@ class Model:
     def attach_drift_pruned_knn(self, x, y, feature_mask, *, neighbors, distance_power,
                                 class_balance, mlp_blend, drift_prune_features,
                                 class_adjustments=None):
+        # 把授权训练样本的标准化特征、标签和特征掩码写入模型，供无标签推理时的近邻融合。
         feature_mask = np.asarray(feature_mask, dtype=bool)
         if feature_mask.shape != (len(self.meta["paths"]),):
             raise ValueError("KNN feature mask shape mismatch")
@@ -193,6 +200,7 @@ class Model:
         self.validate()
 
     def memory_predict(self, normalized):
+        # 在训练时已固定的特征掩码上计算当前输入与训练记忆的距离和加权投票，不读取当前真实标签。
         query = normalized[:, self.feature_mask]
         query /= np.maximum(np.linalg.norm(query, axis=1, keepdims=True), 1e-12)
         result = np.empty((len(query), len(self.meta["classes"])), dtype=np.float64)
@@ -205,6 +213,7 @@ class Model:
             batch = query[start:start + 128]
             # Both sides are L2-normalized, so this computes mean squared distance
             # without allocating a [batch, train_rows, features] temporary.
+            # 两侧向量已做 L2 归一化，平方距离可由 2-2<x,y> 得到，避免分配 batch×训练样本×特征 的大数组。
             distance = np.maximum(2.0 - 2.0 * (batch @ self.memory_x.T), 0.0) / self.memory_x.shape[1]
             indices = np.argpartition(distance, k - 1, axis=1)[:, :k]
             selected_distance = np.take_along_axis(distance, indices, axis=1)
@@ -217,6 +226,7 @@ class Model:
         return result
 
     def fit(self, x, y, epochs):
+        # 基本 MLP 训练保留累计 step/epoch 与已有 Adam 状态；正式受限实验另由 optimize.fit_weighted 管理。
         if type(epochs) is not int or not 1 <= epochs <= 10000:
             raise ValueError("epochs must be between 1 and 10000")
         x = self.normalized(x)
@@ -272,6 +282,7 @@ class Model:
         return epoch_losses
 
     def predict(self, x):
+        # 根据已存元数据应用神经分数、可选记忆融合和辅助修正，推理不更新参数。
         normalized = self.normalized(x)
         _, logits = self.forward(normalized)
         if self.meta["task"] == "classification":
@@ -293,6 +304,7 @@ class Model:
         return np.maximum(0, logits[:, 0] * self.meta["target_scale"] + self.meta["target_mean"])
 
     def save(self, path):
+        # 把权重、Adam、scaler 和辅助记忆写进普通 NPZ；完整恢复不能只保存 params。
         self.validate()
         arrays = {**self.params, **{"adam_first_" + k: v for k, v in self.first.items()},
                   **{"adam_second_" + k: v for k, v in self.second.items()}, "mean": self.mean, "scale": self.scale,
@@ -310,6 +322,7 @@ class Model:
 
     @classmethod
     def load(cls, path):
+        # 限制检查点大小并拒绝对象 pickle，读取数值数组后校验整份状态，避免加载任意可执行对象。
         path = Path(path)
         if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_CHECKPOINT_BYTES:
             raise ValueError("checkpoint must be a regular file no larger than 16 MiB")

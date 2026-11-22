@@ -3,6 +3,8 @@
 This is a connectivity check, independent of the competition host and training.
 Use --check-config to inspect credential presence without making network calls.
 """
+# 宿主连通性和云端生命周期工具：限制端点/模型，安全加载本地凭证，核验自建实验的结束状态。
+# 连通性通过只证明服务可访问，不证明工业模型训练完成、正式参赛资格或隐藏集得分。
 import argparse
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -32,6 +34,7 @@ class PlatformCheckError(RuntimeError):
 
 def write_receipt(path, receipt):
     """Replace the receipt atomically, preserving the last copy on write failure."""
+    # 同目录临时文件写入、flush/fsync 后原子替换，写失败时保留上一份有效回执。
     temporary = None
     try:
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
@@ -50,6 +53,7 @@ def write_receipt(path, receipt):
 @contextmanager
 def termination_handler():
     """Let graceful termination reach finally; forced process kills cannot do so."""
+    # 把可处理终止转为 Python 退出异常，使 finally 能执行；强制杀进程或断电不能靠此保证收尾。
     previous = {}
     def interrupted(signum, frame):
         raise SystemExit(128 + signum)
@@ -68,6 +72,7 @@ def termination_handler():
 
 def check_run(api, path):
     """Read one run, never resume, finish or modify it."""
+    # 校验 workspace/project/run_id，并每次新建 API 实体读取状态，避免 SDK 元数据缓存。
     parts = path.strip("/").split("/")
     if (len(parts) != 3 or any(not part or part in (".", "..")
                               or any(c in part for c in "\\?#%") for part in parts)):
@@ -83,6 +88,7 @@ def check_run(api, path):
 
 def verify_finish(api, path, desired_state):
     """Bounded, read-only polling; never retry a model call or a finish request."""
+    # 仅有限次只读查询预期终态，不重发 finish、不重试模型，也不改变无关实验。
     verification = {"status": "unverified", "expected_state": TERMINAL_STATES[desired_state]}
     for attempt in range(3):
         try:
@@ -102,6 +108,7 @@ def verify_finish(api, path, desired_state):
 
 
 def run_check(swanlab, config, output):
+    # 这条路径只测连通性，使用独有 Run ID 记录一次真实调用并确保收尾；不表示工业模型训练验收。
     run_id = uuid.uuid4().hex
     created = datetime.now(timezone.utc)
     receipt_path = output / "receipt.json"
@@ -223,6 +230,7 @@ def run_check(swanlab, config, output):
 
 def load_env(path):
     """Read simple KEY=value settings without executing or expanding their values."""
+    # 只按白名单读取 .env 的字面值，不执行 shell 展开，也不把凭证值打印到日志。
     if not path.is_file():
         return
     for line in path.read_text(encoding="utf-8-sig").splitlines():
@@ -242,6 +250,7 @@ def load_env(path):
 
 
 def configuration():
+    # 组装宿主允许的端点、模型和云端项目标识，具体凭证仍留在宿主环境。
     return {"base_url": os.environ.get("PYTRIO_BASE_URL", "https://pytrio.com").rstrip("/"),
             "model": os.environ.get("PYTRIO_MODEL", "Qwen/Qwen3.8-27B"),
             "project": os.environ.get("GAS_A_SWANLAB_PROJECT", "gas-a"),
@@ -249,6 +258,7 @@ def configuration():
 
 
 def request_json(url, key, body=None):
+    # 统一 HTTP JSON 请求，不自动重试；调用方保存结果状态，避免不明计费结果被悄悄重发。
     headers = {"Authorization": "Bearer " + key, "X-API-Key": key,
                "Content-Type": "application/json"}
     data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
@@ -268,6 +278,7 @@ def request_json(url, key, body=None):
 
 
 def ensure_model(config, key):
+    # 发送付费请求前确认允许端点和精确模型可用，不悄悄换用其他模型。
     for offset in range(0, 10000, 100):
         payload = request_json(config["base_url"] + f"/api/models?limit=100&offset={offset}", key)
         items = payload.get("items")

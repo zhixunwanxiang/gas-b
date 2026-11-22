@@ -1,4 +1,6 @@
 """Create a landscape PDF, following the supplied closed-loop report structure."""
+# 历史闭环报告生成器：汇总已有回放证据与图表，不发起平台训练或真实模型调用。
+# 报告中的分数和部署来自所选运行目录，不能用来覆盖新版本真实测试结果。
 import argparse
 from datetime import datetime
 from html import escape

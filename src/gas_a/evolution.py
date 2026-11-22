@@ -1,4 +1,6 @@
 """Bounded controller policy and comparable public-validation promotion gates."""
+# 受控策略层：限制实验重试、执行上线门槛，并让策略状态与实际选中的模型版本配对。
+# 模型层负责权重续训；这里仅更新实验偏好/策略版本，不允许大模型任意改代码或放宽预算。
 from copy import deepcopy
 import hashlib
 import json
@@ -6,6 +8,7 @@ import math
 
 
 def validate_controller(config):
+    # 先校验控制器预算和阈值，防止布尔值冒充整数、NaN 或无界配置影响实验权限。
     for key, low, high in (("json_corrections", 0, 2), ("max_history_restores", 0, 2),
                            ("max_repeat_rejections", 1, 8), ("minimum_class_support", 1, 1000000)):
         if type(config.get(key)) is not int or not low <= config[key] <= high:
@@ -24,6 +27,8 @@ def validate_controller(config):
 
 
 def fingerprint(parent_sha256, train_sha256, validation_sha256, spec, execution_policy=None):
+    # 父模型、训练集、验证集、实验配置和执行策略共同确定实验身份。
+    # 同名实验在不同父状态或修复后的执行策略上不必被误判为完全重复。
     identity = [parent_sha256, train_sha256, validation_sha256, spec]
     if execution_policy is not None:
         identity.append(execution_policy)
@@ -32,11 +37,13 @@ def fingerprint(parent_sha256, train_sha256, validation_sha256, spec, execution_
 
 
 def initial_policy():
+    # version 表示当前模型配套策略；revision 是单调递增计数，回滚不倒退该总计数。
     return {"format": "gas-a.strategy.v1", "version": 1, "revision": 1, "preferred_experiment": None,
             "attempts": [], "artifact_policies": {}, "last_measurement": None}
 
 
 def load_policy(value, menu):
+    # 校验跨轮策略与各产物配套快照，拒绝无法解释的版本号、偏好或结构。
     if value is None:
         return initial_policy()
     if (not isinstance(value, dict) or value.get("format") != "gas-a.strategy.v1"
@@ -57,6 +64,7 @@ def load_policy(value, menu):
 
 
 def available_experiments(policy, menu, rnd, train, validation, config, execution_policy=None):
+    # 只屏蔽完全相同实验身份达到拒绝上限的方案，保留其他允许菜单项给 AI 规划。
     allowed, blocked = {}, []
     for name, spec in menu.items():
         identity = fingerprint(rnd.parent.checkpoint_sha256, train["sha256"], validation["sha256"], spec, execution_policy)
@@ -69,7 +77,10 @@ def available_experiments(policy, menu, rnd, train, validation, config, executio
 
 
 def promotion_gate(before, after, config):
+    # F1 必须严格提高且达到配置最小增益，同时满足受保护类别的召回下降限制。
+    # 召回值使用 0～1 比例，0.20 表示 20 个百分点；比较基准是当轮父模型，不是累计初始基线。
     gain = after["macro_f1"] - before["macro_f1"]
+    # 只有父验证支持数达到门槛的类别受单步召回保护；1e-12 只吸收浮点边界误差，不放宽百分点配置。
     losses = {name: item["recall"] - after["per_class"][name]["recall"]
               for name, item in before["per_class"].items()
               if item["support"] >= config["minimum_class_support"]
@@ -80,15 +91,19 @@ def promotion_gate(before, after, config):
 
 def advance_policy(policy, *, selected, parent_id, candidate_id, plan, attempt_key, gain, validation_sha256, selected_f1,
                    experiment_failed=False):
+    # 记录实际候选或本地失败尝试；只有被选中的新候选才能提升策略版本及实验偏好。
+    # 回滚时恢复所选历史产物的配套策略，未知外部历史采用保守初值；日志长度受限以控制状态大小。
     result = deepcopy(policy)
     parent_snapshot = {k: policy[k] for k in ("version", "preferred_experiment")}
     result["artifact_policies"].setdefault(parent_id, parent_snapshot)
+    # 即使本地训练失败、没有上传候选，也保留拒绝尝试，防止同一失败配置无限循环。
     if candidate_id or experiment_failed:
         adopted = candidate_id is not None and selected == candidate_id
         result["attempts"].append({"fingerprint": attempt_key, "experiment": plan["experiment"],
                                    "adopted": adopted, "macro_f1_gain": gain,
                                    "status": "local_training_failed" if experiment_failed else "measured"})
         result["attempts"] = result["attempts"][-128:]
+        # “执行过训练”不等于策略改善；只有实际采用新候选才提升版本并记录偏好。
         if adopted:
             result["revision"] += 1
             result["version"] = result["revision"]

@@ -3,6 +3,8 @@
 This is a transport/sandbox rehearsal, never an official model or score run.
 The script is a host-side tool and is excluded from the submission image.
 """
+# 离线协议验收：将宿主 start、模型/上传/状态 RPC 和结束确认与真实入口串接。
+# 支持原生进程和镜像测试，关注逐行刷新、跨轮状态及协议行为，不替代正式平台成绩。
 import argparse
 import hashlib
 import json
@@ -48,6 +50,8 @@ def receipt(directory, identifier, descriptor):
 
 
 def exchange(host, command, env, output, container_name=None, docker_argv=None):
+    # 写入一帧 start 后边读选手输出边发送相应宿主帧，不能等 stdin 结束才开始交互。
+    # 收到 round_complete 后发确认，再等待进程退出；异常也清理本次拥有的容器和管道。
     with (output / "stderr.log").open("w", encoding="utf-8") as stderr, \
             (output / "protocol.jsonl").open("w", encoding="utf-8") as transcript:
         process = subprocess.Popen(command, cwd=ROOT, env=env, stdin=subprocess.PIPE,
@@ -97,6 +101,7 @@ def exchange(host, command, env, output, container_name=None, docker_argv=None):
 
 
 def check_prediction(root, directory, descriptor, image):
+    # 验证逐条输入在下一条/EOF 前已有响应，并核对实际选中产物的输出，排除只在退出时批量打印。
     from gas_a.frozen_router import load_predictor
     from gas_a.sensor_training.io import CLASSES
     primary = descriptor["checkpoint_paths"][0]

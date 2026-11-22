@@ -1,4 +1,7 @@
 """基于原始 NumPy MLP 的受限续训：保留 Adam 状态，记录逐 epoch 证据并执行质量门槛。"""
+# 数值训练核心：所有梯度只从 train 计算，validation 仅用于逐 epoch 测量和检查点选择。
+# 候选继承父权重、Adam 一二阶矩、scaler、seed 和计数器；冻结参数连同其动量一起保持不变。
+# 平台路径在每个 epoch 使用与最终晋升相同的类别保护门槛，避免导出最高分却不合格的版本。
 import copy
 import hashlib
 import json
@@ -122,6 +125,7 @@ def bounded_experiment(spec, limits):
 
 def classification_delta(probability, target, sample_weights, gamma=0):
     """计算加权 softmax Focal Loss 及其关于 logits 的精确导数。"""
+    # gamma=0 退化为加权交叉熵；gamma>0 调低容易样本的贡献，delta 是对 logits 的梯度。
     pt = np.maximum(probability[np.arange(len(target)), target], 1e-300)
     log_pt = np.log(pt)
     remaining = np.maximum(1 - pt, 1e-12)
@@ -203,6 +207,8 @@ def _mask_batch(batch, model):
 def fit_weighted(model, train, spec, weak_class, deadline, *, on_epoch=None,
                  epoch_offset=0, epochs_to_run=None, anchor_params=None):
     """仅 train.x/train.y 参与梯度计算，保留父模型的标准化参数和 Adam 状态。"""
+    # 先处理受限传感器权重投影，再按累计 epoch 派生随机序列，逐 batch 更新可训练参数。
+    # on_epoch 只负责评估和是否早停；验证标签不会流回反向传播或 Adam 更新。
     if (spec.get("input_transform", "identity") != "identity" or any(
             name in spec for name in ("active_sensors", "active_feature_types", "sensor_weights"))):
         raise ValueError("Legacy input transformations are unsupported")
@@ -321,6 +327,7 @@ def fit_weighted(model, train, spec, weak_class, deadline, *, on_epoch=None,
 
 def train_candidate(parent, train, validation, directory, spec, diagnosis, limits):
     """为单次候选创建独立目录；任何训练异常均写入 failure.json 并保留已消耗资源。"""
+    # 独立新目录保证候选不会覆盖父产物或其他实验；失败报告保留已发生的资源和配置证据。
     spec = bounded_experiment(spec, limits)
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=False)
@@ -343,6 +350,8 @@ def _resources(started, cpu_started):
 
 def _train_candidate(parent, train, validation, directory, spec, diagnosis, limits, attempt_started, cpu_started):
     """从父模型完整状态续训，保存源码快照、逐 epoch 证据和最终选定的 checkpoint。"""
+    # 训练前先快照父模型和源码；逐 epoch 记录门槛及完整状态，选择后导出、重载复评。
+    # 已执行的训练量与最终导出 epoch 分开记录，早停或回选最佳 epoch 不会抹去实际成本。
     parent_sha = digest(parent)
     model = load_model(parent, train["paths"])
     # Continue the primary neural state; a new bundle is explicitly rebuilt later.
@@ -360,6 +369,7 @@ def _train_candidate(parent, train, validation, directory, spec, diagnosis, limi
     before = evaluate(model, validation)
     train_before = evaluate(model, train)
     migration = None
+    # 可选架构变化先保函数迁移，并在 train/validation 上验证续训前预测一致，不能重新初始化后冒称续训。
     if "architecture" in spec:
         parent_model = model
         model, migration = migrate_parent(parent_model, spec["architecture"], parent_sha)
@@ -386,12 +396,15 @@ def _train_candidate(parent, train, validation, directory, spec, diagnosis, limi
         raise ValueError("Invalid checkpoint selection settings")
 
     def record_epoch(record):
+        # 平台 controller_checkpoint_gate 优先于本地其他 gate，先按是否合格排序，再比较 F1/Accuracy。
+        # best 保存整个模型副本，包含 Adam 和计数器；不能只把最佳权重替换进最后一轮优化器状态。
         nonlocal best, best_key, best_record, stale
         # 在下一次参数更新前，评估当前 epoch 对应的模型。
         record.update(stage_id=stage_id, seed=model.meta["seed"], step=record["steps"],
                       validation=evaluate(model, validation))
         controller_policy = limits.get("controller_checkpoint_gate")
         policy = limits.get("checkpoint_gate")
+        # 平台训练路径使用正式控制器门槛；即使某 epoch 的 F1 更高，只要类别保护不合格就不能排在合格 epoch 前。
         if controller_policy is not None:
             from ..evolution import promotion_gate
             measured_gate = promotion_gate(limits.get("controller_checkpoint_reference", before),
@@ -429,6 +442,7 @@ def _train_candidate(parent, train, validation, directory, spec, diagnosis, limi
                                         started + limits["max_seconds_per_candidate"], on_epoch=record_epoch)
     executed_steps, executed_epochs = model.meta["steps"], model.meta["epochs"]
     # 导出最佳 epoch 时恢复权重、Adam 矩与计数器；实际执行量单独保留用于成本核算。
+    # 最佳 epoch 选择只改变导出状态；实际训练已执行的 epoch/step 另记，不回退成本记录。
     if select_best:
         model = best
     if not np.array_equal(mean, model.mean) or not np.array_equal(scale, model.scale):

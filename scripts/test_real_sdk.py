@@ -3,6 +3,9 @@
 This host-side tool is excluded from the submission image. It spends real model
 credits; it is not the organizer's host and its IDs are provider receipt IDs.
 """
+# 真实模型协议桥接：选手 rnd.model → SDK JSONL → 宿主 PyTRiO 请求 → 原始回复 → SDK 回执。
+# 实际训练和预测可运行在固定 Docker 镜像中；该脚本本身不创建云端 Run，云端由外层测试总控负责。
+# 提供方响应 ID 不能冒充正式比赛计量回执；未知结果不自动重试，也不补写模型决定。
 import argparse
 from datetime import datetime, timezone
 import json
@@ -38,6 +41,7 @@ LOCAL_PROMPT = (
 
 
 def request_phase(messages):
+    # 从选手结构化用户消息识别 plan/select，仅用于证据归类，不改变请求内容。
     for message in reversed(messages):
         if message.get("role") == "user" and isinstance(message.get("content"), str):
             try:
@@ -57,6 +61,8 @@ class RealGateway:
         (root / "provider-calls").mkdir()
 
     def invoke(self, frame, start):
+        # 发送前计入尝试预算并写 outcome_unknown；收到完整合法响应后才记 verified_response。
+        # 宿主只附加一次固定任务提示，透传选手采样参数；服务超时/中断不自动重试。
         if len(self.attempts) >= self.max_calls:
             raise RuntimeError("Real model call budget exhausted; no request sent")
         if self.config["model"] != MODEL or self.config["base_url"] != "https://pytrio.com":
@@ -68,6 +74,7 @@ class RealGateway:
             messages[0]["content"] = prefix + "\n" + messages[0]["content"]
         else:
             messages.insert(0, {"role": "system", "content": prefix})
+        # 保留选手实际传入的 max_tokens/temperature/enable_thinking 等采样参数，宿主不偷偷改写。
         options = {k:v for k,v in frame.items() if k not in ("type", "id", "messages")}
         payload = {**options, "model": MODEL, "messages": messages, "stream": False}
         phase = request_phase(frame["messages"])
@@ -78,6 +85,7 @@ class RealGateway:
                  "status": "outcome_unknown", "requested_model": MODEL,
                  "started_at": datetime.now(timezone.utc).isoformat(),
                  "call_id_source": "pytrio_provider_response_not_official_contest_receipt"}
+        # 发请求前就计入预算；超时也可能已被提供方处理，不能因缺少响应而退还这次尝试额度。
         self.attempts.append(entry)
         write_json(folder / "request.json", payload)  # Never persist authorization headers.
         write_json(folder / "receipt.json", entry)
@@ -122,6 +130,8 @@ class RealModelHost(EvidenceHost):
                 self.frame["state_path"] = "/state"
 
     def write(self, text):
+        # 单独接管 model_request 并调用真实网关，不能先走离线父类的模型规则分支。
+        # 其他上传、状态和历史 RPC 继续复用宿主协议实现，响应只绑定实际提供方 call_id。
         frame = json.loads(text)
         if frame["type"] != "model_request":
             result = super().write(text)
@@ -134,6 +144,7 @@ class RealModelHost(EvidenceHost):
         self.next_sequence += 1
         self.frames.append(frame)
         self.messages.append(frame["messages"])
+        # 从真实网关得到原始 response 后原样放进 SDK model_response，JSON 解析与行动决定仍在选手代码中。
         call_id, response, bound = self.gateway.invoke(frame, self.frame)
         self.calls.append(call_id)
         append_jsonl(self.store / "model-calls.jsonl", {
@@ -146,6 +157,7 @@ class RealModelHost(EvidenceHost):
 
 
 def run_native_round(host, directory, state, dataset_root):
+    # 剥离模型/云端凭证后启动选手进程；Docker 模式使用容器内投影路径并在退出时清理本轮容器。
     with tempfile.TemporaryDirectory(prefix="gas-real-sdk-") as work:
         env = environment()
         for name in list(env):
@@ -173,6 +185,7 @@ def audit(out, runtime):
 
 def finalize_acceptance(report, *, recovery=False, minimum_rounds=4):
     """Separate execution completion from the requirements this test claims."""
+    # 同时检查回合确认、真实调用、成绩、历史实验数和实际隔离证据；回滚还要求真的选回历史并延续父产物。
     rows = report.get("rounds", [])
     audit = report.get("audit", {})
     checks = {
@@ -207,6 +220,7 @@ def finalize_acceptance(report, *, recovery=False, minimum_rounds=4):
 
 def recovery_test(source, out, base, gateway, report, runtime=None):
     """Inject weights only; real 27B chooses both actions without forced replies."""
+    # 在正常运行副本上只注入模型权重故障，保存原公开数据和历史产物，两个动作都交给真实模型决定。
     original = json.loads((source/"live-report.json").read_text(encoding="utf-8"))
     if original["status"] != "completed" or original["model"] != MODEL:
         raise ValueError("Recovery requires a completed real-model session")
@@ -285,6 +299,7 @@ def recovery_test(source, out, base, gateway, report, runtime=None):
 
 
 def main():
+    # 有调用上限的宿主测试入口：每轮把实际选择作为下一轮父产物，保留原始请求/响应和逐条测量。
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)

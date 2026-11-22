@@ -3,6 +3,8 @@
 The policy is written before any replay labels are revealed. Each run owns its
 models, registry, frozen predictions, timing log and source snapshot.
 """
+# 历史闭环回放验证：针对公开批次依次监测、训练、评估、部署和恢复。
+# 该工具保留批后标签揭示语义，不能作为 SDK 无标签预测入口或隐藏流成绩证明。
 import argparse
 from collections import deque
 from contextlib import contextmanager
