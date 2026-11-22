@@ -241,6 +241,18 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         self.assertNotIn("prediction_bundle", model.meta)
         self.assertAlmostEqual(report["validation_before"]["macro_f1"], self.report["validation_after"]["macro_f1"])
 
+    def test_controller_epoch_gate_compares_against_complete_routed_parent(self):
+        spec = dict(next(s for s in self.config["experiments"] if s["name"] == "conservative_head"), epochs=2)
+        gate = {key: self.config["controller"][key] for key in (
+            "minimum_macro_f1_gain", "minimum_class_support", "maximum_class_recall_drop")}
+        report = continue_candidate(self.bundle / "checkpoint.npz", self.train, self.validation,
+                                    self.root / "guarded-plain-child", spec, {"weakest_class": "Acetaldehyde"},
+                                    {**self.config["limits"], "controller_checkpoint_gate": gate})
+        reference = report["checkpoint_selection"]["reference_metrics"]["macro_f1"]
+        self.assertAlmostEqual(reference, self.report["validation_after"]["macro_f1"])
+        for epoch in report["epoch_history"]:
+            self.assertAlmostEqual(epoch["controller_gate"]["macro_f1_gain"], epoch["validation"]["macro_f1"] - reference)
+
 
 if __name__ == "__main__":
     unittest.main()

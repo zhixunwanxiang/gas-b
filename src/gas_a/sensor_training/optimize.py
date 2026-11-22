@@ -390,22 +390,30 @@ def _train_candidate(parent, train, validation, directory, spec, diagnosis, limi
         # 在下一次参数更新前，评估当前 epoch 对应的模型。
         record.update(stage_id=stage_id, seed=model.meta["seed"], step=record["steps"],
                       validation=evaluate(model, validation))
+        controller_policy = limits.get("controller_checkpoint_gate")
         policy = limits.get("checkpoint_gate")
-        decision = (fixed_gate(record["validation"], before, limits["checkpoint_reference"], policy)
-                    if policy and policy.get("adaptive") else
-                    gate(record["validation"], before, before, policy) if policy else {"accepted": True, "reasons": []})
-        eligible = decision["accepted"]
+        if controller_policy is not None:
+            from ..evolution import promotion_gate
+            measured_gate = promotion_gate(limits.get("controller_checkpoint_reference", before),
+                                            record["validation"], controller_policy)
+            eligible = measured_gate["eligible"]
+            record["controller_gate"] = measured_gate
+            key = (eligible, record["validation"]["macro_f1"], record["validation"]["accuracy"])
+        else:
+            decision = (fixed_gate(record["validation"], before, limits["checkpoint_reference"], policy)
+                        if policy and policy.get("adaptive") else
+                        gate(record["validation"], before, before, policy) if policy else {"accepted": True, "reasons": []})
+            eligible = decision["accepted"]
+            hard_passed = not any(reason != "macro_f1_gain_below_minimum" and not reason.startswith("class_recall_below_minimum:")
+                                  for reason in decision["reasons"] if reason != "quality_gates_passed")
+            key = (eligible, hard_passed, recall_target_score(record["validation"], policy or {}),
+                   record["validation"]["macro_f1"], record["validation"]["accuracy"])
+            if policy and policy.get("adaptive"):
+                key = (eligible, record["validation"]["macro_f1"], record["validation"]["accuracy"])
         record["checkpoint_eligible"] = eligible
         append_jsonl(directory / "history.jsonl", record)
-        hard_passed = not any(reason != "macro_f1_gain_below_minimum" and not reason.startswith("class_recall_below_minimum:")
-                              for reason in decision["reasons"] if reason != "quality_gates_passed")
         # 先比较门槛与目标 recall，再比较 Macro-F1 和 Accuracy。
         # 仅在严格更优时替换，因此同分保留更早的完整 checkpoint。
-        key = (eligible, hard_passed, recall_target_score(record["validation"], policy or {}),
-               record["validation"]["macro_f1"], record["validation"]["accuracy"])
-        if policy and policy.get("adaptive"):
-            # 显式 adaptive 策略在满足固定质量下限后，按 Macro-F1 和 Accuracy 选择 epoch。
-            key = (eligible, record["validation"]["macro_f1"], record["validation"]["accuracy"])
         if best_key is None or key > best_key:
             best_key, best_record, stale = key, record, 0
             if select_best:
@@ -454,12 +462,15 @@ def _train_candidate(parent, train, validation, directory, spec, diagnosis, limi
                            "verified_unchanged": True if frozen else None,
                            "optimizer_step_policy": "Global steps advance; frozen m/v remain exact; unfreezing resumes them without reset."},
               "executed_steps": executed_steps, "executed_epochs": executed_epochs,
-              "checkpoint_selection": {"mode": "best_guarded_validation_epoch" if select_best else "last_epoch",
-                                       "reference_metrics": limits.get("checkpoint_reference"),
-                                       "reference_sha256": limits.get("checkpoint_reference_sha256"),
+              "checkpoint_selection": {"mode": ("best_controller_eligible_epoch" if "controller_checkpoint_gate" in limits
+                                                else "best_guarded_validation_epoch") if select_best else "last_epoch",
+                                       "reference_metrics": limits.get("controller_checkpoint_reference", limits.get("checkpoint_reference")),
+                                       "reference_sha256": limits.get("controller_checkpoint_reference_sha256", limits.get("checkpoint_reference_sha256")),
                                        "selected_epoch": model.meta["epochs"], "executed_epoch_count": len(epoch_records),
                                        "requested_epoch_count": spec["epochs"], "patience": patience,
-                                       "quality_gate": limits.get("checkpoint_gate"),
+                                       "quality_gate": limits.get("controller_checkpoint_gate", limits.get("checkpoint_gate")),
+                                       "selected_epoch_eligible": (best_record if select_best else epoch_records[-1])["checkpoint_eligible"],
+                                       "eligible_epoch_count": sum(r["checkpoint_eligible"] for r in epoch_records),
                                        "stopped_early": len(epoch_records) < spec["epochs"]},
               "input_transform_before": initial_transform, "input_transform_after": model.meta.get("input_transform", "identity"),
               "parameter_constraint": {"kind": "projected_first_layer_rows", "kept_sensors": spec.get("kept_sensors"),

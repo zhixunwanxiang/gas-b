@@ -1,5 +1,6 @@
 """Training and calibration of the full-input auxiliary expert."""
 import math
+import time
 from copy import deepcopy
 import numpy as np
 
@@ -148,13 +149,20 @@ def binary_cutoffs(parent,x,y):
     return output
 
 
-def train_home(parent, train, spec, dest):
+def train_home(parent, train, spec, dest, *, max_epochs=32, deadline=None):
     """Train the full-input branches on training rows only; preserve parent Adam/scaler."""
     from .decisions import training_parts
+    epochs = spec.get("epochs", 1)
+    if type(epochs) is not int or not 1 <= epochs <= max_epochs:
+        raise ValueError("home.epochs must be an integer within the epoch budget")
     fit, reserve = training_parts(train)
     trunk = deepcopy(parent)
     trunk.meta.pop("prediction_bundle", None)
-    head_epoch(trunk, fit, spec)
+    history = []
+    for _ in range(epochs):
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("Home expert exceeded the candidate wall-time budget")
+        history.append(head_epoch(trunk, fit, spec))
     trunk.save(dest / "home_trunk.npz")
     router = deepcopy(trunk)
     x = np.vstack([fit["x"], reserve["x"]])
@@ -172,3 +180,4 @@ def train_home(parent, train, spec, dest):
         heads[str(cls)] = dict(features=columns.tolist(), w=theta[:-1].tolist(), b=float(theta[-1]))
     router.meta["private_joint_rescue"] = heads
     router.save(dest / "home_router.npz")
+    return {"epochs_requested": epochs, "epochs_executed": len(history), "epoch_history": history}

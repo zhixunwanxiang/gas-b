@@ -39,7 +39,14 @@ def continue_candidate(parent_path, train, validation, directory, spec, diagnosi
     parent = load_model(parent_path, train["paths"])
     parent_predictor = load_predictor(parent_path, train["paths"])
     initial = state_identity(parent)
-    report = train_candidate(parent_path, train, validation, directory, spec, diagnosis, limits)
+    primary_limits = dict(limits)
+    if "controller_checkpoint_gate" in limits:
+        from .sensor_training.data import evaluate
+        # A routed parent is compared as a complete predictor, never silently
+        # replaced by its primary component's weaker validation score.
+        primary_limits["controller_checkpoint_reference"] = evaluate(parent_predictor, validation)
+        primary_limits["controller_checkpoint_reference_sha256"] = parent_sha
+    report = train_candidate(parent_path, train, validation, directory, spec, diagnosis, primary_limits)
     if spec.get("routing") or isinstance(parent_predictor, FrozenRouter):
         from .sensor_training.data import evaluate
         report["anchor_validation_before"] = report["validation_before"]

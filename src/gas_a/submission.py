@@ -22,6 +22,9 @@ from .frozen_router import load_predictor, checkpoint_paths as artifact_checkpoi
 from .monitoring import fit_reference, monitor, diagnose
 from .evolution import (load_policy, available_experiments, promotion_gate,
                         fingerprint, advance_policy, validate_controller)
+from .controller_prompts import (VERSION as CONTROLLER_PROMPT_VERSION, execution_policy,
+                                 enrich_plan, enrich_selection, request_digest)
+from .host_validation import parent_reference, candidate_gate as host_candidate_gate
 
 ROOT = Path(__file__).resolve().parents[2]
 PREDICT_ARGV = ["python3", "/app/harness.py", "predict"]
@@ -94,12 +97,15 @@ def _parent_checkpoint(rnd):
 
 
 def _decision(rnd, request, fields, token_limit, validate, corrections=1):
-    call_ids, failures = [], []
+    call_ids, failures, request_hashes = [], [], []
     for attempt in range(corrections + 1):
         # Never catch an RPC failure: its outcome may be unknown to the SDK.
+        request_hashes.append(request_digest(request))
         receipt = rnd.model(
             [{"role": "user", "content": json.dumps(request, ensure_ascii=False, allow_nan=False)}],
-            max_tokens=min(token_limit, rnd.max_output_tokens), temperature=0,
+            # Structured controller decisions must leave room for final JSON.
+            # Qwen can otherwise spend the entire authorized budget reasoning.
+            max_tokens=min(token_limit, rnd.max_output_tokens), temperature=0, enable_thinking=False,
         )
         call_ids.append(receipt.call_id)
         try:
@@ -113,12 +119,14 @@ def _decision(rnd, request, fields, token_limit, validate, corrections=1):
                    or len(value[k].encode("utf-8")) > 4000 for k in fields):
                 raise ValueError("Model decision fields must be nonempty text <=4000 bytes")
             validate(value)
-            return value, {"model_call_ids": call_ids, "corrections": failures}
+            return value, {"model_call_ids": call_ids, "corrections": failures,
+                           "prompt_version": CONTROLLER_PROMPT_VERSION, "request_sha256": request_hashes}
         except ValueError as error:
             failures.append({"call_id": receipt.call_id, "error": str(error), "response_excerpt": receipt.text[:2000]})
             if attempt == corrections:
                 raise
             request = {**request, "correction": {"attempt": attempt + 1, "error": str(error),
+                       "previous_completed_response": receipt.text[:2000],
                        "instruction": "The previous completed response failed validation. Return a corrected JSON object using only the supplied schema and choices."}}
 
 
@@ -168,8 +176,27 @@ def _history_view(records):
         record = item.get("record", item)
         if not isinstance(record, dict):
             record = item
-        result.append({"id": item["id"], **{k: record[k] for k in (
-            "round_index", "selected_artifact_id", "reason", "configuration") if k in record}})
+        compact = {"id": item["id"], **{k: record[k] for k in (
+            "round_index", "selected_artifact_id") if k in record}}
+        if "reason" in record:
+            compact["reason"] = str(record["reason"])[:600]
+        cfg = record.get("configuration")
+        if isinstance(cfg, dict):
+            compact["configuration"] = {k: cfg[k] for k in (
+                "round_index", "parent_checkpoint_sha256", "train_sha256", "validation_sha256",
+                "local_validation_before", "local_validation_after", "selected_local_macro_f1",
+                "candidate_gate", "host_candidate_gate", "experiment_failure",
+                "execution_policy", "controller_prompt_version") if k in cfg}
+            spec = cfg.get("experiment")
+            if isinstance(spec, dict):
+                compact["configuration"]["experiment"] = {k: spec[k] for k in (
+                    "name", "learning_rate", "epochs", "kept_sensors", "freeze") if k in spec}
+                compact["configuration"]["experiment_config_sha256"] = request_digest(spec)
+            if isinstance(cfg.get("checkpoint_selection"), dict):
+                compact["configuration"]["checkpoint_selection"] = {k: cfg["checkpoint_selection"][k] for k in (
+                    "mode", "selected_epoch", "selected_epoch_eligible", "eligible_epoch_count", "executed_epoch_count")
+                    if k in cfg["checkpoint_selection"]}
+        result.append(compact)
     return result
 
 
@@ -210,9 +237,12 @@ def train(rnd):
         return rnd.parent.path(Path(path).resolve().relative_to(rnd.parent.root.resolve()).as_posix())
     parent = load_predictor(checkpoint, train_data["paths"], resolve_file=parent_file)
     before = evaluate(parent, validation)
+    host_parent = parent_reference(rnd.frame.get("current_validation"), before, validation["sha256"])
     history = rnd.history()
     menu = {spec["name"]: spec for spec in config["experiments"]}
     controller = config["controller"]
+    execution = execution_policy(controller, config["limits"])
+    training_limits = {**config["limits"], "controller_checkpoint_gate": execution["promotion_gate"]}
     state = rnd.state_workspace(run / "state")
     reference = _read_state(state, "monitor_reference.json")
     if reference is None:
@@ -228,9 +258,10 @@ def train(rnd):
     elif policy["artifact_policies"]:
         policy.update(version=1, preferred_experiment=None)
     diagnosis = diagnose(before, drift, validation["sha256"], policy.get("last_measurement"))
-    allowed_menu, blocked = available_experiments(policy, menu, rnd, train_data, validation, controller)
+    allowed_menu, blocked = available_experiments(policy, menu, rnd, train_data, validation, controller, execution)
     restored = _restore_history(rnd, history, run, validation, before, controller)
-    rollback_ids = [identifier for identifier, item in restored.items() if item["gate"]["eligible"]]
+    rollback_ids = [identifier for identifier, item in restored.items()
+                    if item["gate"]["eligible"] and host_parent["comparable"]]
     actions = ["observe"] + (["experiment"] if allowed_menu else []) + (["rollback"] if rollback_ids else [])
 
     def validate_plan(value):
@@ -245,7 +276,7 @@ def train(rnd):
         if value["action"] != "rollback" and value["target_artifact_id"] != rnd.parent.artifact_id:
             raise ValueError("Observe and experiment must refer to the actual parent")
 
-    plan, planning_calls = _decision(rnd, {
+    plan_request = enrich_plan({
         "phase": "plan", "round_index": rnd.round_index,
         "request": "Use drift, diagnosis, history and bounded strategy evidence to choose observation, one continuation experiment, or a validated historical rollback. Observation is appropriate when no useful experiment remains.",
         "parent_checkpoint_sha256": rnd.parent.checkpoint_sha256,
@@ -259,25 +290,45 @@ def train(rnd):
                             "target_artifact_id": [rnd.parent.artifact_id, *rollback_ids],
                             "hypothesis": "testable hypothesis", "reason": "cite measured evidence and uncertainty"},
         "rules": "Return only JSON. Only public training rows update gradients; validation selects epochs and versions. Preserve parent Adam/scaler/steps. Hidden-stream labels or telemetry are unavailable. Do not infer physical causes from PSI alone.",
-    }, ("action", "experiment", "target_artifact_id", "hypothesis", "reason"),
+    }, controller, train_data, validation, execution)
+    plan, planning_calls = _decision(rnd, plan_request, ("action", "experiment", "target_artifact_id", "hypothesis", "reason"),
        config["max_output_tokens"], validate_plan, controller["json_corrections"])
     spec = allowed_menu[plan["experiment"]] if plan["action"] == "experiment" else None
-    report, submitted, candidate_gate = None, None, None
+    report, submitted, candidate_gate, host_gate, experiment_failure = None, None, None, None, None
     configuration = {"action": plan["action"], "experiment": spec, "round_index": rnd.round_index,
                      "parent_checkpoint_sha256": rnd.parent.checkpoint_sha256,
                      "train_sha256": train_data["sha256"], "validation_sha256": validation["sha256"],
                      "local_validation_before": before["macro_f1"],
                      "controller_model_name": rnd.model_name, "strategy_version_before": policy["version"],
+                     "controller_prompt_version": CONTROLLER_PROMPT_VERSION, "execution_policy": execution,
                      "drift_detected": drift["drift"], "monitor_reference_train_sha256": reference["train_sha256"],
-                     "validation_scope": "authorized_public_validation", "promotion_rules": controller}
+                     "validation_scope": "authorized_public_validation", "promotion_rules": controller,
+                     "host_parent_reference": host_parent}
     change = "Observed authorized public features and validation; retained the actual parent without training."
     if spec is not None:
         weak_class = diagnosis["weak_classes"][0]["label"]
         candidate = run / "candidate"
-        report = continue_candidate(checkpoint, train_data, validation, candidate, spec,
-                                    {"weakest_class": weak_class}, config["limits"],
-                                    expected_parent_sha256=rnd.parent.checkpoint_sha256,
-                                    parent_artifact_id=rnd.parent.artifact_id)
+        attempt = {"round_index": rnd.round_index, "experiment": spec,
+                   "parent_checkpoint_sha256": rnd.parent.checkpoint_sha256,
+                   "train_sha256": train_data["sha256"], "validation_sha256": validation["sha256"],
+                   "planning_model_call_ids": planning_calls["model_call_ids"]}
+        append_jsonl(state / "experiment_attempts.jsonl", {**attempt, "status": "started"})
+        try:
+            # Only this CPU/filesystem computation is recoverable here. Never
+            # include rnd.model/submit/save/restore RPCs in this exception scope.
+            report = continue_candidate(checkpoint, train_data, validation, candidate, spec,
+                                        {"weakest_class": weak_class}, training_limits,
+                                        expected_parent_sha256=rnd.parent.checkpoint_sha256,
+                                        parent_artifact_id=rnd.parent.artifact_id)
+        except (TimeoutError, ValueError, ArithmeticError, np.linalg.LinAlgError) as error:
+            experiment_failure = {"stage": "local_training", "error_type": type(error).__name__,
+                                  "message": str(error)[:1000], "candidate_submitted": False}
+            configuration["experiment_failure"] = experiment_failure
+            change = "Local continuation experiment failed (%s); rejected partial files and retained the actual parent." % type(error).__name__
+            append_jsonl(state / "experiment_attempts.jsonl", {**attempt, "status": "failed", **experiment_failure})
+        else:
+            append_jsonl(state / "experiment_attempts.jsonl", {**attempt, "status": "trained"})
+    if report is not None:
         code_paths = _snapshot(candidate)
         if (candidate / "routing.json").is_file():
             code_paths.append("routing.json")
@@ -286,6 +337,7 @@ def train(rnd):
         configuration["local_validation_after"] = report["validation_after"]["macro_f1"]
         candidate_gate = promotion_gate(before, report["validation_after"], controller)
         configuration["candidate_gate"] = candidate_gate
+        configuration["checkpoint_selection"] = report["checkpoint_selection"]
         change = "Continued the actual parent using %s; preserved Adam/scaler and exported epoch %d, step %d." % (
             spec["name"], report["final_epochs"], report["final_steps"])
         write_json(candidate / "planning.json", {"decision": plan, **planning_calls})
@@ -297,8 +349,11 @@ def train(rnd):
             checkpoint_paths=artifact_checkpoint_paths(candidate / "checkpoint.npz"),
             code_paths=code_paths, predict_argv=PREDICT_ARGV,
         )
+        host_gate = host_candidate_gate(submitted, host_parent, report["validation_after"],
+                                        validation["sha256"], controller)
+        configuration["host_candidate_gate"] = host_gate
     eligible = [rnd.parent.artifact_id]
-    if submitted and candidate_gate["eligible"]:
+    if submitted and candidate_gate["eligible"] and host_gate["eligible"]:
         eligible.append(submitted["artifact_id"])
     if plan["action"] == "rollback":
         eligible.append(plan["target_artifact_id"])
@@ -307,7 +362,7 @@ def train(rnd):
         if value["selected_artifact_id"] not in eligible:
             raise ValueError("Model selected an unknown or regressing artifact")
 
-    selection, selection_calls = _decision(rnd, {
+    selection_request = enrich_selection({
         "phase": "select", "round_index": rnd.round_index,
         "request": "Confirm a guarded experiment promotion, observation, or actual historical rollback using the current public validation. Retain the parent if evidence is insufficient.",
         "action": plan["action"], "parent_artifact_id": rnd.parent.artifact_id,
@@ -316,10 +371,13 @@ def train(rnd):
                                   "historical": restored},
         "host_parent_validation": rnd.frame.get("current_validation", {}),
         "host_candidate_receipt": submitted,
+        "host_admission": host_gate, "experiment_failure": experiment_failure,
         "response_schema": {"selected_artifact_id": eligible,
                             "reason": "explain measured results and choice"},
         "rules": "Return only JSON. Compare the same metric and dataset scope. Never call local metrics hidden-test results. Prefer retaining the parent on a tie.",
-    }, ("selected_artifact_id", "reason"), config["max_output_tokens"], validate_selection, controller["json_corrections"])
+    }, controller, validation["sha256"], candidate_gate, report["checkpoint_selection"] if report else None)
+    selection, selection_calls = _decision(rnd, selection_request, ("selected_artifact_id", "reason"),
+                                         config["max_output_tokens"], validate_selection, controller["json_corrections"])
     selected = selection["selected_artifact_id"]
     candidate_id = submitted["artifact_id"] if submitted else None
     selected_metric, selected_sha256 = before, rnd.parent.checkpoint_sha256
@@ -334,9 +392,10 @@ def train(rnd):
         change = "Retained the actual parent checkpoint; the tested candidate was not adopted."
     next_policy = advance_policy(policy, selected=selected, parent_id=rnd.parent.artifact_id,
                                  candidate_id=candidate_id, plan=plan,
-                                 attempt_key=fingerprint(rnd.parent.checkpoint_sha256, train_data["sha256"], validation["sha256"], spec) if spec else None,
+                                 attempt_key=fingerprint(rnd.parent.checkpoint_sha256, train_data["sha256"], validation["sha256"], spec, execution) if spec else None,
                                  gain=candidate_gate["macro_f1_gain"] if candidate_gate else None,
-                                 validation_sha256=validation["sha256"], selected_f1=selected_metric["macro_f1"])
+                                  validation_sha256=validation["sha256"], selected_f1=selected_metric["macro_f1"],
+                                  experiment_failed=experiment_failure is not None)
     configuration.update(selected_checkpoint_sha256=selected_sha256,
                          selected_local_macro_f1=selected_metric["macro_f1"], strategy_version_after=next_policy["version"])
     write_json(state / "strategy.json", next_policy)
@@ -348,6 +407,7 @@ def train(rnd):
         "plan": plan, "selection": selection, "configuration": configuration,
         "model_call_ids": list(rnd.call_ids), "planning_calls": planning_calls, "selection_calls": selection_calls,
         "host_candidate_receipt": submitted, "historical_validation": restored,
+        "experiment_failure": experiment_failure, "host_admission": host_gate,
     }
     append_jsonl(state / "decisions.jsonl", record)
     write_json(run / "round_summary.json", record)

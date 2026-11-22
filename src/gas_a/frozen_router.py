@@ -223,7 +223,9 @@ def build_bundle(parent_path, parent_predictor, train, validation, candidate, sp
         if any(not np.array_equal(getattr(home_before, group)[k], getattr(old_router, group)[k])
                for group in ("params", "first", "second") for k in home_before.params):
             raise ValueError("Home branches require an explicit migration when their neural states differ")
-    train_home(home_before, train, routing["home"], aux)
+    home_report = train_home(home_before, train, routing["home"], aux,
+                             max_epochs=limits["max_epochs"],
+                             deadline=started + limits["max_seconds_per_candidate"])
     cutoffs = binary_cutoffs(home_before, train["x"], train["y"])
     cutoffs = {k: {"cut": value["cut"]} for k, value in cutoffs.items()}
     models = {"four_sensor": load_model(anchor_path), "five_sensor": load_model(aux / "five_sensor.npz"),
@@ -252,7 +254,7 @@ def build_bundle(parent_path, parent_predictor, train, validation, candidate, sp
         "five_sensor": five_report, "five_sensor_initial_state": state_identity(five_before),
         "home": {"parent_checkpoint_sha256": digest(home_parent),
                  "router_parent_checkpoint_sha256": digest(parents.get("home_router", parent_path)),
-                 "initial_state": state_identity(home_before),
+                  "initial_state": state_identity(home_before), "training": home_report,
                  "trunk_final_state": state_identity(models["home_trunk"]),
                  "router_final_state": state_identity(models["home_router"]), "training_rows": len(train["y"])},
     })

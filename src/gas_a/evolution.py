@@ -23,8 +23,11 @@ def validate_controller(config):
             raise ValueError("Invalid drift threshold: " + key)
 
 
-def fingerprint(parent_sha256, train_sha256, validation_sha256, spec):
-    return hashlib.sha256(json.dumps([parent_sha256, train_sha256, validation_sha256, spec],
+def fingerprint(parent_sha256, train_sha256, validation_sha256, spec, execution_policy=None):
+    identity = [parent_sha256, train_sha256, validation_sha256, spec]
+    if execution_policy is not None:
+        identity.append(execution_policy)
+    return hashlib.sha256(json.dumps(identity,
                                      sort_keys=True, allow_nan=False).encode()).hexdigest()
 
 
@@ -53,10 +56,10 @@ def load_policy(value, menu):
     return value
 
 
-def available_experiments(policy, menu, rnd, train, validation, config):
+def available_experiments(policy, menu, rnd, train, validation, config, execution_policy=None):
     allowed, blocked = {}, []
     for name, spec in menu.items():
-        identity = fingerprint(rnd.parent.checkpoint_sha256, train["sha256"], validation["sha256"], spec)
+        identity = fingerprint(rnd.parent.checkpoint_sha256, train["sha256"], validation["sha256"], spec, execution_policy)
         rejected = sum(a["fingerprint"] == identity and not a["adopted"] for a in policy["attempts"])
         if rejected >= config["max_repeat_rejections"]:
             blocked.append(name)
@@ -75,14 +78,16 @@ def promotion_gate(before, after, config):
             "macro_f1_gain": gain, "class_recall_losses": losses}
 
 
-def advance_policy(policy, *, selected, parent_id, candidate_id, plan, attempt_key, gain, validation_sha256, selected_f1):
+def advance_policy(policy, *, selected, parent_id, candidate_id, plan, attempt_key, gain, validation_sha256, selected_f1,
+                   experiment_failed=False):
     result = deepcopy(policy)
     parent_snapshot = {k: policy[k] for k in ("version", "preferred_experiment")}
     result["artifact_policies"].setdefault(parent_id, parent_snapshot)
-    if candidate_id:
-        adopted = selected == candidate_id
+    if candidate_id or experiment_failed:
+        adopted = candidate_id is not None and selected == candidate_id
         result["attempts"].append({"fingerprint": attempt_key, "experiment": plan["experiment"],
-                                   "adopted": adopted, "macro_f1_gain": gain})
+                                   "adopted": adopted, "macro_f1_gain": gain,
+                                   "status": "local_training_failed" if experiment_failed else "measured"})
         result["attempts"] = result["attempts"][-128:]
         if adopted:
             result["revision"] += 1

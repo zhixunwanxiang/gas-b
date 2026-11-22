@@ -229,7 +229,9 @@ class OfflineHost:
             _, validation = load_pair(self.root / "data/train.jsonl", self.root / "data/validation.jsonl")
             self.candidate_metrics = evaluate(load_predictor(self.candidate / "checkpoint.npz"), validation)
             reply.update(type="candidate_response", artifact_id=f"candidate-{self.frame['round_index']}",
-                         summary={"metrics": {"macro_f1": self.candidate_metrics["macro_f1"]}})
+                         summary={"metrics": {"macro_f1": self.candidate_metrics["macro_f1"]},
+                                  "validation_sha256": digest(self.root / "data/validation.jsonl"),
+                                  "scope": "authorized_public_validation"})
         elif kind == "state_request":
             assert "files" not in frame
             upload = self.uploads[frame["upload_id"]]
