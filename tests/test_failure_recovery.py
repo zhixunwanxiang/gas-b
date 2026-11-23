@@ -32,8 +32,8 @@ class FailureRecoveryTest(unittest.TestCase):
         self.assertTrue(rnd._finished)
         return host.saved_state
 
-    def test_host_regression_and_unknown_scope_keep_parent(self):
-        for index,mode in enumerate(("regression","missing_digest"),1):
+    def test_host_regression_and_conflicting_digest_keep_parent(self):
+        for index,mode in enumerate(("regression","conflicting_digest"),1):
             host = OfflineHost(self.root,self.parent,index)
             original = host.write
             def inject(text):
@@ -42,13 +42,32 @@ class FailureRecoveryTest(unittest.TestCase):
                     if mode == "regression":
                         host.pending[-1]["summary"]["metrics"]["macro_f1"] = 0.
                     else:
-                        host.pending[-1]["summary"].pop("validation_sha256")
+                        host.pending[-1]["summary"]["validation_sha256"] = "sha256:" + "0"*64
                 return result
             host.write = inject
             self.run_host(host)
             self.assertTrue(host.record["configuration"]["candidate_gate"]["eligible"])
             self.assertFalse(host.record["configuration"]["host_candidate_gate"]["eligible"])
             self.assertEqual(host.record["selected_artifact_id"],host.frame["parent_artifact"]["artifact_id"])
+
+    def test_compact_sdk_receipt_keeps_host_score_and_binds_current_projection(self):
+        host = OfflineHost(self.root,self.parent)
+        original = host.write
+        def compact(text):
+            result = original(text)
+            if json.loads(text)["type"] == "candidate_request":
+                score = host.pending[-1]["summary"]["metrics"]["macro_f1"]
+                host.pending[-1]["summary"] = {"macro_f1": score}
+            return result
+        host.write = compact
+        state = self.run_host(host)
+        gate = host.record["configuration"]["host_candidate_gate"]
+        self.assertTrue(gate["eligible"])
+        self.assertEqual(host.record["selected_artifact_id"],"candidate-1")
+        self.assertEqual(gate["candidate"]["scope_source"],"sdk_current_candidate_public_validation")
+        decision=json.loads((state/"decisions.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+        self.assertNotIn("scope",decision["host_candidate_receipt"]["summary"])
+        self.assertNotIn("validation_sha256",decision["host_candidate_receipt"]["summary"])
 
     def test_local_timeout_finishes_and_records_failure_with_model_decision(self):
         host = OfflineHost(self.root,self.parent)

@@ -1,4 +1,4 @@
-"""v5 A/B/C 真实回滚补充验收：复用已核验正常记录，只修改独立父模型副本。会产生费用。"""
+"""A/B/C 真实回滚补充验收：复用已核验正常记录，只修改独立父模型副本。会产生费用。"""
 import argparse
 from datetime import datetime, timezone, timedelta
 import json

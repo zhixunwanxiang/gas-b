@@ -7,6 +7,7 @@ The host attaches the official prompt. These are participant instructions only.
 # 下面的提示词字符串会实际发送给模型；本次中文说明只使用注释，不修改提示内容。
 import hashlib
 import json
+from .host_validation import HOST_ADMISSION_VERSION
 
 VERSION = "gas-a-controller-zh-v4"
 EPOCH_POLICY_VERSION = "same-promotion-gate-per-epoch-v1"
@@ -32,7 +33,7 @@ reason 简短列出：同口径父/候选/历史分数、关键类别召回或�
 def execution_policy(controller, limits):
     # 把逐 epoch 选择、最终晋升和训练预算绑定为可序列化证据，供历史可比性和实验指纹使用。
     return {"epoch_policy_version": EPOCH_POLICY_VERSION,
-            "host_admission_policy_version": "explicit-public-scope-and-digest-v1",
+            "host_admission_policy_version": HOST_ADMISSION_VERSION,
             "promotion_gate": {key: controller[key] for key in (
                 "minimum_macro_f1_gain", "minimum_class_support", "maximum_class_recall_drop")},
             "training_limits": dict(limits)}

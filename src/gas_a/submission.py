@@ -27,7 +27,7 @@ from .evolution import (load_policy, available_experiments, promotion_gate,
                         fingerprint, advance_policy, validate_controller)
 from .controller_prompts import (VERSION as CONTROLLER_PROMPT_VERSION, execution_policy,
                                  enrich_plan, enrich_selection, request_digest)
-from .host_validation import parent_reference, candidate_gate as host_candidate_gate
+from .host_validation import parent_reference, candidate_gate as host_candidate_gate, bind_candidate_validation
 
 ROOT = Path(__file__).resolve().parents[2]
 PREDICT_ARGV = ["python3", "/app/harness.py", "predict"]
@@ -390,7 +390,8 @@ def train(rnd):
             code_paths=code_paths, predict_argv=PREDICT_ARGV,
         )
         host_gate = host_candidate_gate(submitted, host_parent, report["validation_after"],
-                                        validation["sha256"], controller)
+                                        validation["sha256"], controller,
+                                        binding=bind_candidate_validation(rnd, submitted, validation["sha256"]))
         configuration["host_candidate_gate"] = host_gate
     # 阶段 9：程序先收紧可选 ID，父产物始终可保留；新候选必须同时通过本地逐类保护与宿主测量门槛。
     eligible = [rnd.parent.artifact_id]

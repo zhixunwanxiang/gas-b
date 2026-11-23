@@ -13,6 +13,7 @@ from .monitoring import fit_reference, monitor, diagnose
 from .training import continue_candidate
 from .prompts import VERSION as PROMPT_VERSION, plan_contract, PLAN_INSTRUCTION, SELECT_INSTRUCTION
 from ..evolution import available_experiments, fingerprint
+from ..host_validation import HOST_ADMISSION_VERSION, bind_candidate_validation
 from ..sensor_training.io import append_jsonl, digest, write_json
 from ..submission import ROOT, PREDICT_ARGV, _decision, _parent_checkpoint, _selected_checkpoint, _snapshot
 
@@ -194,7 +195,8 @@ def train(rnd):
     history = rnd.history()
     state = rnd.state_workspace(run / "state")
     reference_path = state / "regression_monitor_reference.json"
-    # 阶段 3：首轮只从 train 建立监测参考；后续沿用并校验其 train 摘要，保留跨轮比较口径。
+    # 阶段 3：首轮只从 train 建立监测参考；后续校验其来源和结构，保持最初的比较口径。
+    # 平台可以更新公开 train，不能因此重拟合父模型 scaler，也不能把合法新投影判成状态损坏。
     # monitor 看输入变没变，diagnose 看公开标签上的误差分段；二者一起给出可验证的实验线索。
     reference = json.loads(reference_path.read_text(encoding="utf-8")) if reference_path.exists() else fit_reference(train_data, dataset)
     drift = monitor(reference, validation, train_data, dataset, full_config["controller"]["drift_thresholds"])
@@ -207,7 +209,9 @@ def train(rnd):
         policy.update(paired)
     elif policy["artifact_policies"]:
         policy.update(version=1, preferred_experiment=None)
-    execution = {"format": "rul.execution.v1", "rules": rules, "limits": limits, "prompt_version": PROMPT_VERSION}
+    execution = {"format": "rul.execution.v1", "rules": rules, "limits": limits, "prompt_version": PROMPT_VERSION,
+                 "host_admission_policy_version": HOST_ADMISSION_VERSION,
+                 "monitor_reference_policy": "fixed_initial_training_projection-v1"}
     allowed, blocked = available_experiments(policy, menu, rnd, train_data, validation, rules, execution)
     # 指纹包含父模型、train、validation、方案和执行规则；只屏蔽同一身份下反复失败的方案。
     restored = _restore_history(rnd, history, run, validation, before, rules, dataset)
@@ -282,7 +286,8 @@ def train(rnd):
         submitted = rnd.submit_candidate(candidate, hypothesis=plan["hypothesis"], change_summary=change,
             configuration=cfg, seed=parent.meta["seed"], checkpoint_paths=["checkpoint.npz"],
             code_paths=_snapshot(candidate), predict_argv=PREDICT_ARGV)
-        admission = host_gate(submitted, parent_host, report["validation_after"], validation["sha256"], rules)
+        admission = host_gate(submitted, parent_host, report["validation_after"], validation["sha256"], rules,
+                              binding=bind_candidate_validation(rnd, submitted, validation["sha256"]))
         cfg["host_candidate_gate"] = admission
     eligible = [rnd.parent.artifact_id]
     # 阶段 8：最终白名单取本地和宿主两道门槛的交集；不合格候选即使模型坚持也不能选。

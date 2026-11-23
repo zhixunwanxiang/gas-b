@@ -17,9 +17,14 @@ def fit_reference(train, dataset):
 
 
 def monitor(reference, current, train, dataset, thresholds):
-    # 跨轮沿用的参考必须仍属于同一个 train 和同一套特征，否则停止比较，避免口径混用。
+    # SDK 允许本轮 train 投影更新；监测继续相对“最初公开 train”，不追随新分布移动参考。
+    # 旧参考由 SDK 保存的状态提供完整性保护；这里核验数据集、来源摘要格式、维度和统计结构。
+    reference_sha = reference.get("train_sha256")
     if (reference.get("format") != "rul.monitor.v1" or reference.get("dataset") != dataset
-            or reference.get("train_sha256") != train["sha256"] or reference.get("paths") != current["paths"]
+            or not isinstance(reference_sha, str) or not reference_sha.startswith("sha256:")
+            or len(reference_sha) != 71 or any(c not in "0123456789abcdef" for c in reference_sha[7:])
+            or type(reference.get("rows")) is not int or reference["rows"] < 1
+            or reference.get("paths") != current["paths"] or train["paths"] != current["paths"]
             or len(reference.get("features", [])) != len(current["paths"])):
         raise ValueError("Regression monitoring reference differs from its original training projection")
     rows, features = len(current["x"]), []
@@ -47,7 +52,9 @@ def monitor(reference, current, train, dataset, thresholds):
     ordered = sorted(features, key=lambda f: f["psi"], reverse=True)
     return {"scope": "authorized_public_validation_features", "dataset": dataset, "rows": rows,
             "drift": any(f["drift"] for f in features), "changed_features": sum(f["drift"] for f in features),
-            "reference_train_sha256": train["sha256"], "current_sha256": current["sha256"],
+            "reference_policy": "fixed_initial_training_projection",
+            "reference_train_sha256": reference_sha, "current_train_sha256": train["sha256"],
+            "training_projection_changed": reference_sha != train["sha256"], "current_sha256": current["sha256"],
             "thresholds": thresholds, "top_features": ordered[:8], "features": ordered}
 
 

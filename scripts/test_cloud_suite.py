@@ -19,8 +19,8 @@ from scripts.cloud_experiment import CloudJournal
 from scripts.live_platforms import load_env, configuration, write_receipt, termination_handler
 from scripts.docker_rehearsal import DockerRuntime
 
-DEFAULT_IMAGE = "gas-rsi-abc:wyx-sdk104-v6-20261123"
-DEFAULT_IMAGE_ID = "sha256:905c8e9d172d5271091b84be787922c67c14388bb75cf05b14f4b0c18dc515e7"
+DEFAULT_IMAGE = "gas-rsi-abc:wyx-sdk104-v7-20261123"
+DEFAULT_IMAGE_ID = "sha256:259ad61698efd54431e15b5f7da917a3388261a4287a594bf0668695502caa37"
 
 
 def snapshot(out, baseline):

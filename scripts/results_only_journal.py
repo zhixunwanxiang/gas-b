@@ -99,7 +99,8 @@ class ResultsOnlyJournal(CloudJournal):
         monitor = json.loads((state / "monitoring.json").read_text(encoding="utf-8"))
         values[f"{self.phase}/drift_detected"] = int(monitor["drift"])
         diagnostic = json.loads((state / "diagnosis.json").read_text(encoding="utf-8"))
-        safe_monitor = picked(monitor, ("scope", "dataset", "rows", "drift", "changed_features", "thresholds", "top_features", "sensors"))
+        safe_monitor = picked(monitor, ("scope", "dataset", "rows", "drift", "changed_features", "thresholds", "top_features", "sensors",
+            "reference_policy", "reference_train_sha256", "current_train_sha256", "training_projection_changed"))
         # 只上传统计及诊断聚合，不上传逐样本特征和 answer；完整诊断文件仍保存在本地状态。
         safe_diagnostic = picked(diagnostic, ("scope", "weak_classes", "top_confusions", "drift_sensors", "metrics",
             "rul_segments", "training_target_cuts", "drift_features", "same_scope_previous_macro_f1_delta", "hypothesis", "interpretation", "hidden_feedback_available"))

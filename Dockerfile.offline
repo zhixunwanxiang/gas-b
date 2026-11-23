@@ -1,4 +1,5 @@
-# 离线重建：基础运行环境必须是已核验 SDK 1.0.4 / NumPy 1.26.4 / Python 3.12.13 的旧 v4 镜像。
+# 离线重建：基础镜像必须是已核验 SDK 1.0.4 / NumPy 1.26.4 / Python 3.12.13 的运行环境。
+# 默认固定旧 v4，也可用 CONTEST_RUNTIME 显式传入本机已核验的后续镜像及摘要。
 # 标准在线构建仍使用 Dockerfile；本文件不访问包源，不把旧镜像的 /app 源码当成最新实现。
 ARG CONTEST_RUNTIME=gas-rsi-a:wyx-sdk104-v4-20261122@sha256:388fb0d9721fa11d0cb9befcb6dee6dbadb23597dfdb59415913d276b4ec25fe
 FROM ${CONTEST_RUNTIME} AS runtime

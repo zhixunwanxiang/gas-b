@@ -1,4 +1,4 @@
-"""从官方初始基线开始的一次固定v6全流程：真实正常/回滚、独立核验、原回复重放。会产生费用。"""
+"""从官方初始基线开始的固定镜像全流程：真实正常/回滚、独立核验、原回复重放。会产生费用。"""
 import argparse
 from datetime import datetime, timezone
 import json
@@ -70,7 +70,7 @@ def write_summary_cloud(root, config, summary):
     out = root / "cloud-summary"
     out.mkdir()
     journal = ResultsOnlyJournal(swanlab, config, out, {"purpose": "fresh_end_to_end_result_summary_no_new_model_calls",
-        "model": normal.MODEL, "image_id": summary["image_id"]}, "fresh-v6-complete-results")
+        "model": normal.MODEL, "image_id": summary["image_id"]}, "fresh-full-complete-results")
     state = "crashed"
     try:
         journal.begin()

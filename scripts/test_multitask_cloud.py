@@ -1,4 +1,4 @@
-"""v5真实27B和SwanLab多任务验收：每个数据集一个Run，原始回复直接送回SDK。会产生费用。"""
+"""真实27B和SwanLab多任务验收：每个数据集一个Run，原始回复直接送回SDK。会产生费用。"""
 import argparse
 from datetime import datetime, timezone, timedelta
 import hashlib

@@ -22,6 +22,7 @@ from gas_a.regression import submission as regression
 from gas_a.regression.data import BEARING_FEATURES, input_values, load_pair, load_model, schema
 from gas_a.regression.evaluation import evaluate, promotion_gate, host_gate, parent_reference
 from gas_a.regression.training import continue_candidate, fit_epoch
+from gas_a.regression.monitoring import fit_reference, monitor
 from gas_a.sensor_training.io import digest
 from gas_a.sensor_training.reference.model import Model
 
@@ -125,6 +126,10 @@ class RegressionTest(unittest.TestCase):
                 np.testing.assert_array_equal(previous.scale, candidate.scale)
                 self.assertEqual(candidate.meta["target_mean"], previous.meta["target_mean"])
                 self.assertEqual(candidate.meta["target_scale"], previous.meta["target_scale"])
+                report = json.loads((host.candidate / "training.json").read_text(encoding="utf-8"))
+                self.assertEqual(report,json.loads((host.candidate / "continuation.json").read_text(encoding="utf-8")))
+                self.assertEqual(report["parent_checkpoint_sha256"],digest(parent))
+                self.assertEqual(report["checkpoint_sha256"],digest(host.candidate / "checkpoint.npz"))
                 record = json.loads((state / "decisions.jsonl").read_text(encoding="utf-8").splitlines()[-1])
                 self.assertEqual(record["planning_calls"]["prompt_version"], regression.PROMPT_VERSION)
                 self.assertNotIn("OFFICIAL_PROMPT_SENTINEL", json.dumps(host.messages))
@@ -145,6 +150,62 @@ class RegressionTest(unittest.TestCase):
             for key in ("w1", "b1"):
                 np.testing.assert_array_equal(getattr(original, group)[key], getattr(after, group)[key])
         self.assertFalse(np.array_equal(original.params["w2"], after.params["w2"]))
+
+    def test_authorized_training_projection_can_change_between_sdk_rounds(self):
+        for dataset in ("B","C"):
+            root=self.root/dataset
+            checkpoint=make_fixture(root,dataset)
+            first=RegressionHost(root,checkpoint,dataset,1)
+            state=self.run_host(first)
+            reference=json.loads((state/"regression_monitor_reference.json").read_text(encoding="utf-8"))
+            parent=first.candidate/"checkpoint.npz" if first.record["selected_artifact_id"]=="candidate-1" else checkpoint
+            original=load_model(parent,dataset)
+            path=root/"data/train.jsonl"
+            extra=json.loads(path.read_text(encoding="utf-8").splitlines()[0]);extra["id"]="new-authorized-train-row"
+            with path.open("a",encoding="utf-8") as stream: stream.write(json.dumps(extra)+"\n")
+            second=RegressionHost(root,parent,dataset,2,history=[{"id":"history-1",**first.record}],state=state)
+            next_state=self.run_host(second)
+            after=load_model(second.candidate/"checkpoint.npz",dataset)
+            np.testing.assert_array_equal(after.mean,original.mean)
+            np.testing.assert_array_equal(after.scale,original.scale)
+            for key in ("target_mean","target_scale","seed"): self.assertEqual(after.meta[key],original.meta[key])
+            self.assertGreater(after.meta["steps"],original.meta["steps"])
+            self.assertEqual(json.loads((next_state/"regression_monitor_reference.json").read_text(encoding="utf-8")),reference)
+            drift=json.loads((next_state/"monitoring.json").read_text(encoding="utf-8"))
+            self.assertTrue(drift["training_projection_changed"])
+            self.assertEqual(drift["reference_train_sha256"],reference["train_sha256"])
+            self.assertEqual(drift["current_train_sha256"],digest(path))
+            self.assertEqual(second.record["history_ids"],["history-1"])
+
+    def test_changed_train_does_not_allow_corrupt_or_cross_dataset_monitor_state(self):
+        checkpoint=make_fixture(self.root,"B")
+        train,validation=load_pair(self.root/"data/train.jsonl",self.root/"data/validation.jsonl","B")
+        reference=fit_reference(train,"B")
+        thresholds=json.loads((ROOT/"submission_config.json").read_text(encoding="utf-8"))["controller"]["drift_thresholds"]
+        for change in ({"train_sha256":"not-a-digest"},{"dataset":"C"},{"rows":0},{"paths":[]}):
+            with self.subTest(change=change),self.assertRaises(ValueError):
+                monitor({**reference,**change},validation,train,"B",thresholds)
+
+    def test_sdk_compact_regression_candidate_summary_can_be_adopted(self):
+        for dataset in ("B","C"):
+            root=self.root/dataset;checkpoint=make_fixture(root,dataset)
+            host=RegressionHost(root,checkpoint,dataset)
+            original=host.write
+            def compact(text):
+                result=original(text)
+                if json.loads(text)["type"]=="candidate_request":
+                    score=host.pending[-1]["summary"]["metrics"]["rmse"]
+                    host.pending[-1]["summary"]={"rmse":score}
+                return result
+            host.write=compact
+            self.run_host(host)
+            cfg=host.record["configuration"]
+            self.assertTrue(cfg["candidate_gate"]["eligible"])
+            self.assertTrue(cfg["host_candidate_gate"]["eligible"])
+            self.assertEqual(host.record["selected_artifact_id"],"candidate-1")
+            decision=json.loads((host.saved_state/"decisions.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+            self.assertNotIn("scope",decision["host_candidate_receipt"]["summary"])
+            self.assertEqual(cfg["host_candidate_gate"]["candidate"]["scope_source"],"sdk_current_candidate_public_validation")
 
     def test_lower_rmse_and_comparable_host_required(self):
         before = {"rmse": 100., "mae": 80.}

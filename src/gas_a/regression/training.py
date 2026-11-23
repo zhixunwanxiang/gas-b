@@ -111,5 +111,7 @@ def continue_candidate(checkpoint, train, validation, output, spec, limits, rule
                          "actual_continuation": best.meta["steps"] > original.meta["steps"]}}
     if not all(report["checks"].values()):
         raise ValueError("Regression continuation state was not preserved")
+    # 与三份官方续训指南的结果目录保持一致；两份报告来自同一个对象，不另算或美化成绩。
+    write_json(output / "training.json", report)
     write_json(output / "continuation.json", report)
     return report

@@ -4,6 +4,8 @@
 
 **当前支持 A 分类、B/C 剩余寿命回归，原生接口使用 contest-harness SDK 1.0.4。** 方案范围和安全门槛由代码限定，27B 负责依据证据做选择；系统不会任意生成并执行新的训练代码。
 
+当前 **v7 镜像**已纳入续训审查的三项修复：B/C 允许跨轮更新授权训练投影而保留最初监测参考；输出指南约定的 `training.json`；精简候选回执通过本轮 SDK 提交与当前文件摘要绑定，仍拒绝显式冲突和无法核验的宿主分数。实现见[续训与 SDK 修复说明](docs/BASELINE_SDK_FIXES_20261123.md)，构建与离线镜像验证见[v7 交付说明](docs/IMAGE_V7_20261123.md)。下列成绩来自修复后固定 v7 镜像的全新真实 27B 测试，未沿用 v6 回执或结果。
+
 ## 当前任务与最近结果
 
 | 数据集 | 输入 | 预测结果 | 选版主指标 |
@@ -12,7 +14,7 @@
 | B：轴承剩余寿命 | 水平/垂直各 17 个振动特征 | 非负寿命，单位分钟 | RMSE 越低越好，辅助 MAE |
 | C：发动机剩余寿命 | 3 项设置、21 项传感器值 | 非负寿命，单位循环 | RMSE 越低越好，辅助 MAE、NASA 评分 |
 
-2026-11-23 最新一次全新测试使用同一个固定 v6 镜像，从三个官方公开包的初始模型、空历史和空状态开始，完成 **12 轮正常训练 + 6 轮故障回滚/继承检查**，共 **36 次真实 PyTRiO Qwen3.8-27B 调用**。每个数据集有 3 次“读非空历史—实际实验—依据结果决策”完整记录；运行中没有人工指定方案或改写回复。
+2026-11-23 13:59:36 至 14:22:56，最新一次全新测试使用同一个固定 v7 镜像，从三个官方公开包的初始模型、空历史和空状态开始，完成 **12 轮正常训练 + 6 轮故障回滚/继承检查**，共 **36 次真实 PyTRiO Qwen3.8-27B 调用**，提供方报告 225,491 tokens。每个数据集有 3 次“读非空历史—实际实验—依据结果决策”完整记录；运行中没有人工指定方案或改写回复。
 
 | 任务 | 公开包初始基线 | 最终成绩 | 改善 | 正常阶段升级 |
 |---|---:|---:|---|---:|
@@ -20,9 +22,11 @@
 | B：RMSE ↓ | 681.159832604 | 651.885364673 | 误差降低 4.2977% | 2 次 |
 | C：RMSE ↓ | 52.868572566 | 51.761745579 | 误差降低 2.0935% | 2 次 |
 
-三组实际历史回滚和下一轮完整产物继承均通过；151 项离线测试通过。使用本次保存的回复重放后，16 个检查点/路由文件、27 组逐条预测及所选版本一致，重放新增模型调用为 0。7 个新云端 Run 均已回读确认 `FINISHED`。
+三组实际历史回滚和下一轮完整产物继承均通过；v7 构建前 159 项项目测试通过，镜像内另有 17 项修复回归测试通过。使用本次保存的回复重放后，16 个检查点/路由文件、27 组逐条预测及所选版本一致，重放新增模型调用为 0。7 个新云端 Run 均已回读确认 `FINISHED`，本次没有触发响应纠正请求。
 
-[最新全流程结果、七个云端链接与验证边界](docs/FRESH_PLATFORM_TEST_20261123.md) · [SwanLab 总览](https://swanlab.cn/@1218/gas-b/runs/e6e33b7e2b0a410fa42143405b6d93f6/chart)
+[最新 v7 全流程结果、七个云端链接与验证边界](docs/FRESH_V7_REAL_TEST_20261123.md) · [SwanLab 总览](https://swanlab.cn/@1218/gas-b/runs/27bd34cfe76742dcac41df4e9a3f93ee/chart)
+
+本次镜像、精简源码/证据包和报告位于 `output/fresh-platform-test-v7-20261123/`，含清单共 **62,851,302 字节（59.94 MiB）**，低于 60 MiB。材料 ZIP 对一份相同的初始权重去重，解压后先运行 `restore_materials.py`；恢复后与原材料逐字节核验 169 个文件。完整逐条预测、公开大数据和所有轮次权重仍在本地 runtime，精简包不替代该目录。
 
 这些成绩来自**公开数据上的本地 SDK 宿主模拟**，不等于组委会正式宿主、最终平台基线或隐藏测试集成绩。旧实验及失败记录另见文末历史资料，不能与本次成绩混合统计。
 
@@ -53,7 +57,7 @@
 |---|---|
 | A 上线 | Macro-F1 严格提高且至少增加 `0.0005`，即 **0.05 个百分点**；父验证支持数至少 20 的类别，单步召回下降最多 `0.20`，即 **20 个百分点** |
 | B/C 上线 | RMSE 至少减少 `max(0.000001, 父 RMSE × 0.0005)`，同时 MAE 最多相对增加 2% |
-| 宿主回执 | 授权公开验证范围与文件摘要一致，本地/宿主测量一致，宿主主指标收益达标；不能用缺失或冲突证据绕过门槛 |
+| 宿主回执 | 授权公开验证身份由显式字段或本轮 SDK 候选事务核验，分数始终使用宿主值并与本地复核一致；冲突、未知指标或未绑定的缺省身份仍拒绝 |
 | 漂移 | 当前样本至少 30 条；PSI ≥ 0.2、分箱距离 ≥ 0.2 或均值偏移 ≥ 1.5 个训练标准差 |
 | 漂移汇总 | A 先对每个传感器的 8 维指标取均值再判断；B/C 按 34/24 列逐项判断 |
 | 数值训练预算 | A 最多 32 个 epoch，B/C 最多 8 个；每个候选数值阶段最多 30 秒，还受各菜单轮数和早停限制 |
@@ -67,6 +71,7 @@
 - 只使用平台授权的公开 `train` / `validation`。train 用于更新梯度和拟合训练统计，validation 可用于诊断、选 epoch、选路与选版。隐藏数据不挂进训练容器，也不获取隐藏标签。
 - 续训以本轮 `rnd.parent` 声明的检查点和摘要为准，继承权重、Adam 一二阶矩、标准化、seed 和累计训练量。未采用候选不会自动变成下轮父模型。
 - 样本 `id` 只用于数据一致性检查，不进入模型；不从文件名、样本号或匿名标识反推标签。B/C 特征结构、顺序、profile 与分钟/循环单位均严格校验。
+- B/C 跨轮 train 更新时仍使用首轮监测参考，分别记录参考与当前 train 的摘要；父检查点的输入/目标 scaler 不重拟合。`training.json` 与 `continuation.json` 保存同一份真实续训报告。
 - `/app`、`/data`、`/previous`、`/state`、`/model` 按阶段只读使用。候选与 `state_workspace()` 返回的状态副本写在 `/workspace`，通过 SDK 保存。
 - SDK 1.0.4 使用 `chunked-v1` 上传。上传期间不修改文件，容量以 `rnd.limits` 为准；不支持新协议时明确报错。
 - 完整但非法的模型回复最多纠正一次，并保留每次真实回执。RPC 发出后中断会立即结束会话，不捕获后继续发请求，也不自动重试结果未知的操作。
@@ -116,14 +121,14 @@ $imageId = (& $dockerExe image inspect $imageTag --format '{{.Id}}').Trim()
 
 ```powershell
 & $dockerExe build -f Dockerfile.offline `
-  --build-arg CONTEST_RUNTIME=gas-rsi-abc:wyx-sdk104-v6-20261123 `
+  --build-arg CONTEST_RUNTIME=gas-rsi-abc:wyx-sdk104-v7-20261123 `
   -t $imageTag .
 $imageId = (& $dockerExe image inspect $imageTag --format '{{.Id}}').Trim()
 ```
 
-最近已测镜像是 `gas-rsi-abc:wyx-sdk104-v6-20261123`，不可变 ID 为 `sha256:905c8e9d172d5271091b84be787922c67c14388bb75cf05b14f4b0c18dc515e7`。该次镜像、复现材料和报告合计 **59.87 MiB**，本地目录为 `output/fresh-platform-test-v6-20261123/`，完整证据在 `runtime/fresh-v6-full-20261123/`。
+当前镜像为 `gas-rsi-abc:wyx-sdk104-v7-20261123`，不可变 ID 为 `sha256:259ad61698efd54431e15b5f7da917a3388261a4287a594bf0668695502caa37`，交付目录为 `output/submission-wyx-sdk104-v7-20261123/`。默认真实测试工具已指向 v7；构建、校验和导出依据见[v7 交付说明](docs/IMAGE_V7_20261123.md)。
 
-**当前中文注释整理不改变计算/协议逻辑，但源码字节已变化。** 旧测试快照和镜像原样保留；对当前源码运行严格镜像测试时，先重建，再显式传入新的 `$imageTag` / `$imageId`。只重用旧 tag 会被源码一致性检查拒绝。新导出包的体积也应重新测量，不能沿用旧包的大小结论。
+v6 原始镜像与真实模型证据原样保留在 `output/fresh-platform-test-v6-20261123/` 和 `runtime/fresh-v6-full-20261123/`。v7 新增真实 27B 的完整证据位于 `runtime/fresh-v7-full-20261123/`，与构建时的离线替身测试分开保存。后续若再改动应用源码，仍须重建并显式传入对应 `$imageTag` / `$imageId`，严格预检会拒绝源码不匹配的旧镜像。
 
 ## 测试与复现
 
@@ -133,9 +138,11 @@ $imageId = (& $dockerExe image inspect $imageTag --format '{{.Id}}').Trim()
 .\.venv\Scripts\python.exe -B -X utf8 -m unittest discover -s tests -v
 ```
 
-最近完整测试为 151 项通过。官方 SDK 自身的离线协议测试可另在 `vendor/contest-harness-sdk-1.0.4/` 目录运行：
+固定 v6 验收时为 151 项测试通过，修复后的完整测试结果见[修复说明](docs/BASELINE_SDK_FIXES_20261123.md)。官方 SDK 自身的离线协议测试可另在 `vendor/contest-harness-sdk-1.0.4/` 目录运行：
 
 ```powershell
+$env:PYTHONUTF8 = '1'  # 同时作用于 SDK 测试启动的子进程
+$env:PYTHONIOENCODING = 'utf-8'
 Push-Location vendor/contest-harness-sdk-1.0.4
 & ..\..\.venv\Scripts\python.exe -B -X utf8 -m unittest tests.test_sdk tests.test_contract_regressions tests.test_transport_regressions -v
 Pop-Location
@@ -189,12 +196,12 @@ $liveOut = 'runtime/fresh-abc-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff')
 
 ### 4. 已有记录的零费用核验和重放
 
-下例需要本机保留最新完整 `runtime` 目录，以及当时的固定 v6 镜像。`runtime/` 和 `output/` 未进入 Git，克隆仓库不会自动获得旧实验大文件。
+下例需要本机保留最新完整 `runtime` 目录，以及当时的固定 v7 镜像。`runtime/` 和 `output/` 未进入 Git，克隆仓库不会自动获得实验大文件。
 
 ```powershell
-$recordedRun = 'runtime/fresh-v6-full-20261123'
-$recordedImage = 'gas-rsi-abc:wyx-sdk104-v6-20261123'
-$recordedImageId = 'sha256:905c8e9d172d5271091b84be787922c67c14388bb75cf05b14f4b0c18dc515e7'
+$recordedRun = 'runtime/fresh-v7-full-20261123'
+$recordedImage = 'gas-rsi-abc:wyx-sdk104-v7-20261123'
+$recordedImageId = 'sha256:259ad61698efd54431e15b5f7da917a3388261a4287a594bf0668695502caa37'
 
 # 只读核验原始证据，不调用模型或云端
 .\.venv\Scripts\python.exe -B -X utf8 scripts/verify_closed_loop.py `
@@ -250,7 +257,8 @@ $replayOut = 'runtime/replay-abc-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff')
 
 ## 历史资料与验证边界
 
-- [最新全新 v6 测试](docs/FRESH_PLATFORM_TEST_20261123.md)：2026-11-23 本次 36 次真实调用，A/B/C 正常与回滚均为同一固定镜像。
+- [最新全新 v7 测试](docs/FRESH_V7_REAL_TEST_20261123.md)：2026-11-23 13:59 起，36 次新的真实调用，A/B/C 正常与回滚均为固定 v7 镜像。
+- [此前全新 v6 测试](docs/FRESH_PLATFORM_TEST_20261123.md)：2026-11-23 12:22 起的历史验收，单独保留，不与 v7 混算。
 - [此前 v6 修复与混合阶段验收](docs/CLOSED_LOOP_ACCEPTANCE_V6_20261123.md)：保留 v5 首次回滚失败及修复过程，正常阶段采用此前 v5 记录；不与最新一次混算。
 - [v5 多任务适配](docs/MULTITASK_V5_20261123.md)、[v5 正常实验](docs/REAL_MULTITASK_RESULTS_20261123.md)：补齐 B/C 原生接口的开发记录。
 - [旧 v4 A 云端实验](docs/CLOUD_TEST_20261122.md)、[历史回放](docs/LEGACY_REPLAY.md)：v4 仅支持 A；带批后标签反馈的归档回放不能作为平台预测入口。

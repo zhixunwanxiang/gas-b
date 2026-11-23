@@ -1,7 +1,7 @@
 """原单位回归指标和越低越好的上线门槛；不复用 A 的 F1/召回率规则。"""
 import math
 import numpy as np
-from ..host_validation import PUBLIC_SCOPES, SCORE_TOLERANCE
+from ..host_validation import SCORE_TOLERANCE, parse_measurement
 
 
 def evaluate(model, data, dataset):
@@ -38,23 +38,10 @@ def promotion_gate(before, after, rules):
             "rmse_reduction": gain, "required_rmse_reduction": required, "mae_limit": mae_limit}
 
 
-def measurement(value, validation_sha256):
+def measurement(value, validation_sha256, *, binding=None):
     # SDK 候选回执和父分数帧都可能携带 summary；先统一形状，再核对指标和数据范围。
-    # 数字看起来更好还不够：必须声明授权公开验证范围，且文件摘要与本轮完全相同。
-    payload = value.get("summary", value) if isinstance(value, dict) else None
-    if not isinstance(payload, dict):
-        return {"comparable": False, "reason": "unrecognized_summary"}
-    metrics = payload.get("metrics", {})
-    score = metrics.get("rmse") if isinstance(metrics, dict) else None
-    if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(score) or score < 0:
-        return {"comparable": False, "reason": "missing_or_invalid_rmse"}
-    if not isinstance(payload.get("scope"), str) or payload["scope"] not in PUBLIC_SCOPES:
-        return {"comparable": False, "reason": "unknown_validation_scope"}
-    sha = payload.get("validation_sha256")
-    if not isinstance(sha, str) or sha.removeprefix("sha256:") != validation_sha256.removeprefix("sha256:"):
-        return {"comparable": False, "reason": "validation_digest_missing_or_different"}
-    return {"comparable": True, "rmse": float(score), "scope": payload["scope"],
-            "validation_sha256": validation_sha256, "source": "host"}
+    # 数字看起来更好还不够：公开范围和文件身份必须可核验；缺省身份只接受本轮 SDK 候选绑定。
+    return parse_measurement(value, validation_sha256, "rmse", binding=binding)
 
 
 def parent_reference(host_value, before, sha):
@@ -68,10 +55,10 @@ def parent_reference(host_value, before, sha):
     return result
 
 
-def host_gate(receipt, parent, after, sha, rules):
+def host_gate(receipt, parent, after, sha, rules, *, binding=None):
     # 本地准入之外，再独立检查宿主回执：范围可比、真实改善、本地/宿主 RMSE 一致。
     # 此处不伪造宿主指标；MAE 保护已由 promotion_gate 检查，两道门槛最终取交集。
-    candidate = measurement(receipt, sha)
+    candidate = measurement(receipt, sha, binding=binding)
     result = {"eligible": False, "parent": parent, "candidate": candidate}
     if not parent["comparable"] or not candidate["comparable"]:
         return {**result, "reason": "unverified_parent_or_candidate_measurement"}
