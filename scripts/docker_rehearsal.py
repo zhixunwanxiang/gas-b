@@ -17,9 +17,10 @@ def child_environment():
 
 
 class DockerRuntime:
-    def __init__(self, image, *, executable="docker", context=None, expected_id=None):
+    def __init__(self, image, *, executable="docker", context=None, expected_id=None, required_tasks=("classification",)):
         self.cli = [executable, *(["--context", context] if context else [])]
         self.requested_image, self.image, self.expected_id = image, None, expected_id
+        self.required_tasks = set(required_tasks)
         self.launches = []
         self.probe = None
 
@@ -68,7 +69,10 @@ print(json.dumps({'verified':True,'uid':os.geteuid(),'readonly_root':True,'netwo
         self.probe = json.loads(result.stdout)
         description = json.loads(self._run(["run", "--rm", "--pull=never", "--network", "none",
                                            "--read-only", self.image, "describe"]).stdout)
-        if description.get("sdk_version") != "1.0.4" or description.get("tasks") != ["classification"]:
+        tasks = description.get("tasks")
+        if (description.get("sdk_version") != "1.0.4" or not isinstance(tasks, list)
+                or any(t not in ("classification", "regression") for t in tasks)
+                or not self.required_tasks <= set(tasks)):
             raise ValueError("Unexpected image describe contract")
         return {"requested_image": self.requested_image, "image_id": self.image,
                 "describe": description, "runtime_probe": self.probe}

@@ -15,6 +15,23 @@
     "select_best_epoch": true,
     "early_stopping_patience": 6
   },
+  "regression": {
+    "controller": {
+      "json_corrections": 1,
+      "max_history_restores": 2,
+      "max_repeat_rejections": 2,
+      "minimum_rmse_absolute_gain": 0.000001,
+      "minimum_rmse_relative_gain": 0.0005,
+      "maximum_mae_relative_increase": 0.02
+    },
+    "limits": {"max_epochs": 8, "max_seconds_per_candidate": 30, "early_stopping_patience": 3},
+    "experiments": [
+      {"name": "low_rate", "learning_rate": 0.0003, "epochs": 3, "freeze_features": false, "loss": "mse"},
+      {"name": "standard_rate", "learning_rate": 0.001, "epochs": 6, "freeze_features": false, "loss": "mse"},
+      {"name": "head_only", "learning_rate": 0.0005, "epochs": 4, "freeze_features": true, "loss": "mse"},
+      {"name": "robust_huber", "learning_rate": 0.0003, "epochs": 5, "freeze_features": false, "loss": "huber"}
+    ]
+  },
   "experiments": [
     {
       "name": "frozen_router",

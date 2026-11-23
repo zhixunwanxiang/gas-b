@@ -1,6 +1,36 @@
 # submission_config.json 参数与实际代码逻辑
 
-本文对应当前项目根目录的 `submission_config.json`。共核对 72 个参数路径；数组中的传感器号、权重候选等作为一个参数整体说明。重复的训练参数含义相同，取值和生效分支在后文列全。
+本文对应当前项目根目录的 `submission_config.json`。原A分类部分共72个参数路径；v5新增的B/C回归参数在下面单独说明。数组中的传感器号、权重候选等作为一个参数整体说明，重复的训练参数含义相同。
+
+## v5新增：regression（只影响B/C，不修改A的分类门槛）
+
+实现位于 `src/gas_a/regression/submission.py`、`training.py` 和 `evaluation.py`。
+
+| 参数 | 默认值 | 实际处理 |
+|---|---|---|
+| `regression.controller.json_corrections` | 1 | 计划或选版收到完整但非法的回复时，最多纠正1次；RPC中断不重试。 |
+| `regression.controller.max_history_restores` | 2 | 每轮最多恢复并在当前验证集重新测量2个允许的历史模型。 |
+| `regression.controller.max_repeat_rejections` | 2 | 相同父模型、数据、实验和执行规则下，失败/未采用累计2次后屏蔽该方案。 |
+| `regression.controller.minimum_rmse_absolute_gain` | 0.000001 | 要求RMSE绝对减少至少该值，B单位分钟，C单位循环。 |
+| `regression.controller.minimum_rmse_relative_gain` | 0.0005 | 同时要求RMSE相对减少至少0.05%；不是分类的0.05个百分点。 |
+| `regression.controller.maximum_mae_relative_increase` | 0.02 | 辅助保护：MAE相对父模型最多增加2%。C的NASA评分如实记录，不单独作为硬门槛。 |
+| `regression.limits.max_epochs` | 8 | 单个候选最多执行的epoch数。 |
+| `regression.limits.max_seconds_per_candidate` | 30 | 本地数值训练预算，按batch检查；不等于模型请求、数据加载和上传的总时限。 |
+| `regression.limits.early_stopping_patience` | 3 | 连续3个epoch没有更好的合格检查点就早停；优先导出达标且RMSE最低的epoch。 |
+| `regression.experiments[*].name` | 见下表 | 27B只能选择菜单名称，不能通过回复改学习率、轮数或数据范围。 |
+| `regression.experiments[*].learning_rate` | 见下表 | Adam更新学习率；原父权重和一二阶矩仍然加载。 |
+| `regression.experiments[*].epochs` | 见下表 | 本方案最多训练轮数，还受总epoch/时间预算限制。 |
+| `regression.experiments[*].freeze_features` | 见下表 | true时仅更新输出层，隐藏层权重及Adam矩均保持原值。 |
+| `regression.experiments[*].loss` | 见下表 | mse或固定delta=1的huber，均对父检查点已有缩放后的训练目标计算，不截断原始寿命标签。 |
+
+| 方案 | 学习率 | epochs | 冻结隐藏层 | 损失 |
+|---|---:|---:|---|---|
+| low_rate | 0.0003 | 3 | false | mse |
+| standard_rate | 0.001 | 6 | false | mse |
+| head_only | 0.0005 | 4 | true | mse |
+| robust_huber | 0.0003 | 5 | false | huber |
+
+回归漂移复用 `controller.drift_thresholds` 的数值，但按B的34个特征、C的24个特征逐项告警，不使用A的“每传感器8维取均值”规则。`max_output_tokens`仍同时约束所有任务的模型决策输出上限。
 
 这是项目的系统策略和实验菜单，不代表组委会规定了这些阈值。特别是召回下降 0.20、支持数 20、漂移阈值等，都是项目当前默认值。
 

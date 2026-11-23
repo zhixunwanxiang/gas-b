@@ -9,6 +9,7 @@ archive; swanlab.save() is not used (it is private-deployment-only).
 import base64
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import time
@@ -168,16 +169,22 @@ class CloudJournal:
                  "record": record, "sdk_finish_record": finish}
         self.rounds.append(entry)
         phase, cfg = self.phase, finish["configuration"]
+        regression = host.frame["task_contract"]["task"] == "regression"
+        metric = "rmse" if regression else "macro_f1"
         values = {f"{phase}/round_index": host.frame["round_index"],
-                  f"{phase}/selected_macro_f1": cfg["selected_local_macro_f1"],
-                  f"{phase}/parent_macro_f1": cfg["local_validation_before"],
+                  f"{phase}/selected_{metric}": cfg["selected_local_rmse"] if regression else cfg["selected_local_macro_f1"],
+                  f"{phase}/parent_{metric}": cfg["validation_before"]["rmse"] if regression else cfg["local_validation_before"],
                   f"{phase}/complete_history_cycle": int(complete),
                   f"{phase}/history_records_read": len(finish["history_ids"]),
-                  f"{phase}/drift_detected": int(cfg["drift_detected"]),
                   f"{phase}/strategy_version": cfg["strategy_version_after"]}
         if host.candidate_metrics:
-            values[f"{phase}/candidate_macro_f1"] = host.candidate_metrics["macro_f1"]
+            values[f"{phase}/candidate_{metric}"] = host.candidate_metrics[metric]
         monitoring = json.loads((state / "monitoring.json").read_text(encoding="utf-8"))
+        values[f"{phase}/drift_detected"] = int(monitoring["drift"])
+        # 新宿主已通过实际predict进程复测选中产物，可直接留档其MAE、NASA等辅助值。
+        for key, value in getattr(host, "selected_metrics", {}).items():
+            if key in ("mae", "nasa_score", "accuracy") and isinstance(value, (int, float)):
+                values[f"{phase}/selected_{key}"] = value
         diagnosis = json.loads((state / "diagnosis.json").read_text(encoding="utf-8"))
         self.emit(values, {f"{phase}/round_record": entry, f"{phase}/monitoring": monitoring,
                            f"{phase}/diagnosis": diagnosis})
@@ -193,6 +200,9 @@ class CloudJournal:
                             if "validation" in epoch:
                                 self.emit({f"{phase}/trial_{host.frame['round_index']}_main_epoch": epoch["epoch"],
                                            f"{phase}/trial_{host.frame['round_index']}_main_validation_f1": epoch["validation"]["macro_f1"]})
+            if regression and (host.candidate / "history.jsonl").is_file():
+                epochs = [json.loads(line) for line in (host.candidate / "history.jsonl").read_text(encoding="utf-8").splitlines()]
+                self.emit(texts={f"{phase}/epoch_history": {"round_index": host.frame["round_index"], "epochs": epochs}})
         self.receipt.update(completed_rounds=len(self.rounds),
                             complete_history_cycles=sum(r["complete_history_experiment_decision"] for r in self.rounds))
         self._save()
@@ -296,7 +306,9 @@ class CloudJournal:
         restore_path = self.output / "cloud-downloaded-evidence.zip"
         restore_path.write_bytes(restored)
         # 完整 Text 已逐条核对；关键标量另比对步骤和值，避免页面曲线来自错误轮次或分数。
-        scalar_keys = ["normal/selected_macro_f1", "normal/complete_history_cycle", "recovery/selected_macro_f1"]
+        # 从实际事件选择指标：A用F1，B/C用RMSE，兼容只有正常阶段以及只读恢复核验。
+        scalar_keys = sorted({key for key, _ in self.scalars if key == "normal/complete_history_cycle"
+                              or key.startswith(("normal/selected_", "recovery/selected_"))})
         actual = remote.metrics(keys=scalar_keys, all=True)
         verified_values = 0
         for series in actual.get("list", []):
@@ -310,7 +322,7 @@ class CloudJournal:
             if set(actual_points) != set(expected):
                 raise ValueError("Cloud scalar steps differ from actual experiment steps")
             for step, value in expected.items():
-                if abs(actual_points[step] - value) > 1e-12:
+                if not math.isclose(actual_points[step], value, rel_tol=1e-12, abs_tol=1e-12):
                     raise ValueError("Cloud score differs from platform-simulation measurement")
                 verified_values += 1
         if verified_values != sum(len(self.scalars_for(k)) for k in scalar_keys):

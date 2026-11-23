@@ -1,5 +1,6 @@
 **
 !Dockerfile
+!Dockerfile.offline
 !requirements.txt
 !harness.py
 !contest_submission.py

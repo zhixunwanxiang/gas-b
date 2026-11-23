@@ -39,7 +39,7 @@ class DockerRehearsalTest(unittest.TestCase):
 
     def test_preflight_probes_use_sanitized_environment(self):
         info = [{"Id": "sha256:fixed", "Os": "linux", "Architecture": "amd64", "Config": {"User": "65534:65534"}}]
-        replies = [info, {"verified": True}, {"sdk_version": "1.0.4", "tasks": ["classification"]}]
+        replies = [info, {"verified": True}, {"sdk_version": "1.0.4", "tasks": ["classification", "regression"]}]
         with patch.dict(os.environ, {"PYTRIO_API_KEY": "synthetic-test-secret"}), \
                 patch("scripts.docker_rehearsal.subprocess.run", side_effect=[
                     subprocess.CompletedProcess([], 0, stdout=json.dumps(r)) for r in replies]) as execute:
@@ -61,6 +61,14 @@ class DockerRehearsalTest(unittest.TestCase):
         self.assertEqual(set(self.runtime.launches[1]["mounts"]), {"/model"})
         self.assertNotIn("mutable-tag", command)
         self.assertTrue(self.runtime.audit()["container_policy_verified"])
+
+    def test_multitask_preflight_rejects_old_classification_only_image(self):
+        self.runtime.required_tasks = {"classification", "regression"}
+        replies = [[{"Id": "sha256:fixed", "Os": "linux", "Architecture": "amd64", "Config": {"User": "65534:65534"}}],
+                   {"verified": True}, {"sdk_version": "1.0.4", "tasks": ["classification"]}]
+        with patch("scripts.docker_rehearsal.subprocess.run", side_effect=[
+                subprocess.CompletedProcess([], 0, stdout=json.dumps(r)) for r in replies]), self.assertRaises(ValueError):
+            self.runtime.preflight()
 
     def test_cleanup_refuses_containers_not_owned_by_the_test(self):
         with patch("scripts.docker_rehearsal.subprocess.run") as execute, self.assertRaises(ValueError):

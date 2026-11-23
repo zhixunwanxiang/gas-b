@@ -1,146 +1,164 @@
-"""Independent persisted-evidence checks for a completed local closed-loop run."""
-# 历史回放的独立复核：从已保存的预测和授权公开标签重算指标，再核对部署/回滚证据。
-# 这是本地历史结果复核，不会获得平台隐藏标签或创建真实模型回执。
+"""只读核对正常实验、真实故障回滚、下一轮完整继承及云端归档；不调用模型或云端。"""
 import argparse
-from copy import deepcopy
 import json
 from pathlib import Path
 import sys
-
-from closed_loop_validation import (ROOT, ParentEngine, restore_engine, digest,
-                                    Experiment, POLICY, write, train_home)
+import zipfile
 import numpy as np
-from gas_a.model import Model
-from gas_a.signals import dat_inputs, reveal_labels
-from gas_a.sensor_training.data import load_pair, load_model, evaluate
-from gas_a.sensor_training.optimize import train_candidate
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+import contest_submission
+from scripts.verify_multitask_cloud_run import read, rows, verify_dataset
+from scripts.test_multitask_recovery_cloud import model_manifest
+from scripts.test_real_sdk import MODEL
+from gas_a.sensor_training.reference.model import Model
+from gas_a.sensor_training.io import CLASSES, digest, write_json
 
 
-def independently_score(y, predicted):
-    matrix = [[0] * 6 for _ in range(6)]
-    for target, actual in zip(y.tolist(), predicted.tolist()):
-        matrix[target][actual] += 1
-    f1 = sum(2 * matrix[k][k] / max(1, sum(matrix[k]) + sum(row[k] for row in matrix)) for k in range(6)) / 6
-    accuracy = sum(matrix[k][k] for k in range(6)) / len(y)
-    return matrix, f1, accuracy
+def recompute(directory, dataset):
+    expected = np.array([CLASSES.index(r["answer"]) if dataset == "A" else r["answer"]
+                         for r in rows(directory / "data/validation.jsonl")])
+    groups, count = 0, 0
+    for folder in sorted(directory.glob("measurement-*")):
+        outputs = [r["outputs"] for r in rows(folder / "predictions.jsonl")]
+        saved = read(folder / "metrics.json")
+        assert len(outputs) == len(expected)
+        if dataset == "A":
+            assert all([p["label"] for p in row] == CLASSES for row in outputs)
+            probabilities = np.asarray([[p["score"] for p in row] for row in outputs])
+            assert np.isfinite(probabilities).all() and np.all((probabilities >= 0) & (probabilities <= 1))
+            labels = probabilities.argmax(axis=1)
+            f1 = np.mean([2 * np.sum((labels == k) & (expected == k)) /
+                          (np.sum(labels == k) + np.sum(expected == k)) for k in set(labels) | set(expected)])
+            assert abs(f1 - saved["macro_f1"]) < 1e-12
+        else:
+            assert all(set(row) == {"value"} for row in outputs)
+            values = np.array([row["value"] for row in outputs])
+            assert np.isfinite(values).all() and np.all(values >= 0)
+            error = values - expected
+            assert abs(np.sqrt(np.mean(error ** 2)) - saved["rmse"]) < 1e-9
+            assert abs(np.abs(error).mean() - saved["mae"]) < 1e-9
+            if dataset == "C":
+                nasa = np.expm1(np.where(error < 0, -error / 13, error / 10)).sum()
+                assert np.isclose(nasa, saved["nasa_score"], rtol=1e-12)
+        groups += 1
+        count += len(outputs)
+    return groups, count
+
+
+def verify_recovery(normal, root, dataset):
+    suite, cloud, report = read(root / "suite.json"), read(root / "cloud-verification.json"), read(root / "recovery/report.json")
+    assert suite["status"] == "completed" and suite["cloud_verified"] and suite["cloud_state"] == "FINISHED"
+    assert all(suite["checks"].values()) and all(report["checks"].values())
+    assert cloud["verified"] and cloud["state"] == "FINISHED"
+    probe = read(root / "image-preflight.json")
+    assert probe["image_id"] == suite["image_id"] and probe["runtime_probe"]["verified"]
+    assert suite["runtime"]["container_policy_verified"] and suite["runtime"]["train_containers"] == 2
+    source = read(root / "source-sha256.json")
+    assert all(digest(root / "reproduction" / name) == sha for name, sha in source.items())
+    recovery = root / "recovery"
+    for name in ("train.jsonl", "validation.jsonl"):
+        assert digest(recovery / "data" / name) == digest(normal / "official-baseline/public" / name)
+    original, fault = Model.load(normal / "official-baseline/checkpoint.npz"), Model.load(recovery / "fault-parent/checkpoint.npz")
+    assert original.meta == fault.meta
+    for group in ("first", "second"):
+        assert all(np.array_equal(getattr(original, group)[k], getattr(fault, group)[k]) for k in original.params)
+    assert np.array_equal(original.mean, fault.mean) and np.array_equal(original.scale, fault.scale)
+    assert all(np.array_equal(original.params[k], fault.params[k]) for k in ("w1", "b1"))
+    if dataset == "A":
+        assert np.array_equal(fault.params["w2"], np.roll(original.params["w2"], 1, axis=1))
+        assert np.array_equal(fault.params["b2"], np.roll(original.params["b2"], 1))
+    else:
+        assert np.array_equal(fault.params["w2"], original.params["w2"])
+        assert np.array_equal(fault.params["b2"], original.params["b2"] + 10)
+    calls = {}
+    tokens = 0
+    for folder in sorted((recovery / "provider-calls").iterdir()):
+        receipt, response = read(folder / "receipt.json"), read(folder / "response.json")
+        assert receipt["status"] == "verified_response" and response["model"] == MODEL
+        assert response["id"] == receipt["call_id"] and receipt["call_id"] not in calls
+        calls[receipt["call_id"]] = (response, read(folder / "request.json"))
+        tokens += response.get("usage", {}).get("total_tokens", 0)
+    source_report = read(normal / "normal/report.json")
+    expected_history = [{"id": f"real-local-{dataset}-history-{row['round']}", **row["record"]} for row in source_report["rounds"]]
+    sdk_ids, corrections = [], 0
+    first, second = report["rounds"]
+    target = first["selected_artifact_id"]
+    assert first["actual_historical_rollback"] and first["plan"]["action"] == "rollback" and target != "fault-parent"
+    historical = recovery / "history-artifacts" / target
+    assert model_manifest(historical) == report["restored_model_manifest"]
+    if target == "initial":
+        source_target = normal / "normal/initial"
+    else:
+        source_target = normal / f"normal/host-{int(target.removeprefix('candidate-'))}/candidate"
+    assert model_manifest(historical) == model_manifest(source_target)
+    for index, row in enumerate(report["rounds"]):
+        host = recovery / f"host-{row['round']}"
+        frames = [e["frame"] for e in rows(host / "protocol.jsonl")]
+        start = frames[0]
+        finish = next(f["record"] for f in frames if f.get("type") == "round_complete")
+        assert any(f.get("type") == "round_ack" and f.get("accepted") for f in frames)
+        history = next(f["records"] for f in frames if f.get("type") == "history_response")
+        assert history == expected_history and finish["history_ids"] == [h["id"] for h in history]
+        responses = [f for f in frames if f.get("type") == "model_response"]
+        assert finish["model_call_ids"] == [r["call_id"] for r in responses]
+        for response in responses:
+            assert response["response"] == calls[response["call_id"]][0]
+            sdk_ids.append(response["call_id"])
+        for call in rows(host / "model-calls.jsonl"):
+            assert call["real_remote_model_call"] and call["response"] == calls[call["call_id"]][0]
+            assert call["bound_messages"] == calls[call["call_id"]][1]["messages"]
+        decision = rows(host / "state/decisions.jsonl")[-1]
+        corrections += sum(len(decision[k]["corrections"]) for k in ("planning_calls", "selection_calls"))
+        if dataset != "A":
+            assert decision["planning_calls"]["prompt_version"] == "rul-bc-controller-zh-v2"
+        if index == 0:
+            validated = decision["historical_validation"][target]
+            assert validated["reevaluated_this_round"] and validated["gate"]["eligible"]
+            assert validated["validation_sha256"] == digest(recovery / "data/validation.jsonl")
+            assert any(f.get("type") == "artifact_read_request" and f.get("artifact_id") == target for f in frames)
+        else:
+            assert start["parent_artifact"]["artifact_id"] == target
+            mounted_files = {f["path"]: f["sha256"] for f in start["parent_artifact"]["files"]}
+            assert mounted_files == report["restored_model_manifest"]
+            assert start["parent_checkpoint_sha256"] == first["record"]["configuration"].get(
+                "selected_checkpoint_sha256", decision["configuration"]["parent_checkpoint_sha256"])
+        expected_history.append({"id": f"real-recovery-{dataset}-history-{row['round']}", **finish})
+    assert len(calls) == len(sdk_ids) == suite["real_model_calls"] and set(calls) == set(sdk_ids)
+    assert tokens == suite["provider_reported_total_tokens"]
+    assert digest(root / "evidence-bundle.zip") == digest(root / "cloud-downloaded-evidence.zip") == "sha256:" + cloud["evidence_zip_sha256"]
+    with zipfile.ZipFile(root / "evidence-bundle.zip") as archive:
+        assert archive.testzip() is None and not any(Path(p).name.startswith(".env") for p in archive.namelist())
+    groups, predictions = recompute(recovery, dataset)
+    return {"dataset": dataset, "verified": True, "image_id": suite["image_id"], "real_model_calls": len(calls),
+        "provider_reported_total_tokens": tokens, "automatic_response_corrections": corrections,
+        "actual_historical_rollback": True, "next_round_complete_parent_verified": True,
+        "measurement_groups_recalculated": groups, "prediction_rows_recalculated": predictions,
+        "fault_metrics": report["fault_metrics"], "restored_metrics": report["restored_metrics"],
+        "cloud_url": suite["cloud_url"], "cloud_state": suite["cloud_state"],
+        "cloud_text_records_verified": cloud["text_records_downloaded_and_hash_checked"],
+        "cloud_score_points_verified": cloud["score_points_checked"]}
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("run", type=Path)
+    parser.add_argument("--normal", type=Path, required=True)
+    parser.add_argument("--recovery", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--datasets", nargs="+", choices=("A", "B", "C"), default=["A", "B", "C"])
     args = parser.parse_args()
-    run = args.run.resolve()
-    summary = json.loads((run / "summary.json").read_text(encoding="utf-8"))
-    windows = json.loads((run / "history.json").read_text(encoding="utf-8"))
-    registry = json.loads((run / "registry.json").read_text(encoding="utf-8"))
-    events = [json.loads(s) for s in (run / "events.jsonl").read_text(encoding="utf-8").splitlines()]
-    before = json.loads((run / "protected-hashes-before.json").read_text(encoding="utf-8"))
-    checks = []
-
-    def check(name, condition, detail=None):
-        checks.append({"check": name, "passed": bool(condition), "detail": detail})
-        if not condition:
-            raise AssertionError(name)
-
-    check("protected_inputs_and_sources_unchanged", all(digest(p) == h for p,h in before.items()), len(before))
-    check("policy_saved_before_first_replay", events[0]["event"] == "policy_locked")
-    check("eight_windows_in_natural_order", [w["batch"] for w in windows] == list(range(3,11)))
-    all_y, all_pred, all_prior = [], [], []
-    previous_state = None
-    for w in windows:
-        batch = w["batch"]
-        directory = run / "windows" / f"batch{batch:02d}"
-        commit = json.loads((directory / "prediction_commit.json").read_text(encoding="utf-8"))
-        prediction = np.load(directory / "predictions.npy", allow_pickle=False)
-        engine = ParentEngine() if previous_state is None else restore_engine(registry[previous_state["version"]], previous_state["state"])
-        feature = dat_inputs(Path(summary["dataset"]) / f"batch{batch}.dat", [])
-        replay = engine.predict_batch(feature["x"])
-        labels = reveal_labels(Path(summary["dataset"]) / f"batch{batch}.dat", feature)["y"]
-        check(f"batch{batch}_restored_state_reproduces_predictions", np.array_equal(replay, prediction))
-        check(f"batch{batch}_prediction_file_integrity", digest(directory / "predictions.npy") == commit["file_sha256"])
-        check(f"batch{batch}_source_integrity", feature["sha256"] == commit["source_sha256"])
-        e = [x for x in events if x.get("batch") == batch]
-        position = {x["event"]: x["index"] for x in e}
-        check(f"batch{batch}_temporal_order", position["drift_monitored_without_labels"] < position["prediction_committed_before_labels"]
-              < position["labels_revealed"] < position["diagnosis_completed"])
-        if w["candidate"]:
-            persisted_candidate = json.loads((directory / "candidate.json").read_text(encoding="utf-8"))
-            check(f"batch{batch}_candidate_selection_record_consistent", persisted_candidate == w["candidate"])
-            check(f"batch{batch}_training_after_reveal", position["labels_revealed"] < position["candidate_trained"] < position["candidate_evaluated"])
-            trained = next(x for x in e if x["event"] == "candidate_trained")
-            check(f"batch{batch}_no_replay_rows_in_gradient", trained["stream_rows_used_for_gradient"] == 0 and trained["training_rows"] == 445)
-        engine.release_labels(labels)
-        matrix, f1, accuracy = independently_score(labels, prediction)
-        check(f"batch{batch}_independent_metric_reconciliation", matrix == w["operational"]["confusion_matrix"]
-              and abs(f1-w["operational"]["macro_f1"]) < 1e-12 and abs(accuracy-w["operational"]["accuracy"]) < 1e-12)
-        previous_state = json.loads((directory / "next-state.json").read_text(encoding="utf-8"))
-        if batch < 10:
-            check(f"batch{batch}_next_batch_uses_selected_version", previous_state["version"] == windows[batch-2]["prediction_version"])
-        all_y.append(labels); all_pred.append(prediction)
-        old_path = Path(summary["previous_run"]) / "windows" / f"batch{batch:02d}" / "predictions.npz"
-        with np.load(old_path, allow_pickle=False) as archive:
-            all_prior.append(archive["active"].argmax(1))
-    y, predicted, prior = map(np.concatenate, (all_y, all_pred, all_prior))
-    matrix, f1, accuracy = independently_score(y, predicted)
-    check("pooled_matrix_f1_accuracy_independently_recomputed", matrix == summary["current"]["confusion_matrix"]
-          and abs(f1-summary["current"]["macro_f1"]) < 1e-12 and abs(accuracy-summary["current"]["accuracy"]) < 1e-12)
-    _, old_f1, old_accuracy = independently_score(y, prior)
-    check("previous_pdf_score_independently_reconciled", abs(old_f1-summary["previous_pdf"]["macro_f1"]) < 1e-12
-          and abs(old_accuracy-summary["previous_pdf"]["accuracy"]) < 1e-12)
-    check("terminal_window_does_not_train", not windows[-1]["candidate"] and any(x["event"] == "terminal_training_skipped" for x in events))
-    check("deployment_only_affects_future", all(d["effective_from_batch"] == d["batch"] + 1 for d in summary["deployments"]))
-    check("rule_controller_not_mislabeled_as_external_ai", summary["external_ai_calls"] == 0)
-    check("natural_rollbacks_separated_from_drills", summary["natural_rollbacks"] == sum(d["reason"] == "natural_performance_rollback" for d in summary["deployments"]))
-    for name, result in summary["rollback_drills"].items():
-        if isinstance(result, dict):
-            check(f"{name}_drill_switch_and_prediction_restoration", result["physical_pointer_switched"] and result["restored_predictions_equal"])
-    check("isolated_drills_preserve_operational_pointer", summary["rollback_drills"]["operational_pointer_unchanged"])
-    # Exercise the original public router sequencing and feedback validation contracts.
-    router_entry = registry["released_retrained"]
-    from gas_a.router import FourSensorRouter
-    router = FourSensorRouter(router_entry["bundle"], router_entry["config"])
-    x = dat_inputs(Path(summary["dataset"]) / "batch3.dat", [])["x"][:4]
-    router.predict_batch(x)
-    try:
-        router.predict_batch(x)
-        check("predict_twice_without_feedback_rejected", False)
-    except ValueError:
-        check("predict_twice_without_feedback_rejected", True)
-    try:
-        router.release_labels(np.array([0,1,2,6]))
-        check("invalid_feedback_rejected", False)
-    except ValueError:
-        check("invalid_feedback_rejected", True)
-    router.release_labels(np.array([0,1,2,3]))
-    check("valid_feedback_advances_exactly_one_batch", router.batch_count == 1 and router.waiting is None)
-    # Retrain every executed sensor candidate from its actual immutable parent.
-    train, validation = load_pair(ROOT / "data/public/train.jsonl", ROOT / "data/public/validation.jsonl")
-    cfg = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
-    limits = dict(cfg["training"]["limits"], checkpoint_reference=evaluate(load_model(ROOT / "models/reference.npz"), validation),
-                  checkpoint_reference_sha256="sha256:" + digest(ROOT / "models/reference.npz"))
-    by_digest = {"sha256:" + digest(p): p for p in (ROOT / "models").glob("*.npz")}
-    for p in (run / "versions").glob("*/*.npz"):
-        by_digest["sha256:" + digest(p)] = p
-    for w in windows:
-        candidate = w["candidate"]
-        if not candidate:
-            continue
-        for component in candidate["components"]:
-            destination = run / "verification" / "training-replay" / candidate["version"] / component["role"]
-            parent = by_digest[component["parent_sha256"]]
-            train_candidate(parent, train, validation, destination, component["parameters"],
-                            {"weakest_class": w["diagnosis"]["weakest_class"]}, limits)
-            check(f"batch{w['batch']}_{component['role']}_exact_training_replay", "sha256:" + digest(destination / "checkpoint.npz") == component["checkpoint_sha256"])
-    home_dest = run / "verification/home-replay"
-    home_dest.mkdir(parents=True)
-    train_home(Model.load(ROOT / "models/start.npz"), train, cfg["training"]["home"], home_dest)
-    for name in ("home_trunk", "home_router"):
-        check(name + "_exact_training_replay", digest(home_dest / f"{name}.npz") == digest(Path(router_entry["bundle"]) / f"{name}.npz"))
-    check("protected_sources_still_unchanged_after_verification", all(digest(p) == h for p,h in before.items()))
-    result = {"passed": all(x["passed"] for x in checks), "check_count": len(checks), "checks": checks,
-              "scope": "all eight windows, all fourteen sensor training trials, both home components, persisted state restoration, metrics and two isolated rollback drills"}
-    write(run / "verification.json", result)
-    print(json.dumps({"passed": result["passed"], "check_count": len(checks)}, indent=2))
+    results = []
+    for key in args.datasets:
+        normal = verify_dataset(args.normal.resolve() / key, key)
+        restored = verify_recovery(args.normal.resolve() / key, args.recovery.resolve() / key, key)
+        results.append({"dataset": key, "normal": normal, "recovery": restored})
+    result = {"verified": True, "datasets": results,
+        "successful_acceptance_real_calls": sum(r[phase]["real_model_calls"] for r in results for phase in ("normal", "recovery")),
+        "official_host_or_hidden_score_verified": False}
+    write_json(args.output, result)
+    print(json.dumps({"verified": True, "datasets": args.datasets,
+                      "successful_acceptance_real_calls": result["successful_acceptance_real_calls"]}, ensure_ascii=False))
 
 
 if __name__ == "__main__":

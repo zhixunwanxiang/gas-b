@@ -113,11 +113,18 @@ class OfflineHost:
         }
         self.pending.append(self.frame)
 
+    def checkpoint_paths(self, directory, checkpoint="checkpoint.npz"):
+        return artifact_checkpoint_paths(Path(directory) / checkpoint)
+
+    def measure_candidate(self):
+        _, validation = load_pair(self.root / "data/train.jsonl", self.root / "data/validation.jsonl")
+        return evaluate(load_predictor(self.candidate / "checkpoint.npz"), validation)
+
     def add_artifact(self, identifier, directory, checkpoint="checkpoint.npz"):
         directory = Path(directory)
         manifest = [{"path": p.relative_to(directory).as_posix(), "sha256": digest(p), "size_bytes": p.stat().st_size}
                     for p in sorted(directory.rglob("*")) if p.is_file() and "__pycache__" not in p.parts]
-        checkpoints = artifact_checkpoint_paths(directory / checkpoint)
+        checkpoints = self.checkpoint_paths(directory, checkpoint)
         descriptor = {"checkpoint_paths": checkpoints,
                       "code_paths": ["routing.json"] if (directory / "routing.json").is_file() else [],
                       "predict_argv": submission.PREDICT_ARGV}
@@ -158,7 +165,9 @@ class OfflineHost:
                 adopt = (not self.force_retain
                          and request["candidate_artifact_id"] in eligible
                          and scores["candidate"] is not None
-                         and scores["candidate"]["macro_f1"] > scores["parent"]["macro_f1"] + 1e-12)
+                         and (scores["candidate"]["macro_f1"] > scores["parent"]["macro_f1"] + 1e-12
+                              if self.frame["task_contract"]["task"] == "classification"
+                              else scores["candidate"]["rmse"] < scores["parent"]["rmse"] - 1e-12))
                 decision = {"selected_artifact_id": request["candidate_artifact_id"] if adopt else request["parent_artifact_id"],
                             "reason": "Selected using the same public validation Macro-F1; retain the parent on a tie."}
                 if request["action"] == "rollback" and not self.force_retain:
@@ -222,14 +231,13 @@ class OfflineHost:
                 target = self.candidate / name
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(content)
-            assert frame["artifact"]["checkpoint_paths"] == artifact_checkpoint_paths(self.candidate / "checkpoint.npz")
+            assert frame["artifact"]["checkpoint_paths"] == self.checkpoint_paths(self.candidate)
             assert frame["artifact"]["predict_argv"] == submission.PREDICT_ARGV
             for name in frame["artifact"]["code_paths"]:
                 assert (self.candidate / name).is_file()
-            _, validation = load_pair(self.root / "data/train.jsonl", self.root / "data/validation.jsonl")
-            self.candidate_metrics = evaluate(load_predictor(self.candidate / "checkpoint.npz"), validation)
+            self.candidate_metrics = self.measure_candidate()
             reply.update(type="candidate_response", artifact_id=f"candidate-{self.frame['round_index']}",
-                         summary={"metrics": {"macro_f1": self.candidate_metrics["macro_f1"]},
+                         summary={"metrics": {k: v for k, v in self.candidate_metrics.items() if k in ("macro_f1", "rmse", "mae")},
                                   "validation_sha256": digest(self.root / "data/validation.jsonl"),
                                   "scope": "authorized_public_validation"})
         elif kind == "state_request":
@@ -283,7 +291,7 @@ class SubmissionTest(unittest.TestCase):
         values.update(updates)
         return SimpleNamespace(**values)
 
-    def test_describe_only_advertises_classification(self):
+    def test_describe_advertises_native_classification_and_regression(self):
         result = subprocess.run([sys.executable, "-B", str(ROOT / "harness.py"), "describe"],
                                 env=self.env(), capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -291,7 +299,7 @@ class SubmissionTest(unittest.TestCase):
         self.assertEqual(description["protocol"], "contest.harness.workspace.v2")
         self.assertEqual(description["model_access"], "host_gateway_rpc")
         self.assertEqual(description["sdk_version"], "1.0.4")
-        self.assertEqual(description["tasks"], ["classification"])
+        self.assertEqual(description["tasks"], ["classification", "regression"])
 
     def test_legacy_host_is_rejected_before_model_calls_or_training(self):
         host = OfflineHost(self.root, self.checkpoint)
@@ -685,7 +693,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         result = subprocess.run([sys.executable, "-B", str(ROOT / "run.py")], env=self.env(),
                                 cwd=self.root, capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(result.stdout)["tasks"], ["classification"])
+        self.assertEqual(json.loads(result.stdout)["tasks"], ["classification", "regression"])
         self.assertFalse((self.root / "runtime").exists())
 
     def test_local_cli_baseline_then_resume_uses_explicit_new_checkpoint(self):

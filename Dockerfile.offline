@@ -1,0 +1,19 @@
+# 离线重建：基础运行环境必须是已核验 SDK 1.0.4 / NumPy 1.26.4 / Python 3.12.13 的旧 v4 镜像。
+# 标准在线构建仍使用 Dockerfile；本文件不访问包源，不把旧镜像的 /app 源码当成最新实现。
+ARG CONTEST_RUNTIME=gas-rsi-a:wyx-sdk104-v4-20261122@sha256:388fb0d9721fa11d0cb9befcb6dee6dbadb23597dfdb59415913d276b4ec25fe
+FROM ${CONTEST_RUNTIME} AS runtime
+COPY harness.py contest_submission.py submission_config.json /app/
+COPY src /app/src
+
+# 合并运行文件，避免保存归档时把旧版和新版应用层重复计入体积。
+FROM scratch
+COPY --from=runtime / /
+ENV PATH=/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin \
+    LANG=C.UTF-8 PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONUTF8=1 PYTHONIOENCODING=utf-8 \
+    BASELINE_CPU_THREADS=1 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+    CONTEST_SUBMISSION=contest_submission CONTEST_WORK=/workspace HOME=/tmp
+WORKDIR /app
+LABEL org.opencontainers.image.authors="wyx"
+USER 65534:65534
+ENTRYPOINT ["python3", "/app/harness.py"]
+CMD ["describe"]

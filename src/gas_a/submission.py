@@ -113,6 +113,7 @@ def _decision(rnd, request, fields, token_limit, validate, corrections=1):
     # 纠正请求也是真实调用，必须记录其 call_id；RPC 异常发生在 try 之外，不能吞掉后继续会话。
     call_ids, failures, request_hashes = [], [], []
     for attempt in range(corrections + 1):
+        # request 只含本轮证据和自有提示；不重复加入 rnd.prompt，官方提示由宿主在请求前附加。
         # Never catch an RPC failure: its outcome may be unknown to the SDK.
         request_hashes.append(request_digest(request))
         receipt = rnd.model(
@@ -134,8 +135,11 @@ def _decision(rnd, request, fields, token_limit, validate, corrections=1):
                 raise ValueError("Model decision fields must be nonempty text <=4000 bytes")
             validate(value)
             return value, {"model_call_ids": call_ids, "corrections": failures,
-                           "prompt_version": CONTROLLER_PROMPT_VERSION, "request_sha256": request_hashes}
+                           "prompt_version": request.get("controller_prompt", {}).get("version", CONTROLLER_PROMPT_VERSION),
+                           "request_sha256": request_hashes}
         except ValueError as error:
+            # 只有拿到完整响应后发现 JSON/选择不合法才允许纠正；它也是一次需要付费和留回执的模型调用。
+            # 这与超时重试不同：rnd.model 抛异常时根本不会进入本分支。
             failures.append({"call_id": receipt.call_id, "error": str(error), "response_excerpt": receipt.text[:2000]})
             if attempt == corrections:
                 raise
