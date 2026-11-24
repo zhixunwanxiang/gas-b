@@ -360,9 +360,12 @@ def _train_candidate(parent, train, validation, directory, spec, diagnosis, limi
     initial_steps, initial_epochs = model.meta["steps"], model.meta["epochs"]
     initial_transform = model.meta.get("input_transform", "identity")
     source_root = Path(__file__).parent
+    # 与平台提交的完整源码快照共用位置；SDK 对每个小文件也要串行上传，
+    # 不能再额外保留一份 source/，否则上传和每次历史恢复都会重复传输。
+    source_snapshot = Path("src/gas_a/sensor_training")
     source_names = tuple(sorted(p.relative_to(source_root).as_posix() for p in source_root.rglob("*.py")))
     for name in source_names:
-        target = directory / "source" / name
+        target = directory / source_snapshot / name
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes((source_root / name).read_bytes())
     stage_id = directory.parent.name + "/" + directory.name
@@ -490,7 +493,7 @@ def _train_candidate(parent, train, validation, directory, spec, diagnosis, limi
               "parameter_constraint": {"kind": "projected_first_layer_rows", "kept_sensors": spec.get("kept_sensors"),
                                        "input_preprocessing": "unchanged_reference_mean_std_clip", "adam_reset": False,
                                        "projection": "Set excluded w1 rows to zero before training and after every Adam update; their gradients are zero, moments continue to decay."},
-              "active_features": model.meta.get("active_features"), "source_snapshot": "source/",
+              "active_features": model.meta.get("active_features"), "source_snapshot": source_snapshot.as_posix() + "/",
               "train_sha256": train["sha256"], "validation_sha256": validation["sha256"],
               "weak_class": diagnosis["weakest_class"], "class_weights": weights,
               "validation_before": before, "validation_after": after, "epoch_history": epoch_records,
@@ -514,7 +517,7 @@ def _train_candidate(parent, train, validation, directory, spec, diagnosis, limi
                 "train_rows": len(train["ids"]), "validation_rows": len(validation["ids"]),
                 "learning_rate": model.meta["learning_rate"], "batch_size": model.meta["batch_size"],
                 "configuration": configuration, "configuration_sha256": "sha256:" + hashlib.sha256(configuration_raw).hexdigest(),
-                "source_sha256": {name: digest(directory / "source" / name) for name in source_names},
+                "source_sha256": {name: digest(directory / source_snapshot / name) for name in source_names},
                 "label_provenance": None, "created_at": stamp()}
     write_json(directory / "training.json", training)
     write_json(directory / "experiment.json", report)

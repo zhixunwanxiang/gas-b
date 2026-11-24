@@ -106,17 +106,24 @@ print(json.dumps({'verified':True,'uid':os.geteuid(),'readonly_root':True,'netwo
                  "--tmpfs", "/output:rw,nosuid,nodev,size=1g,mode=1777"]
         for target, source in mounts.items():
             argv += ["--mount", f"type=bind,source={source},target={target},readonly"]
-        argv += [self.image, "train"]
+        # 验收使用 SDK 文档的完整命令，不靠镜像 ENTRYPOINT 帮忙拼接。
+        argv += ["--entrypoint", "python3", self.image, "/app/harness.py", "train"]
         self._record(log, "train", argv, mounts)
         return argv, name
 
-    def predict(self, directory, primary, output):
+    def predict(self, directory, primary, output, *, context=None):
         # 预测容器只挂载完整选中模型，明确指定主文件，不挂载带标签数据。
         relative = Path(primary).relative_to(Path(directory)).as_posix()
         argv, _ = self._base("predict")
         mounts = {"/model": str(Path(directory).resolve())}
         argv += ["--mount", f"type=bind,source={mounts['/model']},target=/model,readonly",
-                 "-e", "CONTEST_ARTIFACT_PATH=/model/" + relative, self.image, "predict"]
+                 "-e", "CONTEST_ARTIFACT_PATH=/model/" + relative]
+        if context is not None:
+            # 与平台完整预测上下文一致，不让验收只覆盖 dataset_key=None 的兼容分支。
+            argv += ["-e", "CONTEST_PREDICTION_CONTEXT=" + json.dumps(context),
+                     "-e", "CONTEST_DATASET_KEY=" + context["dataset_key"],
+                     "-e", "CONTEST_TASK=" + context["task"]]
+        argv += ["--entrypoint", "python3", self.image, "/app/harness.py", "predict"]
         self._record(Path(output) / "container.jsonl", "predict", argv, mounts)
         return argv
 

@@ -14,8 +14,9 @@ from .training import continue_candidate
 from .prompts import VERSION as PROMPT_VERSION, plan_contract, PLAN_INSTRUCTION, SELECT_INSTRUCTION
 from ..evolution import available_experiments, fingerprint
 from ..host_validation import HOST_ADMISSION_VERSION, bind_candidate_validation
+from ..progress import progress, stage
 from ..sensor_training.io import append_jsonl, digest, write_json
-from ..submission import ROOT, PREDICT_ARGV, _decision, _parent_checkpoint, _selected_checkpoint, _snapshot
+from ..submission import ROOT, PREDICT_ARGV, _decision, _parent_checkpoint, _prediction_checkpoint, _snapshot
 
 
 @lru_cache(maxsize=2)
@@ -28,9 +29,8 @@ def _prediction_model(path, dataset, identity):
 def predict(sample, model_dir):
     # 先核对原生输入结构，再读取 SDK 实际选中的检查点；这里没有训练和标签反馈分支。
     dataset, paths, values = input_values(sample.inputs, sample.dataset_key)
-    checkpoint = _selected_checkpoint(sample, model_dir)
-    stat = checkpoint.stat()
-    model = _prediction_model(str(checkpoint), dataset, (stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size))
+    checkpoint, identity = _prediction_checkpoint(sample, model_dir)
+    model = _prediction_model(str(checkpoint), dataset, identity)
     if paths != model.meta["paths"]:
         raise ValueError("Regression prediction schema differs from its checkpoint")
     result = float(model.predict(np.asarray([values], dtype=np.float64))[0])
@@ -164,6 +164,7 @@ def _restore_history(rnd, history, run, validation, before, rules, dataset):
 def train(rnd):
     # 阶段 1：检查冻结合同。B 是分钟，C 是循环，两者都是 RMSE 越低越好，不能套 A 的分类门槛。
     dataset = rnd.dataset_key
+    progress("train_started", dataset=dataset, round_index=rnd.round_index)
     if (dataset not in UNITS or rnd.task.get("task") != "regression"
             or str(rnd.task.get("metric", "rmse")).lower() != "rmse"
             or rnd.task.get("metric_direction", "lower") != "lower"
@@ -188,11 +189,14 @@ def train(rnd):
     checkpoint = _parent_checkpoint(rnd)
     # 阶段 2：从宿主实际父产物加载权重、Adam、scaler、seed，先测父模型，再读历史与状态副本。
     # parent_host 会核对宿主父分数和本地分数是否同一范围，冲突时不开放新版本上线。
-    train_data, validation = load_pair(rnd.data.train_path, rnd.data.validation_path, dataset)
-    parent = load_model(checkpoint, dataset, train_data["paths"])
-    before = evaluate(parent, validation, dataset)
+    with stage("load_public_data", dataset=dataset):
+        train_data, validation = load_pair(rnd.data.train_path, rnd.data.validation_path, dataset)
+    with stage("evaluate_parent", dataset=dataset):
+        parent = load_model(checkpoint, dataset, train_data["paths"])
+        before = evaluate(parent, validation, dataset)
     parent_host = parent_reference(rnd.frame.get("current_validation"), before, validation["sha256"])
-    history = rnd.history()
+    with stage("history_rpc", dataset=dataset):
+        history = rnd.history()
     state = rnd.state_workspace(run / "state")
     reference_path = state / "regression_monitor_reference.json"
     # 阶段 3：首轮只从 train 建立监测参考；后续校验其来源和结构，保持最初的比较口径。
@@ -214,7 +218,8 @@ def train(rnd):
                  "monitor_reference_policy": "fixed_initial_training_projection-v1"}
     allowed, blocked = available_experiments(policy, menu, rnd, train_data, validation, rules, execution)
     # 指纹包含父模型、train、validation、方案和执行规则；只屏蔽同一身份下反复失败的方案。
-    restored = _restore_history(rnd, history, run, validation, before, rules, dataset)
+    with stage("restore_and_evaluate_history", dataset=dataset):
+        restored = _restore_history(rnd, history, run, validation, before, rules, dataset)
     rollback_ids = [key for key, value in restored.items() if value["gate"]["eligible"] and parent_host["comparable"]]
     # observe 永远保留；只有存在可执行菜单/合格历史时才开放 experiment/rollback。
     actions = ["observe"] + (["experiment"] if allowed else []) + (["rollback"] if rollback_ids else [])
@@ -265,8 +270,9 @@ def train(rnd):
         append_jsonl(state / "experiment_attempts.jsonl", {"round_index": rnd.round_index, "configuration": spec, "status": "started"})
         candidate = run / "candidate"
         try:
-            report = continue_candidate(checkpoint, train_data, validation, candidate, spec, limits, rules, dataset,
-                                        rnd.parent.checkpoint_sha256)
+            with stage("local_training", dataset=dataset, experiment=spec["name"]):
+                report = continue_candidate(checkpoint, train_data, validation, candidate, spec, limits, rules, dataset,
+                                            rnd.parent.checkpoint_sha256)
         except (TimeoutError, ValueError, ArithmeticError, np.linalg.LinAlgError) as error:
             failure = {"stage": "local_training", "error_type": type(error).__name__, "message": str(error)[:1000]}
             append_jsonl(state / "experiment_attempts.jsonl", {"round_index": rnd.round_index, "status": "failed", **failure})
@@ -283,9 +289,10 @@ def train(rnd):
         write_json(candidate / "planning.json", {"decision": plan, **planning_calls})
         change = "Continued the actual %s regression parent using %s; preserved Adam/scalers/seed and measured RMSE in %s." % (dataset, spec["name"], UNITS[dataset])
         # SDK 上传在计算异常捕获之外；任何结果未知的 RPC 立即结束会话，不重试或伪造成功。
-        submitted = rnd.submit_candidate(candidate, hypothesis=plan["hypothesis"], change_summary=change,
-            configuration=cfg, seed=parent.meta["seed"], checkpoint_paths=["checkpoint.npz"],
-            code_paths=_snapshot(candidate), predict_argv=PREDICT_ARGV)
+        with stage("submit_candidate_rpc", dataset=dataset):
+            submitted = rnd.submit_candidate(candidate, hypothesis=plan["hypothesis"], change_summary=change,
+                configuration=cfg, seed=parent.meta["seed"], checkpoint_paths=["checkpoint.npz"],
+                code_paths=_snapshot(candidate), predict_argv=PREDICT_ARGV)
         admission = host_gate(submitted, parent_host, report["validation_after"], validation["sha256"], rules,
                               binding=bind_candidate_validation(rnd, submitted, validation["sha256"]))
         cfg["host_candidate_gate"] = admission
@@ -337,8 +344,10 @@ def train(rnd):
     write_json(state / "diagnosis.json", diagnosis)
     append_jsonl(state / "decisions.jsonl", record)
     write_json(run / "round_summary.json", record)
-    rnd.save_state(state)
+    with stage("save_state_rpc", dataset=dataset):
+        rnd.save_state(state)
     # 阶段 11：保存的是可写状态副本；finish 引用实际读过的历史和本轮真实回执，等待宿主确认后退出。
-    rnd.finish(selected_artifact_id=selected, hypothesis=plan["hypothesis"], change_summary=change,
-               reason=selection["reason"], configuration=cfg, seed=seed,
-               history_ids=[item["id"] for item in history], model_call_ids=list(rnd.call_ids))
+    with stage("finish_rpc", dataset=dataset):
+        rnd.finish(selected_artifact_id=selected, hypothesis=plan["hypothesis"], change_summary=change,
+                   reason=selection["reason"], configuration=cfg, seed=seed,
+                   history_ids=[item["id"] for item in history], model_call_ids=list(rnd.call_ids))

@@ -54,13 +54,27 @@ class DockerRehearsalTest(unittest.TestCase):
             (self.root / name).mkdir()
         command, name = self.runtime.train(self.root / "parent", self.root / "data", self.root / "state", self.root / "train.jsonl")
         self.assertTrue(name.startswith("gas-real-train-"))
-        self.assertEqual(command[-2:], ["sha256:fixed", "train"])
+        self.assertEqual(command[-5:], ["--entrypoint", "python3", "sha256:fixed", "/app/harness.py", "train"])
         prediction = self.runtime.predict(self.root / "parent", self.root / "parent/nested/checkpoint.npz", self.root / "predict-log")
         self.assertIn("CONTEST_ARTIFACT_PATH=/model/nested/checkpoint.npz", prediction)
+        self.assertEqual(prediction[-5:], ["--entrypoint", "python3", "sha256:fixed", "/app/harness.py", "predict"])
         self.assertEqual(set(self.runtime.launches[0]["mounts"]), {"/previous", "/data", "/state"})
         self.assertEqual(set(self.runtime.launches[1]["mounts"]), {"/model"})
         self.assertNotIn("mutable-tag", command)
         self.assertTrue(self.runtime.audit()["container_policy_verified"])
+
+    def test_prediction_receives_the_complete_sdk_context(self):
+        self.runtime.image = "sha256:fixed"
+        output = self.root / "prediction-context"
+        output.mkdir()
+        context = {"protocol": "contest.predict-context.v1", "dataset_key": "C", "task": "regression",
+                   "artifact_id": "selected-model", "artifact": {"checkpoint_paths": ["checkpoint.npz"]}}
+        command = self.runtime.predict(self.root, self.root / "checkpoint.npz", output, context=context)
+        self.assertIn("CONTEST_PREDICTION_CONTEXT=" + json.dumps(context), command)
+        self.assertIn("CONTEST_DATASET_KEY=C", command)
+        self.assertIn("CONTEST_TASK=regression", command)
+        image_index = command.index(self.runtime.image)
+        self.assertLess(command.index("CONTEST_PREDICTION_CONTEXT=" + json.dumps(context)), image_index)
 
     def test_multitask_preflight_rejects_old_classification_only_image(self):
         self.runtime.required_tasks = {"classification", "regression"}

@@ -153,8 +153,12 @@ class OfflineHost:
             if request["phase"] == "plan":
                 actions = request["response_schema"]["action"]
                 action = self.action if self.action in actions else "observe"
+                # 多轮计时中某方案可能已被重复拒绝屏蔽。离线替身也必须遵守当轮菜单，
+                # 不能反复生成同一个非法决定后把纠正失败误报为 SDK/性能故障。
+                experiments = request["experiments"]
+                experiment = self.experiment if self.experiment in experiments else next(iter(experiments), "none")
                 decision = {"action": action,
-                            "experiment": ("unknown" if self.bad_plan else self.experiment) if action == "experiment" else "none",
+                            "experiment": ("unknown" if self.bad_plan else experiment) if action == "experiment" else "none",
                             "target_artifact_id": (request["response_schema"]["target_artifact_id"][-1]
                                                    if action == "rollback" else request["parent_artifact_id"]),
                             "hypothesis": "A bounded continuation can improve the measured weak class.",

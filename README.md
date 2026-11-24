@@ -4,6 +4,10 @@
 
 **当前支持 A 分类、B/C 剩余寿命回归，原生接口使用 contest-harness SDK 1.0.4。** 方案范围和安全门槛由代码限定，27B 负责依据证据做选择；系统不会任意生成并执行新的训练代码。
 
+**2026-11-24 补充：当前交付更新为 v9。** `/app/harness.py` 恢复为用户提供 SDK 的原模板，镜像内 9 个 SDK 模块与原始压缩包逐字节核对。容器训练/预测验收显式使用 SDK 标准命令，并传入完整预测上下文，不再只测依赖 ENTRYPOINT 的简写与缺省上下文兼容分支。旧 v8 源码重复快照也已合并。当前验证属于离线与保存回复重放，不计为新的真实 27B 调用；不能据此宣布组委会 180 秒预检故障已消除。交付时须使用新的 v9 tar，重试旧提交不会更新镜像。
+
+**2026-11-24：针对平台“预检单步超过 180 秒”的提示，已构建 v8 启动与预测优化镜像。** 本地未复现该 180 秒超时；已去除 describe 的训练模块加载，并在 OS 确认 `/model` 只读后复用路径/文件身份，减少每条预测的文件系统查询。C 的 23,049 条公开预测由约 28.7 秒降至 2.0 秒，输出字节一致。v8 的验证为离线检查和既有真实回复重放，不计作新的真实 27B 实验；最近一次真实调用成绩仍是下述 v7。新镜像、日志与重新试运行说明见 [v8 超时排查报告](docs/IMAGE_V8_TIMEOUT_20261124.md)。
+
 当前 **v7 镜像**已纳入续训审查的三项修复：B/C 允许跨轮更新授权训练投影而保留最初监测参考；输出指南约定的 `training.json`；精简候选回执通过本轮 SDK 提交与当前文件摘要绑定，仍拒绝显式冲突和无法核验的宿主分数。实现见[续训与 SDK 修复说明](docs/BASELINE_SDK_FIXES_20261123.md)，构建与离线镜像验证见[v7 交付说明](docs/IMAGE_V7_20261123.md)。下列成绩来自修复后固定 v7 镜像的全新真实 27B 测试，未沿用 v6 回执或结果。
 
 ## 当前任务与最近结果
@@ -76,6 +80,35 @@
 - SDK 1.0.4 使用 `chunked-v1` 上传。上传期间不修改文件，容量以 `rnd.limits` 为准；不支持新协议时明确报错。
 - 完整但非法的模型回复最多纠正一次，并保留每次真实回执。RPC 发出后中断会立即结束会话，不捕获后继续发请求，也不自动重试结果未知的操作。
 
+## SDK 1.0.4 顺序与超时边界
+
+正式入口逐字节使用随附 SDK 的 `template/harness.py`，不在入口脚本中追加自定义启动逻辑，也不自行实现或修改 JSONL 协议。训练先由 `Round.start()` 读取 `start`；每个请求都必须收到对应响应类型、同 ID 的宿主回复后才能继续。上传按 `upload_begin → upload_chunk（逐块确认）→ upload_finish` 完成，再发 `candidate_request` 或 `state_request`。最后发送 `round_complete`，收到 `round_ack/accepted=true` 后退出。预测没有训练 start 帧，每条输入必须在下一条输入和 EOF 之前得到已刷新的输出。
+
+SDK 没有规定 `save_state` 与 `submit_candidate` 必须按示例中的相对顺序执行。项目在候选实测、模型选版和配套策略写完后保存状态，随后结束本轮；不能为了机械模仿示例，把未完成的决策状态提前保存。`tests/test_sdk_alignment.py` 用实际 SDK 校验 A/B/C 完整回合的请求/回复顺序，以及上传中断后不会再发 RPC。
+
+协议兼容不代表满足平台时限。SDK 1.0.4 的文件上传和历史恢复都是串行 RPC：小文件也要单独请求/确认，恢复历史还会传回整份产物的源码和报告。本项目原 A 候选把训练源码同时放在 `source/` 与 `src/gas_a/sensor_training/`，现改为共用后一处，减少上传和以后恢复时的重复往返。此改动改变产物源码布局，已纳入 v9；既有固定 v8 镜像和旧证据不包含它。
+
+`scripts/validate_platform.py::exchange()` 现在以整轮累计时间验收，默认 180 秒，并受本地宿主 start 帧中更小的 `wall_seconds` 约束；可通过函数参数 `round_timeout` 调整。180 秒是本地测试预算，不是 SDK 对所有平台/RPC 的通用规定。同步宿主处理（模型请求或候选测量）返回后也复查预算，超限不再发送回复或继续会话。协议记录增加累计秒数并逐帧刷新，可区分宿主等待和选手计算。该检查不抢占已经发出的同步宿主操作，宿主操作本身仍需自己的超时与收尾；不能把它解释为每个测试进程都保证在 180 秒内结束。
+
+定位超时须区分阶段：`describe` 不会进入历史恢复、模型调用或候选上传；`train` 的数值训练上限也不涵盖模型、上传和宿主评测的全部耗时。保存回复重放省去了真实模型等待，不能用其耗时推断正式平台一定通过。
+
+### 测试 agent 计时与并发对照
+
+`scripts/benchmark_sdk_agent.py` 使用用户提供的 SDK 1.0.4 源码核对安装包、原模板和固定镜像，再对 A/B/C 各执行 10 轮串行与三个独立进程并发的对照，共 60 轮。每个数据集内部仍严格按轮继承父模型、状态和历史，单个 SDK 会话只允许一个未完成请求。测试执行真实数值训练、分块传输和容器预测，模型决策使用离线替身，不读取密钥、不请求真实模型、不写云端。
+
+```powershell
+.\.venv\Scripts\python.exe -B -X utf8 scripts/benchmark_sdk_agent.py `
+  --baseline-root 'D:\liyue\工业模型赛题研究' `
+  --sdk-archive 'D:\liyue\工业模型赛题研究\contest-harness-sdk-1.0.4.tar.gz' `
+  --output runtime/my-sdk-agent-timing --rounds 10 `
+  --docker-executable 'C:\Users\Administrator\AppData\Local\Programs\DockerDesktop\resources\bin\docker.exe' `
+  --docker-context desktop-linux
+```
+
+输出目录必须全新。`round-timings.csv` 汇总逐轮耗时；每轮 `sdk-timing.json` 保存请求/回复顺序、上传偏移及摘要核验、宿主等待、选手输出间隔和应用阶段。`summary.json` 与 `REPORT.txt` 比较串行/并发耗时和模型输出一致性。Docker `start/die` 事件用于核验训练容器的真实时间交集，不能把同一数据集候选评测中嵌套启动的预测容器误算成跨数据集并发。候选评测时间已包含在候选 RPC 等待中，不能重复相加。
+
+SDK 的 `Round._rpc()` 用锁串行完成单会话请求，SDK 不包含平台跨数据集调度器。仓库原 `test_fresh_platform.py` 按 A→B→C 串行执行；平台界面同时显示 A7/B8/C5 只能支持进度独立，不能凭该截图排除分时交错或界面异步更新，也不能证明同时执行。无法取得平台任务起止时间时，平台并行性应标为未确认；本地并发实验也不代表平台资源池或模型网关排队情况。
+
 ## 安装与入口
 
 以下命令在项目根目录用 PowerShell 运行。数值环境为 Python **3.12.13**、NumPy **1.26.4**、SDK **1.0.4**。
@@ -98,6 +131,7 @@ SDK wheel 已随源码放在 `vendor/contest_harness-1.0.4-py3-none-any.whl`，�
 | `scripts/validate_multitask.py` | A/B/C 离线宿主演练，实际训练/预测，模型决定为离线替身 |
 | `scripts/test_fresh_platform.py` | 从初始基线开始的 A/B/C 真实 27B、回滚、云端记录和重放总控 |
 | `scripts/replay_multitask_cloud.py` | 使用保存回复做零费用数值重放 |
+| `scripts/validate_image_latency.py` | 保持 stdin 打开检查镜像首帧响应，并可对比已有公开预测输出，不调用模型 |
 | `run.py train-local / predict-local / evaluate` | A 的本地单候选开发工具，不代替 B/C 原生入口 |
 | `run.py replay` | 历史带标签反馈回放，仅供研究，不作为平台预测入口 |
 
@@ -126,7 +160,7 @@ $imageId = (& $dockerExe image inspect $imageTag --format '{{.Id}}').Trim()
 $imageId = (& $dockerExe image inspect $imageTag --format '{{.Id}}').Trim()
 ```
 
-当前镜像为 `gas-rsi-abc:wyx-sdk104-v7-20261123`，不可变 ID 为 `sha256:259ad61698efd54431e15b5f7da917a3388261a4287a594bf0668695502caa37`，交付目录为 `output/submission-wyx-sdk104-v7-20261123/`。默认真实测试工具已指向 v7；构建、校验和导出依据见[v7 交付说明](docs/IMAGE_V7_20261123.md)。
+当前镜像为 `gas-rsi-abc:wyx-sdk104-v9-20261124`，不可变 ID 为 `sha256:be6ddcc96cd4b20be480cad0067abbdd0102bc03c2891d7acf5ac7b38003f0d4`，交付目录为 `output/submission-wyx-sdk104-v9-20261124/`。默认真实测试工具已指向 v9；本次未执行新的付费测试。v8 镜像与当时的验证保留，见 [v8 超时排查报告](docs/IMAGE_V8_TIMEOUT_20261124.md)。v7 镜像及其真实实验原样保留，见[v7 交付说明](docs/IMAGE_V7_20261123.md)。
 
 v6 原始镜像与真实模型证据原样保留在 `output/fresh-platform-test-v6-20261123/` 和 `runtime/fresh-v6-full-20261123/`。v7 新增真实 27B 的完整证据位于 `runtime/fresh-v7-full-20261123/`，与构建时的离线替身测试分开保存。后续若再改动应用源码，仍须重建并显式传入对应 `$imageTag` / `$imageId`，严格预检会拒绝源码不匹配的旧镜像。
 

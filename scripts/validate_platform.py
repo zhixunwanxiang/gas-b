@@ -16,12 +16,14 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from tests.test_submission import OfflineHost
 from gas_a.sensor_training.io import digest, write_json
+from scripts.sdk_protocol_audit import audit_file
 import numpy as np
 
 
@@ -49,9 +51,32 @@ def receipt(directory, identifier, descriptor):
     return {"artifact_id": identifier, **value, "artifact_sha256": "sha256:" + hashlib.sha256(encoded).hexdigest()}
 
 
-def exchange(host, command, env, output, container_name=None, docker_argv=None):
+def exchange(host, command, env, output, container_name=None, docker_argv=None, *, round_timeout=180,
+             rpc_delay_seconds=0, model_delay_seconds=0):
     # 写入一帧 start 后边读选手输出边发送相应宿主帧，不能等 stdin 结束才开始交互。
     # 收到 round_complete 后发确认，再等待进程退出；异常也清理本次拥有的容器和管道。
+    # 180 秒是本地验收默认预算，不是 SDK 规定的通用 RPC 超时。
+    # 宿主提供 wall_seconds 时取较严者；同步宿主操作返回后仍需复查总预算，
+    # 不能靠每一帧都小于 120 秒，就让任意长的整轮被判为成功。
+    budgets = [round_timeout, host.frame.get("wall_seconds")]
+    budgets = [value for value in budgets if value is not None]
+    if any(isinstance(value, bool) or not isinstance(value, (int, float))
+           or not np.isfinite(value) or value <= 0 for value in budgets):
+        raise ValueError("Round timeout must be a finite positive number")
+    for value, maximum in ((rpc_delay_seconds, 2), (model_delay_seconds, 30)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value) or not 0 <= value <= maximum:
+            raise ValueError("Invalid local simulated host delay")
+    started_at_unix = time.time()
+    started = time.monotonic()
+    deadline = started + min(budgets) if budgets else None
+    last_request = "process_start"
+
+    def remaining(stage, maximum=None):
+        left = None if deadline is None else deadline - time.monotonic()
+        if left is not None and left <= 0:
+            raise TimeoutError("Round wall-time budget exhausted during %s (last request: %s)" % (stage, last_request))
+        return maximum if left is None else left if maximum is None else min(left, maximum)
+
     with (output / "stderr.log").open("w", encoding="utf-8") as stderr, \
             (output / "protocol.jsonl").open("w", encoding="utf-8") as transcript:
         process = subprocess.Popen(command, cwd=ROOT, env=env, stdin=subprocess.PIPE,
@@ -65,29 +90,59 @@ def exchange(host, command, env, output, container_name=None, docker_argv=None):
                 lines.put(None)
         reader = threading.Thread(target=read_lines, daemon=True)
         reader.start()
+        completed, failure, process_exit_seconds = False, None, None
+        injected_delay = 0.0
         try:
+            def trace(direction, frame):
+                transcript.write(json.dumps({"direction": direction, "elapsed_seconds": time.monotonic() - started,
+                                             "frame": frame}) + "\n")
+                # 先落盘再执行可能耗时的宿主操作，外部中止时仍能定位最后一次请求。
+                transcript.flush()
+
             def respond():
+                remaining("host_response")
                 response = host.readline()
-                transcript.write(json.dumps({"direction": "host", "frame": json.loads(response)}) + "\n")
+                remaining("host_response")
+                trace("host", json.loads(response))
                 process.stdin.write(response)
                 process.stdin.flush()
             respond()
             while host.record is None:
-                line = lines.get(timeout=120)
+                try:
+                    line = lines.get(timeout=remaining("participant_output", 120))
+                except queue.Empty as error:
+                    remaining("participant_output")
+                    raise TimeoutError("No SDK frame received within 120 seconds (last request: %s)" % last_request) from error
                 if line is None:
                     raise RuntimeError("Harness exited before round acknowledgement; inspect stderr.log")
                 frame = json.loads(line)
-                transcript.write(json.dumps({"direction": "harness", "frame": frame}) + "\n")
+                last_request = frame.get("type", "unknown")
+                trace("harness", frame)
                 if frame.get("type") == "round_failed":
                     raise RuntimeError("Harness round failed: " + line)
+                delay = rpc_delay_seconds + (model_delay_seconds if last_request == "model_request" else 0)
+                if delay:
+                    # 仅测试宿主注入等待；不修改 SDK，也不发送伪造心跳或并发 RPC。
+                    injected_delay += delay
+                    time.sleep(delay)
+                    remaining("simulated_host_delay")
                 host.write(line)
+                # host.write 可同步等待模型或执行候选验证；这段时间同样属于整轮。
+                # 预算耗尽后终止本地验收，不伪造回复，也不继续/重试 SDK 会话。
+                remaining("host_dispatch")
                 respond()
             process.stdin.close()
-            if process.wait(timeout=15) != 0:
+            if process.wait(timeout=remaining("process_exit", 15)) != 0:
                 raise RuntimeError("Harness exited unsuccessfully; inspect stderr.log")
+            process_exit_seconds = time.monotonic() - started
+            remaining("process_exit")
             reader.join(timeout=2)
             if not lines.empty() and lines.get_nowait() is not None:
                 raise RuntimeError("Unexpected output after round acknowledgement")
+            completed = True
+        except BaseException as error:
+            failure = {"error_type": type(error).__name__, "last_request": last_request}
+            raise
         finally:
             if process.poll() is None:
                 process.kill()
@@ -98,6 +153,32 @@ def exchange(host, command, env, output, container_name=None, docker_argv=None):
                 # Only the uniquely named container created by this invocation.
                 subprocess.run([*(docker_argv or ["docker"]), "rm", "-f", container_name],
                                env=env, capture_output=True, timeout=30)
+            transcript.flush()
+            try:
+                timing = audit_file(output / "protocol.jsonl")
+                stages = []
+                stderr.flush()
+                for line in (output / "stderr.log").read_text(encoding="utf-8").splitlines():
+                    if line.startswith("[gas-rsi] "):
+                        try:
+                            event = json.loads(line[len("[gas-rsi] "):])
+                        except ValueError:
+                            continue
+                        if event.get("event") == "stage_ended":
+                            stages.append(event)
+                timing.update(status="completed" if completed else "failed", failure=failure,
+                    dataset=host.frame.get("dataset_key"), round_index=host.frame.get("round_index"),
+                    started_at_unix=started_at_unix, process_exit_seconds=process_exit_seconds,
+                    wall_total_seconds=time.monotonic() - started, budget_seconds=min(budgets) if budgets else None,
+                    rpc_delay_seconds=rpc_delay_seconds, model_delay_seconds=model_delay_seconds,
+                    injected_delay_seconds=injected_delay, application_stages=stages,
+                    synchronous_host_operations_preempted=False)
+                write_json(output / "sdk-timing.json", timing)
+                if completed and not timing["order_valid"]:
+                    raise ValueError("SDK wire order audit failed: " + "; ".join(timing["errors"]))
+            except Exception:
+                if completed:
+                    raise
 
 
 def check_prediction(root, directory, descriptor, image):

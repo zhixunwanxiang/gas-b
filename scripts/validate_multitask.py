@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,14 +30,13 @@ PREDICT_ARGV = ["python3", "/app/harness.py", "predict"]
 def measure(runtime, directory, descriptor, validation_path, validation, dataset, out):
     """通过实际 predict 进程测量；只发 inputs，预测容器不挂载带 answer 的数据。"""
     out.mkdir()
+    started = time.perf_counter()
     task = "classification" if dataset == "A" else "regression"
     context = {"protocol": "contest.predict-context.v1", "dataset_key": dataset, "task": task,
                "artifact_id": "measured", "artifact": descriptor}
     env = child_environment()
     if runtime:
-        argv = runtime.predict(directory, directory / descriptor["checkpoint_paths"][0], out)
-        # DockerRuntime strips inherited CONTEST variables; the context must be explicitly passed into this container.
-        argv[-2:-2] = ["-e", "CONTEST_PREDICTION_CONTEXT=" + json.dumps(context)]
+        argv = runtime.predict(directory, directory / descriptor["checkpoint_paths"][0], out, context=context)
     else:
         argv = [sys.executable, "-B", str(ROOT / "harness.py"), "predict"]
         env.update(CONTEST_ARTIFACT_PATH=str(directory / descriptor["checkpoint_paths"][0]),
@@ -45,7 +45,9 @@ def measure(runtime, directory, descriptor, validation_path, validation, dataset
     # 标签只留在宿主用于算分，stdin 发送 task 和 inputs；预测容器只挂载模型，不挂载 validation 文件。
     inputs = "".join(json.dumps({"task": task, "inputs": row["inputs"]}) + "\n" for row in rows)
     try:
+        prediction_started = time.perf_counter()
         result = subprocess.run(argv, input=inputs, text=True, encoding="utf-8", capture_output=True, env=env, timeout=120)
+        prediction_seconds = time.perf_counter() - prediction_started
         (out / "stderr.log").write_text(result.stderr, encoding="utf-8")
         if result.returncode:
             raise RuntimeError("Native prediction process failed; inspect " + str(out / "stderr.log"))
@@ -74,10 +76,13 @@ def measure(runtime, directory, descriptor, validation_path, validation, dataset
                 return values
         metrics = regression_evaluate(Measured(), validation, dataset)
     write_json(out / "metrics.json", metrics)
+    write_json(out / "timing.json", {"dataset": dataset, "rows": len(rows),
+        "prediction_process_seconds": prediction_seconds, "total_measurement_seconds": time.perf_counter() - started,
+        "scope": "local_host_preparation_prediction_and_metric_evaluation"})
     return metrics
 
 
-def run_dataset(base, out, dataset, rounds, runtime, *, peer_factory=None, journal=None, max_rounds=None):
+def run_dataset(base, out, dataset, rounds, runtime, *, peer_factory=None, journal=None, max_rounds=None, exchange_options=None):
     # 一个数据集的多轮宿主：registry 保存真实产物目录，current 永远是上轮最终选中的 ID。
     # peer_factory 决定模型来源（真实回复或记录重放）；缺省才使用明确标识的离线模型替身。
     out.mkdir()
@@ -133,11 +138,11 @@ def run_dataset(base, out, dataset, rounds, runtime, *, peer_factory=None, journ
             host.frame["task_contract"]["public_projection"].update(train_path="/data/train.jsonl", validation_path="/data/validation.jsonl")
             host.frame["state_path"] = "/state" if state else None
             argv, name = runtime.train(directory, out / "data", state, host.store / "container.jsonl")
-            exchange(host, argv, env, host.store, name, docker_argv=runtime.cli)
+            exchange(host, argv, env, host.store, name, docker_argv=runtime.cli, **(exchange_options or {}))
         else:
             with tempfile.TemporaryDirectory(prefix="native-rul-work-") as work:
                 env.update(CONTEST_WORK=work, GAS_A_TEST_ROOT=str(ROOT), GAS_A_TEST_PARENT=str(directory))
-                exchange(host, [sys.executable, "-B", "-c", BOOTSTRAP], env, host.store)
+                exchange(host, [sys.executable, "-B", "-c", BOOTSTRAP], env, host.store, **(exchange_options or {}))
         if host.candidate:
             # 提交的新候选先登记，不直接变成父模型；只有 finish.selected_artifact_id 决定下轮起点。
             descriptor = next(frame["artifact"] for frame in host.frames if frame["type"] == "candidate_request")

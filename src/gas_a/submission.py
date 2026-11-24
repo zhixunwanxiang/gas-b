@@ -28,9 +28,13 @@ from .evolution import (load_policy, available_experiments, promotion_gate,
 from .controller_prompts import (VERSION as CONTROLLER_PROMPT_VERSION, execution_policy,
                                  enrich_plan, enrich_selection, request_digest)
 from .host_validation import parent_reference, candidate_gate as host_candidate_gate, bind_candidate_validation
+from .progress import progress, stage
 
 ROOT = Path(__file__).resolve().parents[2]
 PREDICT_ARGV = ["python3", "/app/harness.py", "predict"]
+# 冻结的 128 维路径只构造一次；数值与每条输入仍独立校验，不缓存样本或预测结果。
+_PREDICTION_PATHS = flatten({"features": [0.0] * 128})[0]
+_READONLY_CHECKPOINTS = {}
 
 
 def _check_task(task, dataset_key):
@@ -43,7 +47,7 @@ def _check_task(task, dataset_key):
 def _prediction_model(path, file_identity=None):
     # Cache only within this prediction process. Each measurement gets a new one.
     # 每个预测进程内缓存一次完整预测器；文件时间/大小参与键，避免同路径文件变化后误用旧对象。
-    return load_predictor(Path(path))
+    return load_predictor(Path(path), _PREDICTION_PATHS)
 
 
 def _selected_checkpoint(sample, model_dir):
@@ -65,6 +69,31 @@ def _selected_checkpoint(sample, model_dir):
     return Path(model_dir).joinpath(*relative.parts).resolve()
 
 
+def _prediction_checkpoint(sample, model_dir):
+    # 平台每个预测进程挂载一份不可变产物。只在 /model 且 OS 确认只读时复用文件身份，
+    # 避免每条样本反复 resolve/lstat/stat；本地可写模型仍逐条检查，以检测同路径文件更新。
+    context = getattr(sample, "context", None) or {}
+    explicit = os.environ.get("CONTEST_ARTIFACT_PATH")
+    key = (str(model_dir), explicit, context.get("artifact_id"),
+           None if explicit else json.dumps(context.get("artifact", {}).get("checkpoint_paths", [])))
+    cached = _READONLY_CHECKPOINTS.get(key)
+    if cached is not None:
+        return cached
+    checkpoint = _selected_checkpoint(sample, model_dir)
+    info = checkpoint.stat()
+    value = checkpoint, (info.st_mtime_ns, info.st_ctime_ns, info.st_size)
+    if str(model_dir) == "/model" and checkpoint.is_relative_to(Path("/model")) and hasattr(os, "statvfs"):
+        try:
+            readonly = bool(os.statvfs(checkpoint).f_flag & getattr(os, "ST_RDONLY", 1))
+        except OSError:
+            readonly = False
+        if readonly:
+            if len(_READONLY_CHECKPOINTS) >= 4:
+                _READONLY_CHECKPOINTS.pop(next(iter(_READONLY_CHECKPOINTS)))
+            _READONLY_CHECKPOINTS[key] = value
+    return value
+
+
 def predict(sample, model_dir):
     # 仅接受 features，校验维度、数值和模型特征顺序后返回六类分数。
     # 这里不读取 answer、历史标签或训练数据；同一预测进程中的特征流状态由模型内部维护。
@@ -77,12 +106,11 @@ def predict(sample, model_dir):
             or any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v)
                    for v in features)):
         raise ValueError("Task A requires 128 finite numeric features")
-    checkpoint = _selected_checkpoint(sample, model_dir)
-    stat = checkpoint.stat()
-    model = _prediction_model(str(checkpoint), (stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size))
-    paths, values = flatten(inputs)
-    if paths != model.meta["paths"]:
-        raise ValueError("Input schema differs from selected checkpoint")
+    checkpoint, identity = _prediction_checkpoint(sample, model_dir)
+    model = _prediction_model(str(checkpoint), identity)
+    # 结构/标量已在上方检查，路径已在缓存模型首次加载时验证；保持官方 float 转换。
+    # 不为每条样本重复生成 128 个 JSON 路径，预测顺序和路由流状态均不改变。
+    values = [float(value) for value in features]
     inference = getattr(model, "predict_one", model.predict)
     scores = inference(np.asarray([values], dtype=np.float64))[0].copy()
     if scores.shape != (6,) or not np.isfinite(scores).all() or np.any(scores < 0) or scores.sum() <= 0:
@@ -116,12 +144,13 @@ def _decision(rnd, request, fields, token_limit, validate, corrections=1):
         # request 只含本轮证据和自有提示；不重复加入 rnd.prompt，官方提示由宿主在请求前附加。
         # Never catch an RPC failure: its outcome may be unknown to the SDK.
         request_hashes.append(request_digest(request))
-        receipt = rnd.model(
-            [{"role": "user", "content": json.dumps(request, ensure_ascii=False, allow_nan=False)}],
-            # Structured controller decisions must leave room for final JSON.
-            # Qwen can otherwise spend the entire authorized budget reasoning.
-            max_tokens=min(token_limit, rnd.max_output_tokens), temperature=0, enable_thinking=False,
-        )
+        with stage("model_rpc", phase=request.get("phase"), attempt=attempt + 1):
+            receipt = rnd.model(
+                [{"role": "user", "content": json.dumps(request, ensure_ascii=False, allow_nan=False)}],
+                # Structured controller decisions must leave room for final JSON.
+                # Qwen can otherwise spend the entire authorized budget reasoning.
+                max_tokens=min(token_limit, rnd.max_output_tokens), temperature=0, enable_thinking=False,
+            )
         call_ids.append(receipt.call_id)
         try:
             raw = receipt.text.strip()
@@ -244,6 +273,7 @@ def train(rnd):
     # 本轮只执行一个经过真实模型规划的动作：observe、experiment 或 rollback。
     # 即使保留父模型也需要真实模型决策、保存记录并等待 SDK 的完成确认；每个回合不等于整个程序只能训练一次。
     _check_task(rnd.task.get("task"), rnd.dataset_key)
+    progress("train_started", dataset="A", round_index=rnd.round_index)
     # 1.0.4 has no inline fallback. Fail before data loading or model calls.
     if rnd.limits.get("artifact_upload_protocol") != "chunked-v1":
         raise HarnessError("CHUNKED_UPLOAD_UNSUPPORTED", "SDK 1.0.4 requires a host with chunked-v1 uploads")
@@ -263,14 +293,17 @@ def train(rnd):
     run = Path(tempfile.mkdtemp(prefix=f"round-{rnd.round_index:02d}-", dir=work))
     # 阶段 2：读取宿主实际父产物并在本轮公开验证集测量，后续所有增益都相对这一份完整预测器。
     checkpoint = _parent_checkpoint(rnd)
-    train_data, validation = load_pair(rnd.data.train_path, rnd.data.validation_path)
+    with stage("load_public_data", dataset="A"):
+        train_data, validation = load_pair(rnd.data.train_path, rnd.data.validation_path)
     def parent_file(path):
         return rnd.parent.path(Path(path).resolve().relative_to(rnd.parent.root.resolve()).as_posix())
-    parent = load_predictor(checkpoint, train_data["paths"], resolve_file=parent_file)
-    before = evaluate(parent, validation)
+    with stage("evaluate_parent", dataset="A"):
+        parent = load_predictor(checkpoint, train_data["paths"], resolve_file=parent_file)
+        before = evaluate(parent, validation)
     host_parent = parent_reference(rnd.frame.get("current_validation"), before, validation["sha256"])
     # 阶段 3：真正读取平台历史。保存引用的 id 是证明“读过历史”的证据，不能自行编造。
-    history = rnd.history()
+    with stage("history_rpc", dataset="A"):
+        history = rnd.history()
     menu = {spec["name"]: spec for spec in config["experiments"]}
     controller = config["controller"]
     execution = execution_policy(controller, config["limits"])
@@ -295,7 +328,8 @@ def train(rnd):
     diagnosis = diagnose(before, drift, validation["sha256"], policy.get("last_measurement"))
     allowed_menu, blocked = available_experiments(policy, menu, rnd, train_data, validation, controller, execution)
     # 阶段 5：历史版本也必须在当前验证数据上复评；父测量口径不可比时不开放回滚动作。
-    restored = _restore_history(rnd, history, run, validation, before, controller)
+    with stage("restore_and_evaluate_history", dataset="A"):
+        restored = _restore_history(rnd, history, run, validation, before, controller)
     rollback_ids = [identifier for identifier, item in restored.items()
                     if item["gate"]["eligible"] and host_parent["comparable"]]
     actions = ["observe"] + (["experiment"] if allowed_menu else []) + (["rollback"] if rollback_ids else [])
@@ -354,10 +388,11 @@ def train(rnd):
         try:
             # Only this CPU/filesystem computation is recoverable here. Never
             # include rnd.model/submit/save/restore RPCs in this exception scope.
-            report = continue_candidate(checkpoint, train_data, validation, candidate, spec,
-                                        {"weakest_class": weak_class}, training_limits,
-                                        expected_parent_sha256=rnd.parent.checkpoint_sha256,
-                                        parent_artifact_id=rnd.parent.artifact_id)
+            with stage("local_training", dataset="A", experiment=spec["name"]):
+                report = continue_candidate(checkpoint, train_data, validation, candidate, spec,
+                                            {"weakest_class": weak_class}, training_limits,
+                                            expected_parent_sha256=rnd.parent.checkpoint_sha256,
+                                            parent_artifact_id=rnd.parent.artifact_id)
         except (TimeoutError, ValueError, ArithmeticError, np.linalg.LinAlgError) as error:
             experiment_failure = {"stage": "local_training", "error_type": type(error).__name__,
                                   "message": str(error)[:1000], "candidate_submitted": False}
@@ -383,12 +418,13 @@ def train(rnd):
         write_json(candidate / "diagnosis.json", diagnosis)
         write_json(candidate / "monitoring.json", drift)
         # 上传后宿主会重新测量并返回回执。此 RPC 位于本地训练异常捕获范围之外，失败时不继续发请求。
-        submitted = rnd.submit_candidate(
-            candidate, hypothesis=plan["hypothesis"], change_summary=change,
-            configuration=configuration, seed=parent.meta["seed"],
-            checkpoint_paths=artifact_checkpoint_paths(candidate / "checkpoint.npz"),
-            code_paths=code_paths, predict_argv=PREDICT_ARGV,
-        )
+        with stage("submit_candidate_rpc", dataset="A"):
+            submitted = rnd.submit_candidate(
+                candidate, hypothesis=plan["hypothesis"], change_summary=change,
+                configuration=configuration, seed=parent.meta["seed"],
+                checkpoint_paths=artifact_checkpoint_paths(candidate / "checkpoint.npz"),
+                code_paths=code_paths, predict_argv=PREDICT_ARGV,
+            )
         host_gate = host_candidate_gate(submitted, host_parent, report["validation_after"],
                                         validation["sha256"], controller,
                                         binding=bind_candidate_validation(rnd, submitted, validation["sha256"]))
@@ -456,11 +492,13 @@ def train(rnd):
     append_jsonl(state / "decisions.jsonl", record)
     write_json(run / "round_summary.json", record)
     # 阶段 12：先提交完整原生状态，再结束本轮。下一轮父模型仍以宿主 start 为准，不由 state 擅自指定。
-    rnd.save_state(state)
+    with stage("save_state_rpc", dataset="A"):
+        rnd.save_state(state)
     # finish 引用本轮实际读取的历史和真实模型回执，等待宿主确认后由 SDK 结束进程。
-    rnd.finish(
-        selected_artifact_id=selected, hypothesis=plan["hypothesis"],
-        change_summary=change,
-        reason=selection["reason"], configuration=configuration, seed=selected_seed,
-        history_ids=[item["id"] for item in history], model_call_ids=list(rnd.call_ids),
-    )
+    with stage("finish_rpc", dataset="A"):
+        rnd.finish(
+            selected_artifact_id=selected, hypothesis=plan["hypothesis"],
+            change_summary=change,
+            reason=selection["reason"], configuration=configuration, seed=selected_seed,
+            history_ids=[item["id"] for item in history], model_call_ids=list(rnd.call_ids),
+        )
