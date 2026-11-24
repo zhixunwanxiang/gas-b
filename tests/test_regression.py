@@ -291,11 +291,12 @@ class RegressionTest(unittest.TestCase):
         checkpoint = make_fixture(self.root, "C")
         host = RegressionHost(self.root, checkpoint, "C")
         host.bad_plan = True
-        with self.assertRaisesRegex(ValueError, "outside the configured menu"):
-            self.run_host(host)
-        self.assertEqual(len(host.calls), 2)
+        state = self.run_host(host)
+        self.assertEqual(len(host.calls), 3)
         self.assertIsNone(host.candidate)
-        self.assertIsNone(host.record)
+        self.assertEqual(host.record["selected_artifact_id"], "parent-1")
+        record = json.loads((state / "decisions.jsonl").read_text(encoding="utf-8"))
+        self.assertEqual(record["planning_calls"]["decision_source"], "program_guard")
 
     def test_identical_local_failures_are_blocked_on_next_round(self):
         checkpoint = make_fixture(self.root, "B")

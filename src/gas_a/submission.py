@@ -29,6 +29,7 @@ from .controller_prompts import (VERSION as CONTROLLER_PROMPT_VERSION, execution
                                  enrich_plan, enrich_selection, request_digest)
 from .host_validation import parent_reference, candidate_gate as host_candidate_gate, bind_candidate_validation
 from .progress import progress, stage
+from .sdk_records import TEXT_BYTES, bounded_configuration
 
 ROOT = Path(__file__).resolve().parents[2]
 PREDICT_ARGV = ["python3", "/app/harness.py", "predict"]
@@ -136,10 +137,22 @@ def _parent_checkpoint(rnd):
     raise ValueError("No declared parent checkpoint matches parent_checkpoint_sha256")
 
 
-def _decision(rnd, request, fields, token_limit, validate, corrections=1):
+class DecisionValidationError(ValueError):
+    """Only completed model replies exhausted the bounded correction budget."""
+    def __init__(self, metadata):
+        super().__init__("Completed controller replies failed decision validation")
+        self.metadata = metadata
+
+
+def _decision(rnd, request, fields, token_limit, validate, corrections=1, evidence_path=None):
     # 一次完整返回后才解析并校验 JSON，格式错误允许有限次数的纠正请求。
     # 纠正请求也是真实调用，必须记录其 call_id；RPC 异常发生在 try 之外，不能吞掉后继续会话。
     call_ids, failures, request_hashes = [], [], []
+    request = {**request, "response_limits": {"text_field_utf8_bytes": TEXT_BYTES,
+               "instruction": "Return exactly the requested JSON fields. Keep hypothesis and reason concise."}}
+    metadata = {"model_call_ids": call_ids, "corrections": failures,
+                "prompt_version": request.get("controller_prompt", {}).get("version", CONTROLLER_PROMPT_VERSION),
+                "request_sha256": request_hashes, "decision_source": "model"}
     for attempt in range(corrections + 1):
         # request 只含本轮证据和自有提示；不重复加入 rnd.prompt，官方提示由宿主在请求前附加。
         # Never catch an RPC failure: its outcome may be unknown to the SDK.
@@ -152,29 +165,51 @@ def _decision(rnd, request, fields, token_limit, validate, corrections=1):
                 max_tokens=min(token_limit, rnd.max_output_tokens), temperature=0, enable_thinking=False,
             )
         call_ids.append(receipt.call_id)
+        if evidence_path is not None:
+            append_jsonl(evidence_path, {"round_index": rnd.round_index, "phase": request.get("phase"),
+                "attempt": attempt + 1, "call_id": receipt.call_id, "request": request,
+                "request_sha256": request_hashes[-1], "response": receipt.response})
         try:
             raw = receipt.text.strip()
-            if raw.startswith("```json\n") and raw.endswith("```"):
-                raw = raw[8:-3].strip()
+            lines = raw.splitlines()
+            if len(lines) >= 3 and lines[0].strip().lower() in ("```json", "```") and lines[-1].strip() == "```":
+                raw = "\n".join(lines[1:-1]).strip()
             value = json_value(raw)
             if not isinstance(value, dict) or set(value) != set(fields):
                 raise ValueError("Model decision does not match the requested JSON schema")
             if any(not isinstance(value[k], str) or not value[k].strip()
-                   or len(value[k].encode("utf-8")) > 4000 for k in fields):
+                   or len(value[k].encode("utf-8")) > TEXT_BYTES for k in fields):
                 raise ValueError("Model decision fields must be nonempty text <=4000 bytes")
             validate(value)
-            return value, {"model_call_ids": call_ids, "corrections": failures,
-                           "prompt_version": request.get("controller_prompt", {}).get("version", CONTROLLER_PROMPT_VERSION),
-                           "request_sha256": request_hashes}
+            return value, metadata
         except ValueError as error:
             # 只有拿到完整响应后发现 JSON/选择不合法才允许纠正；它也是一次需要付费和留回执的模型调用。
             # 这与超时重试不同：rnd.model 抛异常时根本不会进入本分支。
             failures.append({"call_id": receipt.call_id, "error": str(error), "response_excerpt": receipt.text[:2000]})
             if attempt == corrections:
-                raise
+                raise DecisionValidationError(metadata) from error
             request = {**request, "correction": {"attempt": attempt + 1, "error": str(error),
                        "previous_completed_response": receipt.text[:2000],
                        "instruction": "The previous completed response failed validation. Return a corrected JSON object using only the supplied schema and choices."}}
+
+
+def _controller_decision(rnd, request, fields, token_limit, validate, corrections, state):
+    try:
+        return _decision(rnd, request, fields, token_limit, validate, corrections,
+                         evidence_path=state / "model-responses.jsonl")
+    except DecisionValidationError as error:
+        # This guard is a program decision, never a fabricated model response.
+        # SDK/RPC, input, checkpoint and state failures cannot enter this branch.
+        reason = "Program guard retained the actual parent after completed controller replies failed validation; see uploaded decision evidence."
+        if request["phase"] == "plan":
+            value = {"action": "observe", "experiment": "none", "target_artifact_id": rnd.parent.artifact_id,
+                     "hypothesis": "No valid controller experiment was authorized; preserve the actual parent.", "reason": reason}
+        else:
+            value = {"selected_artifact_id": rnd.parent.artifact_id, "reason": reason}
+        validate(value)
+        metadata = {**error.metadata, "decision_source": "program_guard",
+                    "fallback": "retain_actual_parent", "validation_exhausted": True}
+        return value, metadata
 
 
 def _read_state(state, name):
@@ -362,8 +397,8 @@ def train(rnd):
                             "hypothesis": "testable hypothesis", "reason": "cite measured evidence and uncertainty"},
         "rules": "Return only JSON. Only public training rows update gradients; validation selects epochs and versions. Preserve parent Adam/scaler/steps. Hidden-stream labels or telemetry are unavailable. Do not infer physical causes from PSI alone.",
     }, controller, train_data, validation, execution)
-    plan, planning_calls = _decision(rnd, plan_request, ("action", "experiment", "target_artifact_id", "hypothesis", "reason"),
-       config["max_output_tokens"], validate_plan, controller["json_corrections"])
+    plan, planning_calls = _controller_decision(rnd, plan_request, ("action", "experiment", "target_artifact_id", "hypothesis", "reason"),
+       config["max_output_tokens"], validate_plan, controller["json_corrections"], state)
     spec = allowed_menu[plan["experiment"]] if plan["action"] == "experiment" else None
     report, submitted, candidate_gate, host_gate, experiment_failure = None, None, None, None, None
     configuration = {"action": plan["action"], "experiment": spec, "round_index": rnd.round_index,
@@ -421,7 +456,7 @@ def train(rnd):
         with stage("submit_candidate_rpc", dataset="A"):
             submitted = rnd.submit_candidate(
                 candidate, hypothesis=plan["hypothesis"], change_summary=change,
-                configuration=configuration, seed=parent.meta["seed"],
+                configuration=bounded_configuration(configuration, state, rnd.round_index, "candidate"), seed=parent.meta["seed"],
                 checkpoint_paths=artifact_checkpoint_paths(candidate / "checkpoint.npz"),
                 code_paths=code_paths, predict_argv=PREDICT_ARGV,
             )
@@ -455,8 +490,8 @@ def train(rnd):
                             "reason": "explain measured results and choice"},
         "rules": "Return only JSON. Compare the same metric and dataset scope. Never call local metrics hidden-test results. Prefer retaining the parent on a tie.",
     }, controller, validation["sha256"], candidate_gate, report["checkpoint_selection"] if report else None)
-    selection, selection_calls = _decision(rnd, selection_request, ("selected_artifact_id", "reason"),
-                                         config["max_output_tokens"], validate_selection, controller["json_corrections"])
+    selection, selection_calls = _controller_decision(rnd, selection_request, ("selected_artifact_id", "reason"),
+                                         config["max_output_tokens"], validate_selection, controller["json_corrections"], state)
     selected = selection["selected_artifact_id"]
     candidate_id = submitted["artifact_id"] if submitted else None
     selected_metric, selected_sha256 = before, rnd.parent.checkpoint_sha256
@@ -478,6 +513,10 @@ def train(rnd):
                                   experiment_failed=experiment_failure is not None)
     configuration.update(selected_checkpoint_sha256=selected_sha256,
                          selected_local_macro_f1=selected_metric["macro_f1"], strategy_version_after=next_policy["version"])
+    configuration["controller_decisions"] = {"plan": planning_calls["decision_source"], "select": selection_calls["decision_source"]}
+    if "program_guard" in configuration["controller_decisions"].values():
+        change = "Controller decision validation exhausted; program guard retained the actual parent without adopting an unapproved candidate."
+    finish_configuration = bounded_configuration(configuration, state, rnd.round_index, "finish")
     write_json(state / "strategy.json", next_policy)
     write_json(state / "monitoring.json", drift)
     write_json(state / "diagnosis.json", diagnosis)
@@ -499,6 +538,6 @@ def train(rnd):
         rnd.finish(
             selected_artifact_id=selected, hypothesis=plan["hypothesis"],
             change_summary=change,
-            reason=selection["reason"], configuration=configuration, seed=selected_seed,
+            reason=selection["reason"], configuration=finish_configuration, seed=selected_seed,
             history_ids=[item["id"] for item in history], model_call_ids=list(rnd.call_ids),
         )

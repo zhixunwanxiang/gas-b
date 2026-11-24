@@ -68,6 +68,9 @@ def summarize_worker(out, dataset, started, execution_started, report, runtime):
         "measurement_time_overlaps_candidate_rpc_wait": True,
         "all_rounds_order_valid": True, "all_rounds_acknowledged": True,
         "final_selected_artifact_id": report["selected_artifact_id"], "scope": "local_offline_model_decisions_in_fixed_docker_image",
+        "complete_history_experiments": report["complete_history_experiments"],
+        "not_worse_than_public_baseline": report["not_worse_than_public_baseline"],
+        "baseline": report["baseline"], "final": report["final"],
         "real_model_calls": 0, "runtime_audit": runtime.audit(), "rounds": rounds}
 
 
@@ -95,6 +98,10 @@ def worker(config, dataset, out):
         result = summarize_worker(out, dataset, started, execution_started, report, runtime)
         if result["rounds_completed"] != config["rounds"]:
             raise ValueError("Worker did not complete all requested rounds")
+        if config["rounds"] >= 4 and result["complete_history_experiments"] < 3:
+            raise ValueError("Fewer than three nonempty-history experiments completed")
+        if not result["not_worse_than_public_baseline"]:
+            raise ValueError("Final public validation is worse than the same-scope baseline")
         save(out / "result.json", result)
         save(out / "status.json", {k: result[k] for k in ("dataset", "status", "started_at_unix", "ended_at_unix", "rounds_completed")})
         return 0
@@ -282,9 +289,9 @@ def write_outputs(root, config, results, docker):
         "all_order_checks_passed": all(row["order_valid"] and row["acknowledged"] for row in rows),
         "docker_event_capture_complete": all(d["owned_containers_expected"] > 0 and d["owned_containers_expected"] == d["container_start_die_intervals_captured"] for d in docker.values()),
         "new_real_model_calls": 0, "cloud_writes": 0,
-        "platform_concurrency_confirmed": False, "platform_scheduler_source_available": False,
-        "screenshot_progress": {"A": 7, "B": 8, "C": 5},
-        "platform_inference": "Different progress is compatible with independent parallel or interleaved scheduling and asynchronous UI updates; it does not prove simultaneous execution.",
+        "platform_concurrency_confirmed": False, "platform_parallel_mode_shown": True,
+        "platform_scheduler_source_available": False,
+        "platform_inference": "The provided platform screenshot explicitly shows parallel mode. Its actual container overlap, resource allocation and timeout boundary are not visible.",
         "sdk_fact": "One Round serializes its RPCs with a lock; the SDK does not define cross-dataset scheduling.",
         "repository_runner_fact": "test_fresh_platform.execute_phases currently loops through A,B,C sequentially.",
         "timing_scope": "Real numerical training and SDK host prediction; model decisions are offline stubs, not fresh 27B latency."}
@@ -309,8 +316,7 @@ def write_outputs(root, config, results, docker):
     lines += ["", "顺序检查：start；连续 RPC id；单个未完成请求；对应类型/ID 回复；上传偏移、摘要与完成确认；候选/状态事务在上传完成后；真实已读历史和模型回执引用；最终 round_ack；进程退出。",
         "宿主等待包含传输、宿主处理和预测；participant_gap 包含管道调度等待，并不等于纯 CPU 时间。候选评测时预测容器与等待中的训练容器重叠是正常嵌套，不能据此误判为跨数据集并行。",
         "统计 measurement 总时长与 candidate_request 等待存在重叠，不能把两者直接相加。", "",
-        "平台结论：截图中 A7/B8/C5 只能支持各数据集进度独立，可能是并行、分时交错或界面异步更新，不能证明同时执行。SDK 源码只规定单会话 RPC 串行，不包含组委会调度器。当前仓库的旧全流程脚本按 A→B→C 串行执行。本次并发结果属于本地模拟，不证明平台使用相同调度或资源池。",
-        "要确认平台并行，应取得同一运行号下 A/B/C 的容器或任务开始、结束时间；区间交叠才能证明并行。截图不提供这些时间。", "",
+        "平台结论：用户提供的截图明确显示“并行”，本次按 A/B/C 三路并行验收。SDK 源码只规定单会话 RPC 串行，不包含组委会调度器。平台实际容器时间交集、资源池和超时边界不可见；本地容器并行由 Docker start/die 事件独立核验。", "",
         "本地通过不保证平台 180 秒预检通过；真实网关等待、排队及跨任务资源争用未由离线模型替身覆盖。", "",
         "逐轮数据：round-timings.csv；逐 RPC 数据：各 mode/dataset/run/host-N/sdk-timing.json；Docker start/die 证据：docker-events.jsonl 与 summary.json。"]
     (root / "REPORT.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -322,8 +328,8 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--baseline-root", type=Path)
     parser.add_argument("--sdk-archive", type=Path)
-    parser.add_argument("--image", default="gas-rsi-abc:wyx-sdk104-v9-20261124")
-    parser.add_argument("--expected-image-id", default="sha256:be6ddcc96cd4b20be480cad0067abbdd0102bc03c2891d7acf5ac7b38003f0d4")
+    parser.add_argument("--image", default="gas-rsi-abc:wyx-sdk104-v10-20261124")
+    parser.add_argument("--expected-image-id", default="sha256:de5a58d5c3fbeafa1399b531dadff78fd24067a818b094a16747a90cfba45b71")
     parser.add_argument("--docker-executable", default="docker")
     parser.add_argument("--docker-context", default="desktop-linux")
     parser.add_argument("--rounds", type=int, default=10)

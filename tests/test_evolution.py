@@ -91,14 +91,20 @@ class EvolutionTest(unittest.TestCase):
         self.assertEqual(len(record["planning_calls"]["corrections"]), 1)
         self.assertIn("correction", json.loads(host.messages[1][0]["content"]))
 
-    def test_invalid_json_exhaustion_stops_without_fake_decision(self):
+    def test_invalid_json_exhaustion_records_program_guard_without_fake_model_decision(self):
         host = OfflineHost(self.root, self.parent)
         host.malformed_responses = 10
-        with self.assertRaises(ValueError):
-            self.run_round(host)
-        self.assertEqual(len(host.calls), 2)
+        state = self.run_round(host)
+        self.assertEqual(len(host.calls), 4)
         self.assertIsNone(host.candidate)
-        self.assertIsNone(host.record)
+        self.assertEqual(host.record["selected_artifact_id"], "parent-1")
+        record = json.loads((state / "decisions.jsonl").read_text(encoding="utf-8"))
+        for phase in ("planning_calls", "selection_calls"):
+            self.assertEqual(record[phase]["decision_source"], "program_guard")
+            self.assertEqual(len(record[phase]["corrections"]), 2)
+        evidence = [json.loads(line) for line in (state / "model-responses.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([r["call_id"] for r in evidence], host.calls)
+        self.assertEqual(host.record["model_call_ids"], host.calls)
 
     def test_class_recall_guard_can_reject_higher_overall_f1(self):
         before = evaluate(Model.load(self.parent), self.validation)

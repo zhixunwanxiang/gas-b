@@ -563,9 +563,11 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         rnd = Round.start(host, host)
         rnd.parent.root = self.checkpoint.parent
         with patch.dict(os.environ, {"CONTEST_WORK": str(self.root / "workspace")}):
-            with self.assertRaisesRegex(ValueError, "outside the configured menu"):
-                submission.train(rnd)
+            submission.train(rnd)
         self.assertIsNone(host.candidate)
+        self.assertTrue(rnd._finished)
+        self.assertEqual(host.record["selected_artifact_id"], "parent-1")
+        self.assertEqual(host.record["configuration"]["controller_decisions"]["plan"], "program_guard")
 
     def test_work_directory_cannot_be_in_read_only_code_or_data(self):
         for work in (ROOT / "runtime", self.root / "data/work", self.checkpoint.parent / "work"):

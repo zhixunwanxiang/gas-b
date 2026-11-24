@@ -6,7 +6,8 @@ import json
 import math
 from pathlib import Path
 
-from contest_harness.round import _MODEL_OPTIONS, _validate_start
+from contest_harness.errors import HarnessError
+from contest_harness.round import _MODEL_OPTIONS, _validate_start, _declaration, _text
 
 
 RESPONSES = {
@@ -24,7 +25,7 @@ def audit_events(events):
     save_state and submit_candidate may appear in either order; every upload must
     finish before its transaction and every request must receive its own reply.
     """
-    errors, spans, uploads = [], [], {}
+    errors, spans, uploads, declarations = [], [], {}, []
     counts, host_wait = Counter(), defaultdict(float)
     pending, previous_reply, sequence, acknowledged = None, None, 0, False
     call_ids, history_ids, allowed_artifacts = set(), set(), set()
@@ -67,6 +68,20 @@ def audit_events(events):
                 if kind == "model_request":
                     if set(frame) - {"type", "id"} - _MODEL_OPTIONS:
                         raise ValueError("unsupported_model_option")
+                if kind in ("candidate_request", "round_complete"):
+                    declaration = frame["record"] if kind == "round_complete" else frame
+                    try:
+                        _declaration(declaration.get("hypothesis"), declaration.get("change_summary"),
+                                     declaration.get("configuration"), declaration.get("seed"))
+                    except HarnessError as error:
+                        raise ValueError("sdk_declaration_invalid:" + str(error)) from error
+                    if kind == "round_complete" and not _text(declaration.get("reason")):
+                        raise ValueError("sdk_reason_invalid")
+                    declarations.append({"request_type": kind,
+                        **{key + "_utf8_bytes": len(declaration[key].encode("utf-8"))
+                           for key in ("hypothesis", "change_summary", "reason") if key in declaration},
+                        "configuration_serialized_bytes": len(json.dumps(declaration["configuration"],
+                            sort_keys=True, allow_nan=False, separators=(",", ":")).encode("utf-8"))})
                 if kind in ("upload_chunk_request", "upload_finish_request", "candidate_request", "state_request"):
                     upload = uploads.get(frame.get("upload_id"))
                     if upload is None:
@@ -171,7 +186,7 @@ def audit_events(events):
         "round_trips": sum(counts.values()), "request_counts": dict(counts),
         "host_wait_seconds_by_request": dict(host_wait),
         "participant_gap_seconds_total": sum(s["participant_gap_seconds"] or 0 for s in spans),
-        "spans": spans}
+        "declaration_sizes": declarations, "spans": spans}
 
 
 def audit_file(path):

@@ -191,8 +191,8 @@ def main():
     parser.add_argument("--docker-executable", default="docker")
     parser.add_argument("--docker-context", default="desktop-linux")
     args = parser.parse_args()
-    if not 1 <= args.rounds <= 8:
-        parser.error("rounds must be 1..8")
+    if not 1 <= args.rounds <= 10:
+        parser.error("rounds must be 1..10")
     out = args.output.resolve()
     out.mkdir()  # 不覆盖任何历史实验。
     runtime = DockerRuntime(args.image, executable=args.docker_executable, context=args.docker_context,

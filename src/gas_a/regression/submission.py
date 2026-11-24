@@ -16,7 +16,8 @@ from ..evolution import available_experiments, fingerprint
 from ..host_validation import HOST_ADMISSION_VERSION, bind_candidate_validation
 from ..progress import progress, stage
 from ..sensor_training.io import append_jsonl, digest, write_json
-from ..submission import ROOT, PREDICT_ARGV, _decision, _parent_checkpoint, _prediction_checkpoint, _snapshot
+from ..submission import ROOT, PREDICT_ARGV, _controller_decision, _parent_checkpoint, _prediction_checkpoint, _snapshot
+from ..sdk_records import bounded_configuration
 
 
 @lru_cache(maxsize=2)
@@ -252,8 +253,8 @@ def train(rnd):
                "controller_prompt": {"version": PROMPT_VERSION, "instruction": PLAN_INSTRUCTION},
                "response_schema": {"action": actions, "experiment": ["none", *allowed],
                    "target_artifact_id": [rnd.parent.artifact_id, *rollback_ids], "hypothesis": "非空实验假设", "reason": "非空证据理由"}}
-    plan, planning_calls = _decision(rnd, request, ("action", "experiment", "target_artifact_id", "hypothesis", "reason"),
-                                     full_config["max_output_tokens"], validate_plan, rules["json_corrections"])
+    plan, planning_calls = _controller_decision(rnd, request, ("action", "experiment", "target_artifact_id", "hypothesis", "reason"),
+                                     full_config["max_output_tokens"], validate_plan, rules["json_corrections"], state)
     spec = allowed[plan["experiment"]] if plan["action"] == "experiment" else None
     # 保存实际展开的配置，而非只写菜单名称；模型输出不能覆写 spec 中的学习率、epoch 或损失。
     cfg = {"dataset": dataset, "task": "regression", "metric": "rmse", "metric_direction": "lower",
@@ -291,7 +292,7 @@ def train(rnd):
         # SDK 上传在计算异常捕获之外；任何结果未知的 RPC 立即结束会话，不重试或伪造成功。
         with stage("submit_candidate_rpc", dataset=dataset):
             submitted = rnd.submit_candidate(candidate, hypothesis=plan["hypothesis"], change_summary=change,
-                configuration=cfg, seed=parent.meta["seed"], checkpoint_paths=["checkpoint.npz"],
+                configuration=bounded_configuration(cfg, state, rnd.round_index, "candidate"), seed=parent.meta["seed"], checkpoint_paths=["checkpoint.npz"],
                 code_paths=_snapshot(candidate), predict_argv=PREDICT_ARGV)
         admission = host_gate(submitted, parent_host, report["validation_after"], validation["sha256"], rules,
                               binding=bind_candidate_validation(rnd, submitted, validation["sha256"]))
@@ -317,8 +318,8 @@ def train(rnd):
         "parent_host_reference": parent_host, "experiment_failure": failure, "promotion_rules": rules,
         "controller_prompt": {"version": PROMPT_VERSION, "instruction": SELECT_INSTRUCTION},
         "response_schema": {"selected_artifact_id": eligible, "reason": "依据实际回归测量的非空理由"}}
-    selection, selection_calls = _decision(rnd, selection_request, ("selected_artifact_id", "reason"),
-        full_config["max_output_tokens"], validate_selection, rules["json_corrections"])
+    selection, selection_calls = _controller_decision(rnd, selection_request, ("selected_artifact_id", "reason"),
+        full_config["max_output_tokens"], validate_selection, rules["json_corrections"], state)
     selected, seed = selection["selected_artifact_id"], parent.meta["seed"]
     # 阶段 9：依据最终 ID 记录真实分数和种子，不把未采用候选的好看分数写成当前成绩。
     candidate_id = submitted["artifact_id"] if submitted else None
@@ -333,6 +334,10 @@ def train(rnd):
     next_policy = _advance(policy, selected, rnd.parent.artifact_id, candidate_id, plan, identity,
                            gate["rmse_reduction"] if gate else None, failure is not None)
     cfg.update(selected_local_rmse=selected_metrics["rmse"], strategy_version_after=next_policy["version"])
+    cfg["controller_decisions"] = {"plan": planning_calls["decision_source"], "select": selection_calls["decision_source"]}
+    if "program_guard" in cfg["controller_decisions"].values():
+        change = "Controller decision validation exhausted; program guard retained the actual parent without adopting an unapproved candidate."
+    finish_configuration = bounded_configuration(cfg, state, rnd.round_index, "finish")
     record = {"round_index": rnd.round_index, "dataset": dataset, "plan": plan, "selection": selection,
               "configuration": cfg, "selected_artifact_id": selected, "model_call_ids": list(rnd.call_ids),
               "planning_calls": planning_calls, "selection_calls": selection_calls,
@@ -349,5 +354,5 @@ def train(rnd):
     # 阶段 11：保存的是可写状态副本；finish 引用实际读过的历史和本轮真实回执，等待宿主确认后退出。
     with stage("finish_rpc", dataset=dataset):
         rnd.finish(selected_artifact_id=selected, hypothesis=plan["hypothesis"], change_summary=change,
-                   reason=selection["reason"], configuration=cfg, seed=seed,
+                   reason=selection["reason"], configuration=finish_configuration, seed=seed,
                    history_ids=[item["id"] for item in history], model_call_ids=list(rnd.call_ids))

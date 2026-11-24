@@ -22,7 +22,8 @@ def conversation():
         {"direction": "host", "elapsed_seconds": 1.6, "frame": {"type": "model_response", "id": 1,
             "call_id": "offline-1", "response": {"choices": [{"message": {"content": "retain parent"}}]}}},
         {"direction": "harness", "elapsed_seconds": 1.7, "frame": {"type": "round_complete", "record": {
-            "selected_artifact_id": "initial", "model_call_ids": ["offline-1"], "history_ids": []}}},
+            "selected_artifact_id": "initial", "model_call_ids": ["offline-1"], "history_ids": [],
+            "hypothesis": "h", "change_summary": "c", "reason": "r", "configuration": {}, "seed": 42}}},
         {"direction": "host", "elapsed_seconds": 1.8, "frame": {"type": "round_ack", "accepted": True}},
     ]
 
@@ -63,7 +64,7 @@ class SdkProtocolAuditTest(unittest.TestCase):
               "data_base64": base64.b64encode(raw).decode()}, {"type": "upload_chunk_response", "offset": 5}),
             ({"type": "upload_finish_request", "upload_id": "upload-1"},
              {"type": "upload_finish_response", "upload_id": "upload-1"}),
-            ({"type": "candidate_request", "upload_id": "upload-1"},
+            ({"type": "candidate_request", "upload_id": "upload-1", "hypothesis": "h", "change_summary": "c", "configuration": {}, "seed": 42},
              {"type": "candidate_response", "artifact_id": "candidate-1"}),
         ]
         events = conversation()[:5]
@@ -89,6 +90,16 @@ class SdkProtocolAuditTest(unittest.TestCase):
         del events[1:3]
         events[1]["frame"]["id"] = events[2]["frame"]["id"] = 0
         self.assertTrue(audit_events(events)["order_valid"])
+
+    def test_wire_audit_rejects_oversized_utf8_text_and_escaped_configuration(self):
+        events = conversation()
+        events[-2]["frame"]["record"]["reason"] = "中" * 1334
+        self.assertFalse(audit_events(events)["order_valid"])
+        events = conversation()
+        events[-2]["frame"]["record"]["configuration"] = {"text": "中" * 11000}
+        self.assertFalse(audit_events(events)["order_valid"])
+        result = audit_events(conversation())
+        self.assertEqual(result["declaration_sizes"][0]["reason_utf8_bytes"], 1)
 
 
 if __name__ == "__main__":
