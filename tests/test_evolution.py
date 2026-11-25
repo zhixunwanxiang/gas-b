@@ -172,6 +172,18 @@ class EvolutionTest(unittest.TestCase):
         self.assertIsNone(host.record)
         self.assertFalse(any(f["type"] == "artifact_read_request" for f in host.frames))
 
+    def test_compact_current_parent_also_allows_fresh_historical_rollback(self):
+        historical = self.recovery_fixture()
+        host = OfflineHost(self.root, self.parent, history=[{"id": "past", "selected_artifact_id": "historical-good"}])
+        host.action = "rollback"
+        _, validation = load_pair(self.root/"data/train.jsonl", self.root/"data/validation.jsonl")
+        host.frame["current_validation"] = {"metrics": {"macro_f1": evaluate(Model.load(self.parent), validation)["macro_f1"]}}
+        host.add_artifact("historical-good", historical)
+        self.run_round(host)
+        self.assertEqual(host.record["selected_artifact_id"], "historical-good")
+        selection = json.loads(host.messages[-1][0]["content"])
+        self.assertTrue(selection["historical_admission"]["historical-good"]["eligible"])
+
     def test_interrupted_historical_read_poisons_rpc_without_retry(self):
         historical = self.recovery_fixture()
         class InterruptedHost(OfflineHost):
@@ -199,6 +211,13 @@ class EvolutionTest(unittest.TestCase):
         for index in range(1, 11):
             host = OfflineHost(self.root, self.parent, index, history, state, experiment="conservative_head")
             host.force_retain = True
+            original_write = host.write
+            def rejected_performance(text):
+                result = original_write(text)
+                if json.loads(text)["type"] == "candidate_request":
+                    host.pending[-1]["summary"]["metrics"]["macro_f1"] = 0.
+                return result
+            host.write = rejected_performance
             # The offline controller follows the menu; once this experiment is
             # blocked it chooses observation, as the real model is instructed to.
             if index > 2:

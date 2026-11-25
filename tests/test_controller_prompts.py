@@ -84,7 +84,7 @@ class ControllerPromptTest(unittest.TestCase):
         allowed, _ = available_experiments(policy, menu, rnd, self.train, self.validation, self.config["controller"], self.execution)
         self.assertIn("four_sensor", allowed)
         current = fingerprint(digest(self.parent), self.train["sha256"], self.validation["sha256"], spec, self.execution)
-        policy["attempts"] = [{"fingerprint": current, "adopted": False}] * 2
+        policy["attempts"] = [{"fingerprint": current, "adopted": False, "outcome": "performance_rejected"}] * 2
         allowed, blocked = available_experiments(policy, menu, rnd, self.train, self.validation, self.config["controller"], self.execution)
         self.assertNotIn("four_sensor", allowed)
         self.assertIn("four_sensor", blocked)

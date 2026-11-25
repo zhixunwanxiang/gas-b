@@ -1,7 +1,11 @@
 """原单位回归指标和越低越好的上线门槛；不复用 A 的 F1/召回率规则。"""
 import math
 import numpy as np
-from ..host_validation import SCORE_TOLERANCE, parse_measurement
+from ..host_validation import SCORE_TOLERANCE, parse_measurement, metric_matches
+from ..sensor_training.io import digest
+from ..parent_checkpoint import verify_selected_checkpoint
+
+PARENT_REFERENCE_VERSION = "current-parent-public-reevaluation-v2"
 
 
 def evaluate(model, data, dataset):
@@ -53,6 +57,55 @@ def parent_reference(host_value, before, sha):
     if result["comparable"] and abs(result["rmse"] - before["rmse"]) > SCORE_TOLERANCE:
         return {**result, "comparable": False, "reason": "parent_host_local_measurement_conflict"}
     return result
+
+
+def current_parent_reference(rnd, checkpoint, before, sha):
+    """Use an independently remeasured parent when start metadata is incomplete.
+
+    This does not certify the provenance of a compact host score. The reference
+    comes from the actual SDK parent on this round's public validation file.
+    Explicit conflicting metadata or scores still prevent promotion.
+    """
+    if (rnd.frame.get("protocol") != "contest.harness.workspace.v2"
+            or rnd.dataset_key not in ("B", "C") or rnd.task.get("task") != "regression"
+            or not metric_matches(rnd.task, "rmse")
+            or digest(rnd.data.validation_path) != sha):
+        raise ValueError("Current parent or public validation identity changed")
+    verify_selected_checkpoint(rnd, checkpoint)
+    raw = rnd.frame.get("current_validation")
+    strict = parent_reference(raw, before, sha)
+    if not isinstance(raw, dict) or not raw:
+        return strict
+    payload = raw.get("summary", raw)
+    if not isinstance(payload, dict):
+        return strict
+    containers = [raw, payload] if payload is not raw else [raw]
+    for value in containers:
+        if (("artifact_id" in value and value["artifact_id"] != rnd.parent.artifact_id)
+                or ("dataset_key" in value and value["dataset_key"] != rnd.dataset_key)
+                or ("round_index" in value and value["round_index"] != rnd.round_index)
+                or any(key in value and value[key] != rnd.parent.checkpoint_sha256
+                       for key in ("checkpoint_sha256", "parent_checkpoint_sha256"))):
+            return {"comparable": False, "reason": "parent_identity_conflict"}
+    if strict["comparable"]:
+        return strict
+    missing = [key for key in ("scope", "validation_sha256") if not any(key in c for c in containers)]
+    if not missing:
+        return strict
+    # Supply local identity only to check the remaining fields, including every
+    # explicit host field. Never label this temporary normalization as host proof.
+    check = {**raw, **{key: {"scope": "authorized_public_validation", "validation_sha256": sha}[key]
+                            for key in missing}}
+    checked = parent_reference(check, before, sha)
+    if not checked["comparable"]:
+        return {**strict, "reason": checked["reason"]}
+    return {"comparable": True, "rmse": before["rmse"],
+            "source": "local_current_parent_public_reevaluation",
+            "scope": "authorized_public_validation", "validation_sha256": sha,
+            "artifact_id": rnd.parent.artifact_id, "checkpoint_sha256": rnd.parent.checkpoint_sha256,
+            "dataset_key": rnd.dataset_key, "round_index": rnd.round_index,
+            "host_reference": strict, "host_score_matches_local": True,
+            "missing_host_identity_fields": missing}
 
 
 def host_gate(receipt, parent, after, sha, rules, *, binding=None):

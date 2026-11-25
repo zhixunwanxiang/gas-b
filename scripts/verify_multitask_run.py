@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import contest_submission
 from gas_a.sensor_training.io import CLASSES, write_json
+from scripts.validate_multitask import complete_experiment
 
 
 def verify(root):
@@ -18,8 +19,10 @@ def verify(root):
     assert image["runtime_probe"]["verified"]
     assert summary["real_model_calls"] == 0
     assert summary["runtime"]["container_policy_verified"]
+    datasets = [report["dataset"] for report in summary["reports"]]
+    assert datasets and len(set(datasets)) == len(datasets) and set(datasets) <= {"A", "B", "C"}
     groups, rows_checked, complete = 0, 0, {}
-    for dataset in ("A", "B", "C"):
+    for dataset in datasets:
         directory = root / dataset
         records = [json.loads(line) for line in (directory / "data/validation.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
         expected = np.array([CLASSES.index(row["answer"]) if dataset == "A" else row["answer"] for row in records])
@@ -67,9 +70,10 @@ def verify(root):
             assert finish["model_call_ids"] == call_ids and len(call_ids) >= 2
             assert len(history) == index - 1
             candidate = any(e["frame"].get("type") == "candidate_request" for e in transcript)
-            complete[dataset] += bool(history) and candidate
+            complete[dataset] += complete_experiment({"history_ids": finish["history_ids"],
+                "candidate_submitted": candidate, "record": finish})
         assert complete[dataset] >= 3
-    return {"verified": True, "image_id": image["image_id"], "datasets": ["A", "B", "C"],
+    return {"verified": True, "image_id": image["image_id"], "datasets": datasets,
             "measurement_groups_recalculated": groups, "prediction_rows_recalculated": rows_checked,
             "complete_history_experiments": complete, "real_model_calls": 0,
             "official_host_or_hidden_score_verified": False}

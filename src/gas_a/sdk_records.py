@@ -1,11 +1,45 @@
 """SDK 1.0.4 declaration limits; detailed evidence stays in uploaded state."""
 import hashlib
 import json
+import math
 
 from .sensor_training.io import append_jsonl
+from .progress import progress
 
 TEXT_BYTES = 4000
 CONFIG_BYTES = 65536
+
+
+def portable_record(value, *, context="record"):
+    """Make diagnostic evidence JSON-portable without changing live measurements.
+
+    SDK readers can return nonfinite optional host metadata. Keep its path and
+    original spelling beside a null placeholder; validation uses the untouched
+    original receipt, never this serialized copy.
+    """
+    warnings = []
+    def visit(item, path):
+        if isinstance(item, float) and not math.isfinite(item):
+            label = "NaN" if math.isnan(item) else "Infinity" if item > 0 else "-Infinity"
+            warnings.append({"path": path, "original": label})
+            return None
+        if isinstance(item, dict):
+            return {key: visit(child, path + "/" + str(key).replace("~", "~0").replace("/", "~1"))
+                    for key, child in item.items()}
+        if isinstance(item, (list, tuple)):
+            return [visit(child, path + "/" + str(index)) for index, child in enumerate(item)]
+        return item
+    clean = visit(value, "")
+    if not warnings:
+        return value
+    if not isinstance(clean, dict):
+        raise TypeError("Portable evidence must be a JSON object")
+    annotation = {"nonfinite_fields": warnings}
+    if "recording_warnings" in clean:
+        annotation["previous"] = clean["recording_warnings"]
+    clean["recording_warnings"] = annotation
+    progress("nonfinite_metadata_recorded", context=context, fields=len(warnings))
+    return clean
 
 
 def configuration_bytes(value):

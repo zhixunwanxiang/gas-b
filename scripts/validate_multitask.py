@@ -27,6 +27,14 @@ BASELINES = {"A": "cpu-a-guide-20261110-v1", "B": "cpu-b-rul-20261110-v1", "C": 
 PREDICT_ARGV = ["python3", "/app/harness.py", "predict"]
 
 
+def complete_experiment(row):
+    """Count measured model decisions; a program guard is not a closed loop."""
+    cfg = row["record"]["configuration"]
+    return (bool(row["history_ids"]) and row["candidate_submitted"]
+            and cfg.get("action") == "experiment"
+            and cfg.get("controller_decisions") == {"plan": "model", "select": "model"})
+
+
 def measure(runtime, directory, descriptor, validation_path, validation, dataset, out):
     """通过实际 predict 进程测量；只发 inputs，预测容器不挂载带 answer 的数据。"""
     out.mkdir()
@@ -82,7 +90,8 @@ def measure(runtime, directory, descriptor, validation_path, validation, dataset
     return metrics
 
 
-def run_dataset(base, out, dataset, rounds, runtime, *, peer_factory=None, journal=None, max_rounds=None, exchange_options=None):
+def run_dataset(base, out, dataset, rounds, runtime, *, peer_factory=None, journal=None, max_rounds=None, exchange_options=None,
+                compact_validation=False, aggregate_parent=False):
     # 一个数据集的多轮宿主：registry 保存真实产物目录，current 永远是上轮最终选中的 ID。
     # peer_factory 决定模型来源（真实回复或记录重放）；缺省才使用明确标识的离线模型替身。
     out.mkdir()
@@ -114,8 +123,15 @@ def run_dataset(base, out, dataset, rounds, runtime, *, peer_factory=None, journ
                 RegressionHost(out, parent, dataset, index, history=history, state=state))
         host.frame["parent_artifact"] = parent_receipt
         host.frame["parent_checkpoint_sha256"] = digest(parent)
+        if aggregate_parent and (aggregate_parent != "multi" or len(parent_receipt["artifact"]["checkpoint_paths"]) > 1):
+            # 测试专用整组身份，刻意不等于任一单文件摘要；官方聚合算法由宿主持有。
+            from tests.test_submission import simulated_checkpoint_identity
+            host.frame["parent_checkpoint_sha256"] = simulated_checkpoint_identity(parent_receipt)
         host.frame["current_validation"] = {"metrics": score, "scope": "authorized_public_validation",
                                             "validation_sha256": digest(out / "data/validation.jsonl")}
+        if compact_validation:
+            # 平台反馈复现：start 只有具名指标，不含冗余范围/摘要；原始帧仍完整留档。
+            host.frame["current_validation"] = {"metrics": score}
         config = json.loads((ROOT / "submission_config.json").read_text(encoding="utf-8"))
         menu = config["experiments"] if dataset == "A" else config["regression"]["experiments"]
         if peer_factory is None:
@@ -131,6 +147,8 @@ def run_dataset(base, out, dataset, rounds, runtime, *, peer_factory=None, journ
                 metric = measured(host.candidate, frame["artifact"])
                 host.candidate_metrics = metric
                 host.pending[-1]["summary"]["metrics"] = {k: metric[k] for k in ("macro_f1", "rmse", "mae") if k in metric}
+                if compact_validation:
+                    host.pending[-1]["summary"] = {"metrics": host.pending[-1]["summary"]["metrics"]}
             return result
         host.write = receive
         env = child_environment()
@@ -163,7 +181,7 @@ def run_dataset(base, out, dataset, rounds, runtime, *, peer_factory=None, journ
         print(json.dumps({"dataset": dataset, "round": index, "history_count": len(row["history_ids"]),
                           "candidate_submitted": row["candidate_submitted"], "selected_artifact_id": current,
                           "metrics": {k: v for k, v in score.items() if k in ("macro_f1", "rmse", "mae", "nasa_score")}}), flush=True)
-        complete_count = sum(bool(r["history_ids"]) and r["candidate_submitted"] for r in records)
+        complete_count = sum(complete_experiment(r) for r in records)
         # 不能用“总共有四轮”代替“有三次完整历史实验”；观察/回滚不会增加这个计数。
         if index >= rounds and complete_count >= 3:
             break
@@ -174,9 +192,10 @@ def run_dataset(base, out, dataset, rounds, runtime, *, peer_factory=None, journ
               "model_call_attempts": len(host.gateway.attempts) if peer_factory else 0,
               "selected_artifact_id": current,
               "baseline": baseline, "final": score, "rounds": records,
-              "complete_history_experiments": sum(bool(r["history_ids"]) and r["candidate_submitted"] for r in records),
+              "complete_history_experiments": sum(complete_experiment(r) for r in records),
               "not_worse_than_public_baseline": score[metric] >= baseline[metric] - 1e-9 if dataset == "A" else score[metric] <= baseline[metric] + 1e-9,
               "official_platform_score_verified": False}
+    result["validation_receipt_format"] = "compact" if compact_validation else "explicit"
     write_json(out / "report.json", result)
     return result
 
@@ -187,6 +206,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--datasets", choices=("A", "B", "C"), nargs="+", default=["A", "B", "C"])
     parser.add_argument("--rounds", type=int, default=4)
+    parser.add_argument("--compact-validation", action="store_true", help="Reproduce compact start/candidate validation summaries")
     parser.add_argument("--image")
     parser.add_argument("--docker-executable", default="docker")
     parser.add_argument("--docker-context", default="desktop-linux")
@@ -199,7 +219,8 @@ def main():
                             required_tasks=("classification", "regression")) if args.image else None
     if runtime:
         write_json(out / "image-preflight.json", runtime.preflight())
-    reports = [run_dataset(args.baseline_root / BASELINES[key], out / key, key, args.rounds, runtime) for key in args.datasets]
+    reports = [run_dataset(args.baseline_root / BASELINES[key], out / key, key, args.rounds, runtime,
+                           compact_validation=args.compact_validation) for key in args.datasets]
     audit = runtime.audit() if runtime else None
     checks = {
         "all_requested_rounds_completed": all(len(r["rounds"]) == args.rounds for r in reports),

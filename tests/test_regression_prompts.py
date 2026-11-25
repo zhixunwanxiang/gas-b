@@ -29,8 +29,8 @@ class RegressionPromptTest(unittest.TestCase):
     def test_prompt_explains_current_identity_and_plan_selection_consistency(self):
         self.assertIn("历史最佳版本不是当前父模型", PLAN_INSTRUCTION)
         self.assertIn("valid_plan_combinations", PLAN_INSTRUCTION)
-        self.assertIn("计划action=rollback", SELECT_INSTRUCTION)
-        self.assertIn("不能在选版时临时改成", SELECT_INSTRUCTION)
+        self.assertIn("无需规划预先声明rollback", SELECT_INSTRUCTION)
+        self.assertIn("不能选择未经本轮核验的历史ID", SELECT_INSTRUCTION)
 
 
 if __name__ == "__main__":

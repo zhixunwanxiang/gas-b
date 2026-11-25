@@ -91,7 +91,8 @@ def worker(config, dataset, out):
         save(out / "status.json", {"status": "running", "dataset": dataset, "started_at_unix": started,
                                    "execution_started_at_unix": execution_started})
         report = run_dataset(Path(config["baseline_root"]) / BASELINES[dataset], out / "run", dataset,
-            config["rounds"], runtime, exchange_options={"round_timeout": config["round_timeout"],
+            config["rounds"], runtime, compact_validation=config.get("compact_validation", False),
+            aggregate_parent=config.get("aggregate_parent", False), exchange_options={"round_timeout": config["round_timeout"],
                 "rpc_delay_seconds": config["rpc_delay_seconds"], "model_delay_seconds": config["model_delay_seconds"]})
         if frozen_sources() != config["source_sha256"]:
             raise ValueError("Execution source changed while testing")
@@ -338,6 +339,9 @@ def main():
     parser.add_argument("--worker-timeout", type=float, default=1800)
     parser.add_argument("--rpc-delay-seconds", type=float, default=0)
     parser.add_argument("--model-delay-seconds", type=float, default=0)
+    parser.add_argument("--compact-validation", action="store_true")
+    parser.add_argument("--aggregate-parent", action="store_true",
+                        help="Use a test-only opaque checkpoint-group identity, not an individual file digest")
     parser.add_argument("--worker", choices=("A", "B", "C"))
     parser.add_argument("--worker-config", type=Path)
     args = parser.parse_args()
@@ -359,6 +363,7 @@ def main():
         "docker_context": args.docker_context, "baseline_root": str(args.baseline_root.resolve()), "rounds": args.rounds,
         "round_timeout": args.round_timeout, "worker_timeout": args.worker_timeout,
         "rpc_delay_seconds": args.rpc_delay_seconds, "model_delay_seconds": args.model_delay_seconds,
+        "compact_validation": args.compact_validation, "aggregate_parent": args.aggregate_parent,
         "source_sha256": frozen_sources()}
     save(root / "config.json", config)
     started = time.time(); results = []

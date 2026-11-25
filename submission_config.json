@@ -58,7 +58,7 @@
           "kept_sensors": [3, 13, 14, 15, 16]
         },
         "home": {"epochs": 1, "learning_rate": 0.00065, "balance": 0.35, "l2": 0.0002, "label_smoothing": 0.02},
-        "selection": {"inner_weights": [0.4, 0.75, 0.9], "correction_choices": [false, true], "minimum_support": 20, "minimum_macro_f1_gain": 0.0005}
+        "selection": {"inner_weights": [0.4, 0.75, 0.9], "outer_weights": [0.25, 0.4, 0.6, 0.8], "correction_choices": [false, true], "minimum_support": 20, "minimum_macro_f1_gain": 0.0005}
       }
     },
     {

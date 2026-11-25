@@ -6,6 +6,7 @@ import math
 import os
 from pathlib import Path
 import zipfile
+import zlib
 
 _THREADS = int(os.environ.get("BASELINE_CPU_THREADS", "1"))
 if not 1 <= _THREADS <= 8:
@@ -66,8 +67,15 @@ class Model:
         if (m["task"] == "classification" and len(classes) < 2) or (m["task"] == "regression" and classes):
             raise ValueError("invalid checkpoint classes")
         for name in ("learning_rate", "target_mean", "target_scale"):
-            if isinstance(m.get(name), bool) or not isinstance(m.get(name), (float, int)) or not math.isfinite(m[name]):
-                raise ValueError("invalid checkpoint numeric state")
+            value = m.get(name)
+            try:
+                valid = not isinstance(value, bool) and isinstance(value, (float, int)) and math.isfinite(value)
+            except OverflowError:
+                # JSON 整数可以远大于浮点数范围，isfinite 转换时也可能溢出。
+                # 统一为本地检查点格式错误：坏历史可排除，实际父模型仍会停止。
+                valid = False
+            if not valid:
+                raise ValueError("invalid checkpoint numeric state: " + name)
         if not 0 < m["learning_rate"] <= 1 or m["target_scale"] <= 0:
             raise ValueError("invalid optimizer/scaler state")
         input_size, hidden = len(m["paths"]), m["hidden"]
@@ -178,20 +186,39 @@ class Model:
         if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_CHECKPOINT_BYTES:
             raise ValueError("checkpoint must be a regular file no larger than 16 MiB")
         expected = {*PARAMETERS, *("adam_first_" + k for k in PARAMETERS), *("adam_second_" + k for k in PARAMETERS), "mean", "scale", "metadata"}
-        with zipfile.ZipFile(path) as archive:
-            names = [entry.filename for entry in archive.infolist()]
-            if len(names) != len(expected) or set(names) != {name + ".npy" for name in expected} or sum(e.file_size for e in archive.infolist()) > MAX_CHECKPOINT_BYTES:
-                raise ValueError("invalid checkpoint archive")
-        with np.load(path, allow_pickle=False) as arrays:
-            model = cls.__new__(cls)
-            metadata = arrays["metadata"]
-            if metadata.ndim != 0 or metadata.dtype.kind != "U":
-                raise ValueError("invalid checkpoint metadata")
-            model.meta = json.loads(str(metadata))
-            model.params = {k: arrays[k].copy() for k in PARAMETERS}
-            model.first = {k: arrays["adam_first_" + k].copy() for k in PARAMETERS}
-            model.second = {k: arrays["adam_second_" + k].copy() for k in PARAMETERS}
-            model.mean, model.scale = arrays["mean"].copy(), arrays["scale"].copy()
+        try:
+            with zipfile.ZipFile(path) as archive:
+                entries = archive.infolist()
+                names = [entry.filename for entry in entries]
+                if (len(names) != len(expected) or set(names) != {name + ".npy" for name in expected}
+                        or sum(e.file_size for e in entries) > MAX_CHECKPOINT_BYTES
+                        or any(e.flag_bits & 1 for e in entries)):
+                    raise ValueError("invalid checkpoint archive")
+            with np.load(path, allow_pickle=False) as arrays:
+                def array(name):
+                    # ZIP 清单正确时，内部条目仍可能不是 NPY；NumPy 此时返回 bytes。
+                    # 在访问 ndim/copy 前检查类型，格式错误仍统一走 ValueError。
+                    value = arrays[name]
+                    if not isinstance(value, np.ndarray):
+                        raise ValueError("invalid checkpoint array: " + name)
+                    return value
+                model = cls.__new__(cls)
+                metadata = array("metadata")
+                if metadata.ndim != 0 or metadata.dtype.kind != "U":
+                    raise ValueError("invalid checkpoint metadata")
+                model.meta = json.loads(str(metadata))
+                # 能解析成 JSON 不代表元数据可用：数组、null、字符串等没有 .get。
+                # 在读取张量及调用 validate 前明确拒绝，避免泄漏 AttributeError。
+                if not isinstance(model.meta, dict):
+                    raise ValueError("checkpoint metadata must be a JSON object")
+                model.params = {k: array(k).copy() for k in PARAMETERS}
+                model.first = {k: array("adam_first_" + k).copy() for k in PARAMETERS}
+                model.second = {k: array("adam_second_" + k).copy() for k in PARAMETERS}
+                model.mean, model.scale = array("mean").copy(), array("scale").copy()
+        except (zipfile.BadZipFile, EOFError, zlib.error, NotImplementedError) as error:
+            # 只统一本地文件格式错误，不兜底捕获任意程序异常或 SDK/RPC 错误。
+            # 历史复评可据此排除旧候选；实际父模型和预测入口仍会抛错并终止。
+            raise ValueError("invalid checkpoint archive") from error
         model.validate()
         return model
 

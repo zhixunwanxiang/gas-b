@@ -1,13 +1,19 @@
 """宿主公开验证回执适配：显式身份或本轮 SDK 候选绑定，保留原始宿主测量。"""
 # 宿主公开验证回执适配：先确认指标、数据摘要与公开范围，再决定能否同口径比较。
-# 本地高分不能覆盖宿主冲突分数；缺省身份只接受本轮已绑定的 SDK 候选事务，未知来源仍拒绝。
+# 本地高分不能覆盖宿主冲突分数；缺省身份只接受当前 SDK 父模型/候选绑定，未知来源仍拒绝。
 import math
 from dataclasses import dataclass
 from .sensor_training.io import digest
+from .parent_checkpoint import verified_checkpoints
 
 PUBLIC_SCOPES = {"authorized_public_validation", "public_validation", "offline_public_validation"}
 SCORE_TOLERANCE = 1e-6  # Permit ordinary metric rounding, not different measurements.
-HOST_ADMISSION_VERSION = "sdk-bound-public-validation-v2"
+HOST_ADMISSION_VERSION = "sdk-bound-public-validation-v4"
+
+
+def metric_matches(task, expected):
+    value = task.get("metric", expected)
+    return isinstance(value, str) and value.lower() == expected
 
 
 @dataclass(frozen=True)
@@ -21,12 +27,41 @@ class CandidateValidationBinding:
     metric: str
 
 
+@dataclass(frozen=True)
+class ParentValidationBinding:
+    # 只绑定当前 start 的父模型测量；不用于历史分数或候选回执。
+    artifact_id: str
+    checkpoint_sha256: str
+    validation_sha256: str
+    dataset_key: str
+    round_index: int
+    metric: str
+    host_value: dict
+
+
+def bind_parent_validation(rnd, validation_sha256):
+    """After local evaluation, bind compact current_validation to the actual SDK parent."""
+    value = rnd.frame.get("current_validation")
+    if value is None or value == {}:
+        return None
+    if (rnd.frame.get("protocol") != "contest.harness.workspace.v2" or rnd.dataset_key != "A"
+            or rnd.task.get("task") != "classification" or not metric_matches(rnd.task, "macro_f1")
+            or not isinstance(value, dict)):
+        return None
+    if digest(rnd.data.validation_path) != validation_sha256:
+        raise ValueError("Public validation projection changed during parent evaluation")
+    # 平台父身份可能是整组文件的聚合摘要。逐文件按清单校验，不把它误当主文件哈希。
+    verified_checkpoints(rnd)
+    return ParentValidationBinding(rnd.parent.artifact_id, rnd.parent.checkpoint_sha256,
+                                   validation_sha256, rnd.dataset_key, rnd.round_index, "macro_f1", value)
+
+
 def bind_candidate_validation(rnd, receipt, validation_sha256):
     """将 SDK 本轮候选回执与当前公开验证文件绑定，不修改原始回执。"""
     expected = {"A": ("classification", "macro_f1"), "B": ("regression", "rmse"),
                 "C": ("regression", "rmse")}.get(rnd.dataset_key)
     if (rnd.frame.get("protocol") != "contest.harness.workspace.v2" or expected is None
-            or rnd.task.get("task") != expected[0] or rnd.task.get("metric", expected[1]) != expected[1]
+            or rnd.task.get("task") != expected[0] or not metric_matches(rnd.task, expected[1])
             or not isinstance(receipt, dict) or receipt.get("type") != "candidate_response"
             or not isinstance(receipt.get("artifact_id"), str) or not receipt["artifact_id"]):
         raise ValueError("Cannot bind an unrecognized current SDK candidate response")
@@ -63,11 +98,17 @@ def parse_measurement(value, validation_sha256, metric, *, binding=None):
             return {"comparable": False, "reason": "missing_or_invalid_" + metric}
     if any(score != scores[0] for score in scores[1:]):
         return {"comparable": False, "reason": "conflicting_host_metrics"}
-    bound = isinstance(binding, CandidateValidationBinding)
-    if binding is not None and (not bound or binding.metric != metric
-            or binding.validation_sha256 != validation_sha256
-            or value.get("type") != "candidate_response" or value.get("artifact_id") != binding.artifact_id):
-        return {"comparable": False, "reason": "candidate_binding_mismatch"}
+    candidate_bound = isinstance(binding, CandidateValidationBinding)
+    parent_bound = isinstance(binding, ParentValidationBinding)
+    bound = candidate_bound or parent_bound
+    if binding is not None:
+        mismatch = (not bound or binding.metric != metric or binding.validation_sha256 != validation_sha256)
+        if candidate_bound:
+            mismatch |= value.get("type") != "candidate_response" or value.get("artifact_id") != binding.artifact_id
+        if parent_bound:
+            mismatch |= value is not binding.host_value
+        if mismatch:
+            return {"comparable": False, "reason": "parent_binding_mismatch" if parent_bound else "candidate_binding_mismatch"}
     containers = [value, payload] if payload is not value else [payload]
     scopes = [c["scope"] for c in containers if "scope" in c]
     digests = [c["validation_sha256"] for c in containers if "validation_sha256" in c]
@@ -80,16 +121,25 @@ def parse_measurement(value, validation_sha256, metric, *, binding=None):
     if bound:
         for c in containers:
             if (("artifact_id" in c and c["artifact_id"] != binding.artifact_id)
-                    or ("dataset_key" in c and c["dataset_key"] != binding.dataset_key)):
-                return {"comparable": False, "reason": "candidate_binding_mismatch"}
+                    or ("dataset_key" in c and c["dataset_key"] != binding.dataset_key)
+                    or ("round_index" in c and (type(c["round_index"]) is not int or c["round_index"] != binding.round_index))
+                    or (parent_bound and "parent_artifact_id" in c and c["parent_artifact_id"] != binding.artifact_id)
+                    or (parent_bound and any(key in c and (not isinstance(c[key], str) or
+                        c[key].removeprefix("sha256:") != binding.checkpoint_sha256.removeprefix("sha256:"))
+                        for key in ("checkpoint_sha256", "parent_checkpoint_sha256")))):
+                return {"comparable": False, "reason": "parent_binding_mismatch" if parent_bound else "candidate_binding_mismatch"}
     result = {"comparable": True, metric: float(scores[0]), "source": "host",
               "scope": scopes[0] if scopes else "authorized_public_validation",
               "validation_sha256": validation_sha256,
-              "scope_source": "host" if scopes else "sdk_current_candidate_public_validation",
-              "validation_sha256_source": "host" if digests else "locally_hashed_sdk_submission_projection"}
+              "scope_source": "host" if scopes else ("sdk_current_parent_public_validation" if parent_bound
+                                                       else "sdk_current_candidate_public_validation"),
+              "validation_sha256_source": "host" if digests else ("locally_hashed_sdk_parent_projection" if parent_bound
+                                                                   else "locally_hashed_sdk_submission_projection")}
     if bound:
-        result["submission_binding"] = {"artifact_id": binding.artifact_id, "dataset_key": binding.dataset_key,
-                                        "round_index": binding.round_index}
+        result["parent_binding" if parent_bound else "submission_binding"] = {
+            "artifact_id": binding.artifact_id, "dataset_key": binding.dataset_key, "round_index": binding.round_index}
+        if parent_bound:
+            result["parent_binding"]["checkpoint_sha256"] = binding.checkpoint_sha256
     return result
 
 
@@ -98,14 +148,14 @@ def measurement(value, validation_sha256, *, binding=None):
     return parse_measurement(value, validation_sha256, "macro_f1", binding=binding)
 
 
-def parent_reference(host_value, local_before, validation_sha256):
+def parent_reference(host_value, local_before, validation_sha256, *, binding=None):
     # 宿主完全未给父测量时可用本地同范围父分数；宿主已给但冲突时不能覆盖成可比。
-    # 仅“没有提供测量”可回退本地父分数；已提供的未知或冲突回执必须保留拒绝原因。
+    # 精简摘要可由当前 SDK 父绑定补充身份，仍需宿主数字与本地实测一致；显式冲突保留拒绝原因。
     if host_value is None or host_value == {}:
         return {"comparable": True, "macro_f1": local_before["macro_f1"],
                 "validation_sha256": validation_sha256, "scope": "authorized_public_validation",
                 "source": "local_parent_host_measurement_absent"}
-    result = measurement(host_value, validation_sha256)
+    result = measurement(host_value, validation_sha256, binding=binding)
     if result["comparable"] and abs(result["macro_f1"] - local_before["macro_f1"]) > SCORE_TOLERANCE:
         return {**result, "comparable": False, "reason": "parent_host_local_measurement_conflict"}
     return result

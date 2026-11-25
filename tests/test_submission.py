@@ -35,6 +35,13 @@ from gas_a.frozen_router import load_predictor, checkpoint_paths as artifact_che
 _WRITE_ROOTS = None
 
 
+def simulated_checkpoint_identity(receipt):
+    """测试用不透明聚合身份；并非声称复刻官方聚合算法。"""
+    entries = {item["path"]: item["sha256"] for item in receipt["files"]}
+    payload = [(name, entries[name]) for name in receipt["artifact"]["checkpoint_paths"]]
+    return "sha256:" + hashlib.sha256(json.dumps(payload, separators=(",", ":")).encode()).hexdigest()
+
+
 def _write_audit(event, args):
     if _WRITE_ROOTS is None:
         return
@@ -225,7 +232,8 @@ class OfflineHost:
             upload["finished"] = True
             reply.update(type="upload_finish_response", upload_id=frame["upload_id"])
         elif kind == "candidate_request":
-            assert frame["parent_checkpoint_sha256"] == digest(self.parent)
+            # 协议原样引用 start 的父身份；它可能是多文件聚合摘要。
+            assert frame["parent_checkpoint_sha256"] == self.frame["parent_checkpoint_sha256"]
             assert "files" not in frame
             upload = self.uploads[frame["upload_id"]]
             assert upload["kind"] == "candidate" and upload["finished"]
@@ -570,7 +578,8 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         self.assertEqual(host.record["configuration"]["controller_decisions"]["plan"], "program_guard")
 
     def test_work_directory_cannot_be_in_read_only_code_or_data(self):
-        for work in (ROOT / "runtime", self.root / "data/work", self.checkpoint.parent / "work"):
+        # 容器验收时测试文件可挂在 /audit，实际应用仍在 /app；检查真正的代码目录。
+        for work in (submission.ROOT / "runtime", self.root / "data/work", self.checkpoint.parent / "work"):
             host = OfflineHost(self.root, self.checkpoint, round_index=len(list(self.root.glob("host-*"))) + 1)
             rnd = Round.start(host, host)
             rnd.parent.root = self.checkpoint.parent
@@ -587,7 +596,8 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         auxiliary_path = self.root / "previous/auxiliary.npz"
         auxiliary.save(auxiliary_path)
         host = OfflineHost(self.root, nested)
-        host.frame["parent_artifact"]["artifact"]["checkpoint_paths"] = ["auxiliary.npz", "weights/selected-stage.bin"]
+        host.frame["parent_artifact"]["artifact"]["checkpoint_paths"] = ["weights/selected-stage.bin"]
+        host.frame["parent_artifact"]["artifact"]["code_paths"] = ["auxiliary.npz"]
         host.frame["parent_artifact"]["files"] = [
             {"path": str(p.relative_to(nested.parent.parent)).replace("\\", "/"),
              "sha256": digest(p), "size_bytes": p.stat().st_size} for p in (auxiliary_path, nested)]

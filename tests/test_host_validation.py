@@ -6,7 +6,7 @@ import tempfile
 from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from gas_a.host_validation import (parent_reference, candidate_gate, CandidateValidationBinding,
-                                  bind_candidate_validation, measurement)
+                                  ParentValidationBinding, bind_candidate_validation, measurement)
 from gas_a.sensor_training.io import digest
 
 
@@ -52,6 +52,35 @@ class HostValidationTest(unittest.TestCase):
 
     def test_present_but_unverifiable_parent_is_not_replaced_by_local_score(self):
         self.assertFalse(self.gate(self.receipt(.8),self.receipt(.7,validation_sha256=None))["eligible"])
+
+    def parent_binding(self, value):
+        return ParentValidationBinding("parent", "sha256:" + "b"*64, self.sha, "A", 1, "macro_f1", value)
+
+    def test_current_parent_compact_metrics_are_verified_without_replacing_host_score(self):
+        for value in ({"macro_f1": .7}, {"metrics": {"macro_f1": .7}},
+                      {"metric": "macro_f1", "score": .7}, {"summary": {"macro_f1": .7000001}}):
+            with self.subTest(value=value):
+                self.assertFalse(parent_reference(value, self.before, self.sha)["comparable"])
+                parent = parent_reference(value, self.before, self.sha, binding=self.parent_binding(value))
+                self.assertTrue(parent["comparable"])
+                self.assertEqual(parent["source"], "host")
+                self.assertEqual(parent["scope_source"], "sdk_current_parent_public_validation")
+                self.assertEqual(parent["parent_binding"]["artifact_id"], "parent")
+                self.assertTrue(candidate_gate(self.receipt(.8), parent, self.after, self.sha, self.config)["eligible"])
+
+    def test_parent_binding_rejects_explicit_conflicts_stale_and_unrelated_measurements(self):
+        for changes in ({"scope": "hidden"}, {"scope": None}, {"validation_sha256": "wrong"},
+                        {"validation_sha256": None}, {"artifact_id": "other"}, {"dataset_key": "B"},
+                        {"round_index": 0}, {"round_index": True}, {"checkpoint_sha256": "wrong"},
+                        {"parent_checkpoint_sha256": "wrong"}, {"parent_artifact_id": "other"}, {"macro_f1": .6},
+                        {"macro_f1": True}, {"macro_f1": float("nan")}, {"metric": "accuracy"}):
+            with self.subTest(changes=changes):
+                value = {"macro_f1": .7, **changes}
+                parent = parent_reference(value, self.before, self.sha, binding=self.parent_binding(value))
+                self.assertFalse(parent["comparable"])
+        value = {"macro_f1": .7}
+        self.assertFalse(parent_reference(dict(value), self.before, self.sha,
+                                         binding=self.parent_binding(value))["comparable"])
 
     def binding(self):
         return CandidateValidationBinding("new",self.sha,"A",1,"macro_f1")

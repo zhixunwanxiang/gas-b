@@ -19,6 +19,7 @@ from .router import HomeExpert, PAIRS, pair_codes
 from .signals import Flatline, correct, home_probabilities
 from .sensor_training.data import evaluate, load_model, score_predictions
 from .sensor_training.io import CLASSES, digest, write_json
+from .sensor_training.reference.data import finite_number
 from .sensor_training.optimize import train_candidate
 
 FORMAT = "gas-a.frozen-four-sensor.v1"
@@ -109,26 +110,33 @@ def load_predictor(checkpoint, paths=None, resolve_file=None):
     root = checkpoint.parent
     manifest_path = resolve_file(_relative(root, marker.get("manifest")))
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if (manifest.get("format") != FORMAT or manifest.get("classes") != CLASSES
-            or set(manifest.get("components", {})) != set(COMPONENTS)):
+    # 先确认每层容器类型，再读取字段或创建集合，避免坏清单泄漏 AttributeError/TypeError。
+    # 格式错误仅拒绝这份产物；调用方可以隔离旧历史，实际父模型则仍须完整通过检查。
+    if (not isinstance(manifest, dict) or manifest.get("format") != FORMAT
+            or manifest.get("classes") != CLASSES or not isinstance(manifest.get("components"), dict)
+            or set(manifest["components"]) != set(COMPONENTS)):
         raise ValueError("Invalid frozen routing manifest")
-    policy = manifest["policy"]
-    if (set(policy) != {"inner_weight", "outer_weight", "active_pairs", "cutoffs", "feature_correction"}
+    policy = manifest.get("policy")
+    if (not isinstance(policy, dict)
+            or set(policy) != {"inner_weight", "outer_weight", "active_pairs", "cutoffs", "feature_correction"}
             or type(policy["feature_correction"]) is not bool
-            or any(isinstance(policy[k], bool) or not isinstance(policy[k], (int, float))
-                   or not np.isfinite(policy[k]) or not 0 <= policy[k] <= 1
+            or any(not finite_number(policy[k]) or not 0 <= policy[k] <= 1
                    for k in ("inner_weight", "outer_weight"))
             or not isinstance(policy["active_pairs"], list)
-            or len(set(policy["active_pairs"])) != len(policy["active_pairs"])
             or any(type(c) is not int or c not in [6*a+b for a,b in PAIRS] for c in policy["active_pairs"])
-            or set(policy["cutoffs"]) != {"0", "1"}
-            or any(not 0 < policy["cutoffs"][k]["cut"] < 1 for k in ("0", "1"))):
+            or len(set(policy["active_pairs"])) != len(policy["active_pairs"])
+            or not isinstance(policy["cutoffs"], dict) or set(policy["cutoffs"]) != {"0", "1"}
+            or any(not isinstance(policy["cutoffs"][k], dict)
+                   or not finite_number(policy["cutoffs"][k].get("cut"))
+                   or not 0 < policy["cutoffs"][k]["cut"] < 1 for k in ("0", "1"))):
         raise ValueError("Invalid frozen routing policy")
     models, component_paths = {}, {}
     # 对所有实际使用的组件逐一验证字节摘要与 scaler，防止部分回滚或混装不同版本。
     for role in COMPONENTS:
         entry = manifest["components"][role]
-        path = resolve_file(_relative(root, entry["path"]))
+        if not isinstance(entry, dict) or not isinstance(entry.get("sha256"), str):
+            raise ValueError("Invalid routing component: " + role)
+        path = resolve_file(_relative(root, entry.get("path")))
         if digest(path) != entry["sha256"]:
             raise ValueError(f"Routing component digest mismatch: {role}")
         if role == "four_sensor" and path.resolve() != checkpoint.resolve():
@@ -150,20 +158,30 @@ def checkpoint_paths(checkpoint):
     return [model.component_paths[role].relative_to(root).as_posix() for role in COMPONENTS]
 
 
-def calibrate_policy(models, validation, cutoffs, search):
+def calibrate_policy(models, validation, cutoffs, search, *, controller=None, parent_metrics=None):
     """Compare a bounded family of class-pair policies using validation labels only."""
     # 在有上限的修正开关/融合权重菜单中，逐个类别对尝试加入路由。
     # 支持数不足或没有严格公开验证增益的类别对不启用；最后还必须通过外层整体晋升门槛。
     weights = search["inner_weights"]
+    outer_weights = search.get("outer_weights", [.6])
     minimum_support, minimum_gain = search["minimum_support"], search["minimum_macro_f1_gain"]
     corrections = search["correction_choices"]
     if (not isinstance(weights, list) or not weights or len(weights) > 5
             or any(isinstance(w, bool) or not isinstance(w, (int, float)) or not np.isfinite(w) or not 0 <= w <= 1 for w in weights)
+            or not isinstance(outer_weights, list) or not outer_weights or len(outer_weights) > 5
+            or any(isinstance(w, bool) or not isinstance(w, (int, float)) or not np.isfinite(w) or not 0 <= w <= 1 for w in outer_weights)
             or type(minimum_support) is not int or minimum_support < 1
             or not isinstance(corrections, list) or not corrections or len(corrections) > 2
             or any(type(v) is not bool for v in corrections)
             or not isinstance(minimum_gain, (int, float)) or not np.isfinite(minimum_gain) or minimum_gain < 0):
         raise ValueError("Invalid bounded routing search")
+    if (controller is None) != (parent_metrics is None):
+        raise ValueError("Protected routing requires both controller and actual parent metrics")
+    from .evolution import promotion_gate
+    def gate(metric):
+        return promotion_gate(parent_metrics, metric, controller) if controller is not None else {"eligible": True}
+    def rank(metric):
+        return (gate(metric)["eligible"], metric["macro_f1"])
     # 初始 active_pairs 为空，相当于安全保留 four；只有得到公开验证增益的类别对才逐步开启。
     base = {"inner_weight": .75, "outer_weight": .6, "active_pairs": [], "cutoffs": cutoffs,
             "feature_correction": False}
@@ -176,28 +194,34 @@ def calibrate_policy(models, validation, cutoffs, search):
         mode = dict(base, feature_correction=correction)
         scores = _expert_scores(models, mode, validation["x"], _new_stream(models["four_sensor"]))
         for weight in weights:
-            policy = dict(mode, inner_weight=weight, active_pairs=[])
             challenger = (1-weight) * scores[2] + weight * scores[1]
             codes = pair_codes(scores[0].argmax(1), challenger.argmax(1))
-            current = score_predictions(scores[0], y)
-            for a, b in PAIRS:
-                code = 6*a+b
-                # 支持数按实际会触发这条路由的样本统计；过少样本不据此校准一个新分支。
-                support = int(np.count_nonzero(~scores[3] & (codes == code)))
-                if support < minimum_support:
-                    continue
-                proposal = dict(policy, active_pairs=[*policy["active_pairs"], code])
-                metric = score_predictions(route_scores(scores, proposal), y)
-                accepted = metric["macro_f1"] > current["macro_f1"] + max(1e-12, minimum_gain)
-                trials.append({"feature_correction": correction, "inner_weight": weight,
-                               "pair": [CLASSES[a], CLASSES[b]], "support": support,
-                               "macro_f1": metric["macro_f1"], "accepted": accepted})
-                if accepted:
-                    policy, current = proposal, metric
-            if current["macro_f1"] > best["macro_f1"] + 1e-12:
-                best_policy, best = deepcopy(policy), current
+            for outer in outer_weights:
+                policy = dict(mode, inner_weight=weight, outer_weight=outer, active_pairs=[])
+                current = baseline
+                for a, b in PAIRS:
+                    code = 6*a+b
+                    # 支持数按实际会触发这条路由的样本统计；过少样本不据此校准一个新分支。
+                    support = int(np.count_nonzero(~scores[3] & (codes == code)))
+                    if support < minimum_support:
+                        continue
+                    proposal = dict(policy, active_pairs=[*policy["active_pairs"], code])
+                    metric = score_predictions(route_scores(scores, proposal), y)
+                    # 合格路由优先于不合格高分；已合格时不能为 F1 牺牲类别保护。
+                    feasible, current_feasible = gate(metric)["eligible"], gate(current)["eligible"]
+                    accepted = ((feasible and not current_feasible) or
+                                (feasible == current_feasible and metric["macro_f1"] >
+                                 current["macro_f1"] + max(1e-12, minimum_gain)))
+                    trials.append({"feature_correction": correction, "inner_weight": weight, "outer_weight": outer,
+                                   "pair": [CLASSES[a], CLASSES[b]], "support": support,
+                                   "macro_f1": metric["macro_f1"], "gate": gate(metric), "accepted": accepted})
+                    if accepted:
+                        policy, current = proposal, metric
+                if rank(current) > rank(best):
+                    best_policy, best = deepcopy(policy), current
     return best_policy, {"scope": "authorized_public_validation", "validation_sha256": validation["sha256"],
                          "validation_rows": len(y), "four_sensor_metrics": baseline, "selected_metrics": best,
+                         "parent_metrics": parent_metrics, "promotion_rules": controller, "selected_gate": gate(best),
                          "search": search, "trials": trials}
 
 
@@ -262,7 +286,10 @@ def build_bundle(parent_path, parent_predictor, train, validation, candidate, sp
                 or any(not np.array_equal(getattr(model, group)[k], getattr(home_before, group)[k])
                        for group in ("params", "first", "second") for k in ("w1", "b1"))):
             raise ValueError("Home expert did not preserve and continue the actual parent state")
-    policy, calibration = calibrate_policy(models, validation, cutoffs, routing["selection"])
+    controller = limits.get("controller_checkpoint_gate")
+    policy, calibration = calibrate_policy(models, validation, cutoffs, routing["selection"],
+                                          controller=controller,
+                                          parent_metrics=evaluate(parent_predictor, validation) if controller is not None else None)
     remaining()
     anchor = models["four_sensor"]
     # 先把主检查点标记为完整路由入口，再计算各组件摘要和清单，保证平台从主文件能找回整包。

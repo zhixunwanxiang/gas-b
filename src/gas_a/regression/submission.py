@@ -8,16 +8,17 @@ import tempfile
 import numpy as np
 from contest_harness.errors import HarnessError
 from .data import UNITS, input_values, load_model, load_pair
-from .evaluation import evaluate, promotion_gate, parent_reference, host_gate
+from .evaluation import evaluate, promotion_gate, current_parent_reference, host_gate, PARENT_REFERENCE_VERSION
 from .monitoring import fit_reference, monitor, diagnose
 from .training import continue_candidate
 from .prompts import VERSION as PROMPT_VERSION, plan_contract, PLAN_INSTRUCTION, SELECT_INSTRUCTION
-from ..evolution import available_experiments, fingerprint
+from ..evolution import (available_experiments, fingerprint, experiment_outcome,
+                         validate_attempts, eligible_history, EXPERIMENT_POLICY_VERSION)
 from ..host_validation import HOST_ADMISSION_VERSION, bind_candidate_validation
 from ..progress import progress, stage
 from ..sensor_training.io import append_jsonl, digest, write_json
 from ..submission import ROOT, PREDICT_ARGV, _controller_decision, _parent_checkpoint, _prediction_checkpoint, _snapshot
-from ..sdk_records import bounded_configuration
+from ..sdk_records import bounded_configuration, portable_record
 
 
 @lru_cache(maxsize=2)
@@ -81,9 +82,7 @@ def _policy(state, dataset, menu):
             or value.get("preferred_experiment") not in (None, *menu)
             or not isinstance(value.get("attempts"), list) or not isinstance(value.get("artifact_policies"), dict)):
         raise ValueError("Invalid regression strategy state")
-    for item in value["attempts"]:
-        if not isinstance(item.get("fingerprint"), str) or type(item.get("adopted")) is not bool:
-            raise ValueError("Invalid regression experiment history")
+    validate_attempts(value["attempts"])
     for item in value["artifact_policies"].values():
         if (type(item.get("version")) is not int or not 1 <= item["version"] <= value["revision"]
                 or item.get("preferred_experiment") not in (None, *menu)):
@@ -91,7 +90,8 @@ def _policy(state, dataset, menu):
     return value
 
 
-def _advance(policy, selected, parent, candidate, plan, identity, reduction, failed):
+def _advance(policy, selected, parent, candidate, plan, identity, reduction, failed,
+             local_gate=None, host_gate=None, selection_source="model"):
     # 依据已经发生的结果更新策略，而不是依据模型在 reason 里声称“有效”。
     # 拒绝/本地失败也计入 attempts，后续用完整实验指纹限制同一个失败方案重复尝试。
     result = deepcopy(policy)
@@ -100,7 +100,9 @@ def _advance(policy, selected, parent, candidate, plan, identity, reduction, fai
         adopted = candidate is not None and selected == candidate
         result["attempts"].append({"fingerprint": identity, "experiment": plan["experiment"],
                                    "adopted": adopted, "rmse_reduction": reduction,
-                                   "status": "local_training_failed" if failed else "measured"})
+                                   "status": "local_training_failed" if failed else "measured",
+                                   **experiment_outcome(adopted=adopted, failed=failed,
+                                       local_gate=local_gate, host_gate=host_gate, selection_source=selection_source)})
         result["attempts"] = result["attempts"][-128:]
         if adopted:
             # 只有实际选中新候选才增加策略版本，并将这个方案记为实验偏好。
@@ -121,13 +123,17 @@ def _history_view(history):
     result = []
     for item in history[-10:]:
         record = item.get("record", item)
+        if not isinstance(record, dict):
+            record = {}
         config = record.get("configuration", {})
-        result.append({"id": item["id"], "selected_artifact_id": record.get("selected_artifact_id"),
+        if not isinstance(config, dict):
+            config = {}
+        result.append(portable_record({"id": item["id"], "selected_artifact_id": record.get("selected_artifact_id"),
                        "reason": str(record.get("reason", ""))[:600],
                        "configuration": {key: config[key] for key in (
                            "dataset", "experiment", "parent_checkpoint_sha256", "train_sha256", "validation_sha256",
                            "validation_before", "validation_after", "candidate_gate", "host_candidate_gate",
-                           "experiment_failure", "selected_local_rmse") if key in config}})
+                           "experiment_failure", "selected_local_rmse") if key in config}}, context="regression_history_view"))
     return result
 
 
@@ -139,6 +145,12 @@ def _restore_history(rnd, history, run, validation, before, rules, dataset):
     order.extend(reversed(list(receipts)))
     restored, seen = {}, {rnd.parent.artifact_id}
     for identifier in order:
+        # 历史记录本身合法，不代表可选 selected_artifact_id 一定是字符串。
+        # 不把列表/对象放进集合判断；忽略坏提示后仍按本帧授权清单寻找可用历史。
+        if not isinstance(identifier, str) or not identifier.strip():
+            if identifier is not None:
+                progress("history_selection_hint_rejected", dataset=dataset, value_type=type(identifier).__name__)
+            continue
         if identifier in seen or identifier not in receipts:
             continue
         seen.add(identifier)
@@ -158,7 +170,9 @@ def _restore_history(rnd, history, run, validation, before, rules, dataset):
                                     "validation_sha256": validation["sha256"], "reevaluated_this_round": True}
         except (ValueError, OSError, KeyError) as error:
             # 文件/模型不兼容只使这个历史版本失去资格；restore_artifact 的 RPC 异常不在这里捕获。
-            restored[identifier] = {"error": str(error)[:1000], "gate": {"eligible": False}}
+            # 加载器把坏 NPZ 和非对象元数据统一为 ValueError，保留具体原因供下一轮复盘。
+            restored[identifier] = {"error": str(error)[:1000], "error_type": type(error).__name__,
+                                    "stage": "historical_model_evaluation", "gate": {"eligible": False}}
     return restored
 
 
@@ -195,7 +209,8 @@ def train(rnd):
     with stage("evaluate_parent", dataset=dataset):
         parent = load_model(checkpoint, dataset, train_data["paths"])
         before = evaluate(parent, validation, dataset)
-    parent_host = parent_reference(rnd.frame.get("current_validation"), before, validation["sha256"])
+    with stage("validate_parent_measurement", dataset=dataset):
+        parent_host = current_parent_reference(rnd, checkpoint, before, validation["sha256"])
     with stage("history_rpc", dataset=dataset):
         history = rnd.history()
     state = rnd.state_workspace(run / "state")
@@ -215,13 +230,22 @@ def train(rnd):
     elif policy["artifact_policies"]:
         policy.update(version=1, preferred_experiment=None)
     execution = {"format": "rul.execution.v1", "rules": rules, "limits": limits, "prompt_version": PROMPT_VERSION,
+                 "experiment_policy_version": EXPERIMENT_POLICY_VERSION,
                  "host_admission_policy_version": HOST_ADMISSION_VERSION,
+                 "parent_reference_policy_version": PARENT_REFERENCE_VERSION,
                  "monitor_reference_policy": "fixed_initial_training_projection-v1"}
     allowed, blocked = available_experiments(policy, menu, rnd, train_data, validation, rules, execution)
+    admission_blocker = None
+    if not parent_host["comparable"]:
+        # 不可核验的父测量使本轮任何候选都不能上线；直接观察并留证，避免重复消耗训练预算。
+        admission_blocker = parent_host.get("reason", "parent_measurement_unverified")
+        allowed = {}
     # 指纹包含父模型、train、validation、方案和执行规则；只屏蔽同一身份下反复失败的方案。
     with stage("restore_and_evaluate_history", dataset=dataset):
-        restored = _restore_history(rnd, history, run, validation, before, rules, dataset)
-    rollback_ids = [key for key, value in restored.items() if value["gate"]["eligible"] and parent_host["comparable"]]
+        # 父测量不可比时历史也不能采用，避免白白传输整份历史产物。
+        restored = {} if admission_blocker else _restore_history(rnd, history, run, validation, before, rules, dataset)
+    rollback_ids = eligible_history(restored, validation["sha256"], parent_host["comparable"],
+                                    {item["artifact_id"] for item in rnd.artifacts})
     # observe 永远保留；只有存在可执行菜单/合格历史时才开放 experiment/rollback。
     actions = ["observe"] + (["experiment"] if allowed else []) + (["rollback"] if rollback_ids else [])
 
@@ -244,6 +268,8 @@ def train(rnd):
     request = {"phase": "plan", "round_index": rnd.round_index, "dataset": dataset,
                "task": "regression", "metric": "rmse", "metric_direction": "lower", "target_unit": UNITS[dataset],
                "parent_artifact_id": rnd.parent.artifact_id, "validation_before": before,
+               "parent_host_reference": parent_host,
+               "admission_blocker": admission_blocker,
                "history": _history_view(history), "experiments": allowed, "strategy": {
                    "version": policy["version"], "preferred_experiment": policy["preferred_experiment"],
                    "blocked_repeated_experiments": blocked},
@@ -260,7 +286,10 @@ def train(rnd):
     cfg = {"dataset": dataset, "task": "regression", "metric": "rmse", "metric_direction": "lower",
            "target_unit": UNITS[dataset], "action": plan["action"], "experiment": spec,
            "parent_checkpoint_sha256": rnd.parent.checkpoint_sha256, "train_sha256": train_data["sha256"],
+           "parent_primary_file_sha256": digest(checkpoint),
            "validation_sha256": validation["sha256"], "validation_before": before,
+           "parent_host_reference": parent_host,
+           "admission_blocker": admission_blocker,
            "controller_prompt_version": PROMPT_VERSION, "execution_policy": execution}
     submitted, report, gate, admission, failure = None, None, None, None, None
     identity = fingerprint(rnd.parent.checkpoint_sha256, train_data["sha256"], validation["sha256"], spec, execution) if spec else None
@@ -273,7 +302,7 @@ def train(rnd):
         try:
             with stage("local_training", dataset=dataset, experiment=spec["name"]):
                 report = continue_candidate(checkpoint, train_data, validation, candidate, spec, limits, rules, dataset,
-                                            rnd.parent.checkpoint_sha256)
+                                            digest(checkpoint))
         except (TimeoutError, ValueError, ArithmeticError, np.linalg.LinAlgError) as error:
             failure = {"stage": "local_training", "error_type": type(error).__name__, "message": str(error)[:1000]}
             append_jsonl(state / "experiment_attempts.jsonl", {"round_index": rnd.round_index, "status": "failed", **failure})
@@ -299,21 +328,25 @@ def train(rnd):
         cfg["host_candidate_gate"] = admission
     eligible = [rnd.parent.artifact_id]
     # 阶段 8：最终白名单取本地和宿主两道门槛的交集；不合格候选即使模型坚持也不能选。
-    # 历史资格只开放给本轮规划的回滚目标，不能在最后一步临时换成任意历史 ID。
+    # 历史资格由当前 SDK 授权及本轮复评决定，独立于是否在规划中预先声明 rollback。
     if submitted and gate["eligible"] and admission["eligible"]:
         eligible.append(submitted["artifact_id"])
-    if plan["action"] == "rollback":
-        eligible.append(plan["target_artifact_id"])
+    selection_history_ids = rollback_ids if planning_calls["decision_source"] == "model" else []
+    eligible.extend(selection_history_ids)
 
     def validate_selection(value):
         if value["selected_artifact_id"] not in eligible:
-            raise ValueError("Selected ID is not allowed for this plan. Actual parent=%s; action=%s; allowed IDs=%s. "
-                             "Historical restoration requires a rollback plan; do not substitute a historical best for the actual parent." % (
+            raise ValueError("Selected ID is outside current measured choices. Actual parent=%s; action=%s; allowed IDs=%s. "
+                             "History requires SDK authorization and a qualified current-scope reevaluation." % (
                                  rnd.parent.artifact_id, plan["action"], eligible))
 
     selection_request = {"phase": "select", "dataset": dataset, "action": plan["action"],
         "parent_artifact_id": rnd.parent.artifact_id, "candidate_artifact_id": submitted["artifact_id"] if submitted else None,
         "same_local_validation": {"parent": before, "candidate": report["validation_after"] if report else None, "historical": restored},
+        "historical_admission": {key: {"eligible": key in selection_history_ids,
+            "reevaluated_this_round": value.get("reevaluated_this_round") is True,
+            "validation_sha256": value.get("validation_sha256"), "gate": value["gate"],
+            "fresh_metrics": value.get("metrics")} for key, value in restored.items()},
         "host_candidate_receipt": submitted, "host_candidate_gate": admission, "candidate_gate": gate,
         "parent_host_reference": parent_host, "experiment_failure": failure, "promotion_rules": rules,
         "controller_prompt": {"version": PROMPT_VERSION, "instruction": SELECT_INSTRUCTION},
@@ -332,7 +365,13 @@ def train(rnd):
     elif submitted:
         change = "Measured the regression candidate but retained the actual parent artifact."
     next_policy = _advance(policy, selected, rnd.parent.artifact_id, candidate_id, plan, identity,
-                           gate["rmse_reduction"] if gate else None, failure is not None)
+                           gate["rmse_reduction"] if gate else None, failure is not None,
+                           local_gate=gate, host_gate=admission, selection_source=selection_calls["decision_source"])
+    if candidate_id or failure:
+        cfg["experiment_outcome"] = {key: next_policy["attempts"][-1][key] for key in (
+            "outcome", "reason", "counts_toward_rejection_limit")}
+    cfg["selection_action"] = ("adopt_candidate" if selected == candidate_id else
+                                "retain_parent" if selected == rnd.parent.artifact_id else "rollback")
     cfg.update(selected_local_rmse=selected_metrics["rmse"], strategy_version_after=next_policy["version"])
     cfg["controller_decisions"] = {"plan": planning_calls["decision_source"], "select": selection_calls["decision_source"]}
     if "program_guard" in cfg["controller_decisions"].values():
@@ -342,11 +381,13 @@ def train(rnd):
               "configuration": cfg, "selected_artifact_id": selected, "model_call_ids": list(rnd.call_ids),
               "planning_calls": planning_calls, "selection_calls": selection_calls,
               "historical_validation": restored, "host_candidate_receipt": submitted}
+    record["host_current_validation"] = rnd.frame.get("current_validation")
     write_json(reference_path, reference)
     # 阶段 10：持久化监测参考、配套策略、诊断及两次决策的真实调用号，供下一轮“读历史”使用。
     write_json(state / "regression_strategy.json", next_policy)
     write_json(state / "monitoring.json", drift)
     write_json(state / "diagnosis.json", diagnosis)
+    record = portable_record(record, context="regression_round_record")
     append_jsonl(state / "decisions.jsonl", record)
     write_json(run / "round_summary.json", record)
     with stage("save_state_rpc", dataset=dataset):

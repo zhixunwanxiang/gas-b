@@ -30,6 +30,15 @@ def json_value(raw):
     return json.loads(raw, object_pairs_hook=unique_object, parse_constant=reject)
 
 
+def finite_number(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
 def flatten(inputs):
     paths, values = [], []
     def visit(value, path, depth):
@@ -43,11 +52,11 @@ def flatten(inputs):
         elif isinstance(value, list):
             for index, child in enumerate(value):
                 visit(child, path + [("index", index)], depth + 1)
-        elif isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+        elif finite_number(value):
             paths.append(json.dumps(path, ensure_ascii=False, separators=(",", ":")))
             values.append(float(value))
         else:
-            raise ValueError("model inputs must contain finite numeric features only")
+            raise ValueError("model inputs must contain finite numeric features only at " + json.dumps(path))
     visit(inputs, [], 0)
     if not values or len(values) > 4096:
         raise ValueError("expected 1..4096 numeric features")
@@ -65,13 +74,19 @@ def read_dataset(path, task, classes=None, expected_paths=None):
     for number, line in enumerate(raw.decode("utf-8").splitlines(), 1):
         if not line.strip():
             continue
-        row = json_value(line)
+        try:
+            row = json_value(line)
+        except ValueError as error:
+            raise ValueError(f"{path.name}: line {number}: {error}") from error
         if not isinstance(row, dict) or not {"id", "inputs", "answer"} <= set(row):
             raise ValueError(f"line {number}: id, inputs and answer are required")
         identity = row["id"]
         if not isinstance(identity, str) or not identity or identity in seen:
             raise ValueError(f"line {number}: sample IDs must be nonempty and unique")
-        current_paths, values = flatten(row["inputs"])
+        try:
+            current_paths, values = flatten(row["inputs"])
+        except ValueError as error:
+            raise ValueError(f"{path.name}: line {number}: {error}") from error
         if paths is None:
             paths = current_paths
         if current_paths != paths:
@@ -82,7 +97,7 @@ def read_dataset(path, task, classes=None, expected_paths=None):
                 raise ValueError(f"line {number}: label is outside the configured class list")
             target = classes.index(answer)
         elif task == "regression":
-            if isinstance(answer, bool) or not isinstance(answer, (float, int)) or not math.isfinite(answer) or answer < 0:
+            if not finite_number(answer) or answer < 0:
                 raise ValueError(f"line {number}: RUL must be a finite nonnegative number")
             target = float(answer)
         else:

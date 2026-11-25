@@ -20,6 +20,17 @@ def read_json(path):
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
+def json_text(value, **options):
+    """Serialize strict JSON, escaping lone surrogates without losing evidence.
+
+    A completed gateway response can contain JSON-escaped invalid Unicode.
+    Keep the original code points as JSON escapes instead of failing a UTF-8
+    file write or SDK message write. Valid Unicode and numeric checks stay as-is.
+    """
+    text = json.dumps(value, ensure_ascii=False, allow_nan=False, **options)
+    return text.encode("utf-8", errors="backslashreplace").decode("utf-8")
+
+
 def read_config(path, _parents=()):
     """解析相对路径的 JSON 配置继承，递归合并嵌套对象并避免共享合并字典。"""
     path = Path(path).resolve()
@@ -50,7 +61,7 @@ def write_json(path, obj):
     temp = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
     try:
         with temp.open("x", encoding="utf-8") as stream:
-            stream.write(json.dumps(obj, ensure_ascii=False, indent=2, allow_nan=False) + "\n")
+            stream.write(json_text(obj, indent=2) + "\n")
             stream.flush()
             os.fsync(stream.fileno())
         # 临时文件与目标位于同一目录，通过 os.replace 一次切换，读者无需读取半成品。
@@ -64,7 +75,7 @@ def append_jsonl(path, obj):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as stream:
-        stream.write(json.dumps(obj, ensure_ascii=False, allow_nan=False) + "\n")
+        stream.write(json_text(obj) + "\n")
         stream.flush()
 
 
@@ -76,7 +87,7 @@ def write_jsonl(path, rows):
     try:
         with temp.open("x", encoding="utf-8", newline="\n") as stream:
             for row in rows:
-                stream.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
+                stream.write(json_text(row) + "\n")
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temp, path)

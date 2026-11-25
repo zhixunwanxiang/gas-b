@@ -10,7 +10,7 @@
 |---|---|---|
 | `regression.controller.json_corrections` | 1 | 计划或选版收到完整但非法的回复时，最多纠正1次；RPC中断不重试。 |
 | `regression.controller.max_history_restores` | 2 | 每轮最多恢复并在当前验证集重新测量2个允许的历史模型。 |
-| `regression.controller.max_repeat_rejections` | 2 | 相同父模型、数据、实验和执行规则下，失败/未采用累计2次后屏蔽该方案。 |
+| `regression.controller.max_repeat_rejections` | 2 | 相同父模型、数据、实验和执行规则下，明确性能不合格或本地训练失败累计2次后屏蔽该方案；测量未核验、选版保护和主动未采用不计入。 |
 | `regression.controller.minimum_rmse_absolute_gain` | 0.000001 | 要求RMSE绝对减少至少该值，B单位分钟，C单位循环。 |
 | `regression.controller.minimum_rmse_relative_gain` | 0.0005 | 同时要求RMSE相对减少至少0.05%；不是分类的0.05个百分点。 |
 | `regression.controller.maximum_mae_relative_increase` | 0.02 | 辅助保护：MAE相对父模型最多增加2%。C的NASA评分如实记录，不单独作为硬门槛。 |
@@ -62,7 +62,7 @@
 |---|---:|---|
 | `controller.json_corrections` | `1` | 每个决策阶段收到不合法 JSON 或不允许的选择后，最多补发一次纠错请求；首次调用不计在这一次里。`0` 表示不纠错。代码允许整数 `0～2`。只纠正已成功返回的回复，不重试结果未知的 RPC。[submission.py:96](D:/aiproject/gas-rsi-four-sensor/src/gas_a/submission.py:98) |
 | `controller.max_history_restores` | `2` | 每轮最多完整恢复并尝试评估两个宿主允许的历史产物，优先按近期历史选择记录排列，再补充其他允许产物。它不是保留历史记录的条数，也不保证找到了所有历史版本中的最佳模型。代码允许整数 `0～2`；`0` 关闭历史恢复。[submission.py:130](D:/aiproject/gas-rsi-four-sensor/src/gas_a/submission.py:135) |
-| `controller.max_repeat_rejections` | `2` | 相同父检查点摘要、训练集摘要、验证集摘要及完整实验配置，累计两次候选未被采用后，从当轮实验菜单移除该组合。改用其他父权重、其他数据或其他实验配置时是不同组合。按状态中最近 128 次实验记录计数；不是“总共只准训练两轮”，也不要求拒绝记录必须相邻。代码允许整数 `1～8`。[evolution.py:56](D:/aiproject/gas-rsi-four-sensor/src/gas_a/evolution.py:59) |
+| `controller.max_repeat_rejections` | `2` | 相同父检查点、训练/验证数据、完整配置和执行策略下，仅明确性能拒绝及本地训练失败计入上限；测量未核验、选版 `program_guard`、合格但未采用不计入。旧状态缺少拒绝阶段的 `measured` 记录保留为未知，旧本地训练失败仍计数。按最近128次记录计数，允许整数 `1～8`。 |
 | `controller.minimum_macro_f1_gain` | `0.0005` | 最终候选或历史回滚版本相对当轮父模型，在同一份当前公开验证集上的 Macro-F1 至少提升 `0.0005`。例如 `0.7140 → 0.7145`，是 0.05 个百分点，不是相对提高 0.05%。代码允许 `0～1`；即使设为 `0`，仍要求提升严格大于 `1e-12`，同分不能晋升。[evolution.py:68](D:/aiproject/gas-rsi-four-sensor/src/gas_a/evolution.py:71) |
 | `controller.minimum_class_support` | `20` | 只有父模型评估报告中真实样本数至少 20 的类别，才参加“类别召回下降保护”。这不是预测为该类别的样本数，也不限制是否计算该类别 F1。代码允许整数 `1～1000000`。[evolution.py:68](D:/aiproject/gas-rsi-four-sensor/src/gas_a/evolution.py:71) |
 | `controller.maximum_class_recall_drop` | `0.20` | 对满足上述支持数的每个类别，计算 `父召回率 - 候选召回率`；超过 `0.20 + 1e-12` 就拒绝该候选。`0.20` 是 20 个百分点，例如 96% 降到 76%；不是“相对降低 20%”。一个受保护类别超限就足以拒绝。代码允许 `0～1`；`0` 表示基本不允许下降，`1` 数值上不再拦截合法召回范围内的降幅。[evolution.py:68](D:/aiproject/gas-rsi-four-sensor/src/gas_a/evolution.py:71) |
@@ -195,13 +195,14 @@ home 的神经训练使用 train 内部分层拆出的拟合子集；保留子�
 | 完整参数路径 | 当前值 | 实际作用及边界 |
 |---|---|---|
 | `experiments[0].routing.selection.inner_weights` | `[0.4,0.75,0.9]` | 搜索“五传感器辅助专家”的内部混合权重。每个候选 `w` 对应 `challenger = w × five + (1-w) × home`。`w` 越大，五传感器分数占比越高。代码要求 1～5 个有限数值，各在 `0～1`。不是给四个专家直接分配的三个总权重。 |
+| `experiments[0].routing.selection.outer_weights` | `[0.25,0.4,0.6,0.8]` | 搜索挑战者与四传感器主专家的外层融合权重。对启用的类别组合使用 `(1-w) × four + w × challenger`。要求 1～5 个有限数值，各在 `0～1`；兼容旧配置时缺省为 `[0.6]`。 |
 | `experiments[0].routing.selection.correction_choices` | `[false,true]` | 分别评估关闭/打开特征偏移修正，最终只导出选中的布尔值。开启时，修正器用已经到达的特征维护历史中位数偏移；不使用标签，也不改检查点的标准化参数。代码要求 1～2 个布尔值。仅保留 `[false]` 就只搜索关闭修正的策略。 |
 | `experiments[0].routing.selection.minimum_support` | `20` | 某个“主专家预测类别与 challenger 预测类别的无序组合”，在排除第 13 号传感器平线报警样本后，至少覆盖 20 条验证样本，才尝试启用该组合的路由。不是某个真实类别支持数，也不是 controller 的类别召回保护。代码要求正整数。 |
-| `experiments[0].routing.selection.minimum_macro_f1_gain` | `0.0005` | 每贪心添加一个类别组合路由时，整份验证集 Macro-F1 必须相对当前路由策略严格提升超过 `max(1e-12, 0.0005)`，才能加入。这里比较“当前路由策略与增加一个组合后的策略”，不是“完整候选与父模型”；严格大于也不同于 controller 的至少提升。代码要求有限非负数。 |
+| `experiments[0].routing.selection.minimum_macro_f1_gain` | `0.0005` | 同等准入资格下，每贪心添加一个类别组合路由，整份验证集 Macro-F1 须相对当前路由策略严格提升超过 `max(1e-12, 0.0005)`。正式入口优先比较是否通过相对完整实际父模型的 controller 门槛：合格策略可替代不合格策略，不合格策略不能替代已合格策略。代码要求有限非负数。 |
 
 代码：[frozen_router.py:137](D:/aiproject/gas-rsi-four-sensor/src/gas_a/frozen_router.py:137)、[frozen_router.py:53](D:/aiproject/gas-rsi-four-sensor/src/gas_a/frozen_router.py:53)、[signals.py:67](D:/aiproject/gas-rsi-four-sensor/src/gas_a/signals.py:67)。
 
-当前还存在不在 JSON 中的固定路由值：外层混合 `outer_weight=0.6`。对已启用且未平线报警的类别组合，最终为 `0.4 × four + 0.6 × challenger`；其他样本继续使用 four 分数。即使开启修正，four/five 的分数也各自取原始输入预测和修正输入预测的平均，不能简单理解为完全替换输入。未发现优于基准主专家的组合时，策略保留主专家输出。
+A v11 起外层权重也来自上述有界 JSON 菜单。对已启用且未平线报警的类别组合应用选中权重；其他样本继续使用 four 分数。即使开启修正，four/five 的分数也各自取原始输入预测和修正输入预测的平均，不能简单理解为完全替换输入。正式入口最终按“controller 准入资格、Macro-F1”排序完整路由，优先保留合格策略；本地未传 controller 的调用仍按 Macro-F1 选择。路由报告保留父指标、各次门槛及最终资格。
 
 `correction_choices=true` 表示允许被搜索，不表示最终一定启用。`inner_weights` 也不是根据隐藏标签在线重选的列表，最终权重和类别组合已冻结在产物清单中。特征状态可随输入更新。
 
@@ -226,3 +227,5 @@ home 的神经训练使用 train 内部分层拆出的拟合子集；保留子�
 Dockerfile 会把本文件复制进镜像；本地改完后，正式提交镜像需要重新构建，已存在的运行记录/候选目录中快照不会自动更新。
 
 本文已同步控制器 v3 的宿主测量保护、本地失败恢复及 home 轮数修复；JSON 参数值未调整。主、五传感器和 home 的新增轮数均受 `limits.max_epochs` 限制，home 在每个 epoch 前检查候选截止时间，内部仍没有逐 batch 的截止时间检查。训练预算和选版执行策略参与实验签名；仅改提示词措辞不会清空失败记录。本地训练失败会计入 `max_repeat_rejections`。正式选版另需通过宿主回执校验，不能只凭本地高分绕过未知或冲突的宿主测量，见 [修复说明](docs/CODE_FIXES_20261122.md)。
+
+2026-11-25 策略调整：实验记录增加 `outcome`、`reason`、`counts_toward_rejection_limit`，配置摘要保存 `experiment_outcome`。规划 `action` 继续表示本轮是否从实际父模型训练；最终 `selection_action` 单独记录 `adopt_candidate`、`retain_parent` 或 `rollback`。最终选版可选择 SDK 当前允许、确实已恢复且在本轮相同验证摘要下复评合格的历史产物，无需规划预先选择 `rollback`；恢复次数上限不变。规划进入 `program_guard` 时仍只允许实际父模型。执行策略版本与提示词版本同步更新，旧失败记录保留，不再把未知原因的未采用当作性能失败。

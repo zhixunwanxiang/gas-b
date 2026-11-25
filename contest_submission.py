@@ -17,7 +17,12 @@ def train(rnd):
     # describe 只需检查声明和函数是否可调用，不应启动 NumPy、训练或读取数据。
     # SDK 已收到 start 后才走到此处；不提前等待 stdin EOF，也不另建协议。
     from gas_a.multitask import train as run
-    return run(rnd)
+    try:
+        return run(rnd)
+    except Exception as error:
+        from gas_a.progress import training_failure
+        training_failure(error, dataset=rnd.dataset_key, round_index=rnd.round_index)
+        raise
 
 
 def predict(sample, model_dir):

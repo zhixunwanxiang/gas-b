@@ -6,6 +6,62 @@ import hashlib
 import json
 import math
 
+EXPERIMENT_POLICY_VERSION = "classified-rejections-fresh-history-v2"
+OUTCOMES = {"adopted", "performance_rejected", "measurement_unverified",
+            "controller_guard", "not_selected", "local_training_failed", "unclassified"}
+
+
+def experiment_outcome(*, adopted, failed, local_gate=None, host_gate=None, selection_source="model"):
+    """Separate measured performance failures from adoption/controller failures."""
+    if adopted:
+        outcome, reason = "adopted", "candidate_selected"
+    elif failed:
+        outcome, reason = "local_training_failed", "local_training_failed"
+    elif isinstance(local_gate, dict) and local_gate.get("eligible") is False:
+        outcome = "performance_rejected"
+        reason = "class_recall_regression" if local_gate.get("class_recall_losses") else "local_promotion_gate_rejected"
+    elif isinstance(host_gate, dict) and host_gate.get("eligible") is False:
+        reason = host_gate.get("reason") or "host_measurement_unverified"
+        outcome = ("performance_rejected" if reason in (
+            "host_gain_below_promotion_threshold", "host_rmse_reduction_below_threshold") else "measurement_unverified")
+    elif selection_source == "program_guard":
+        outcome, reason = "controller_guard", "selection_validation_exhausted"
+    elif (isinstance(local_gate, dict) and local_gate.get("eligible") is True
+          and isinstance(host_gate, dict) and host_gate.get("eligible") is True):
+        outcome, reason = "not_selected", "eligible_candidate_not_selected"
+    else:
+        outcome, reason = "unclassified", "insufficient_rejection_evidence"
+    return {"outcome": outcome, "reason": reason,
+            "counts_toward_rejection_limit": outcome in ("performance_rejected", "local_training_failed")}
+
+
+def counted_rejection(attempt):
+    # Legacy measured/not-adopted entries contain no failure stage. Do not infer
+    # a performance failure from them. Known legacy local failures stay bounded.
+    return (not attempt["adopted"] and (attempt.get("outcome") in (
+        "performance_rejected", "local_training_failed") or attempt.get("status") == "local_training_failed"))
+
+
+def validate_attempts(attempts):
+    for item in attempts:
+        if (not isinstance(item, dict) or not isinstance(item.get("fingerprint"), str)
+                or type(item.get("adopted")) is not bool
+                or ("outcome" in item and (not isinstance(item["outcome"], str) or item["outcome"] not in OUTCOMES))
+                or ("counts_toward_rejection_limit" in item and (
+                    type(item["counts_toward_rejection_limit"]) is not bool
+                    or item["counts_toward_rejection_limit"] != counted_rejection(item)))):
+            raise ValueError("Invalid classified experiment history")
+
+
+def eligible_history(restored, validation_sha256, parent_verified, authorized_ids):
+    """Only actual current-round remeasurements can enter final selection."""
+    if not parent_verified:
+        return []
+    return [identifier for identifier, value in restored.items()
+            if identifier in authorized_ids and value.get("reevaluated_this_round") is True
+            and value.get("validation_sha256") == validation_sha256
+            and isinstance(value.get("gate"), dict) and value["gate"].get("eligible") is True]
+
 
 def validate_controller(config):
     # 先校验控制器预算和阈值，防止布尔值冒充整数、NaN 或无界配置影响实验权限。
@@ -60,6 +116,7 @@ def load_policy(value, menu):
     versions = [value["version"], *(item["version"] for item in value["artifact_policies"].values())]
     if type(value.get("revision")) is not int or value["revision"] < max(versions):
         raise ValueError("Invalid strategy revision counter")
+    validate_attempts(value["attempts"])
     return value
 
 
@@ -68,7 +125,7 @@ def available_experiments(policy, menu, rnd, train, validation, config, executio
     allowed, blocked = {}, []
     for name, spec in menu.items():
         identity = fingerprint(rnd.parent.checkpoint_sha256, train["sha256"], validation["sha256"], spec, execution_policy)
-        rejected = sum(a["fingerprint"] == identity and not a["adopted"] for a in policy["attempts"])
+        rejected = sum(a["fingerprint"] == identity and counted_rejection(a) for a in policy["attempts"])
         if rejected >= config["max_repeat_rejections"]:
             blocked.append(name)
         else:
@@ -90,7 +147,7 @@ def promotion_gate(before, after, config):
 
 
 def advance_policy(policy, *, selected, parent_id, candidate_id, plan, attempt_key, gain, validation_sha256, selected_f1,
-                   experiment_failed=False):
+                   experiment_failed=False, local_gate=None, host_gate=None, selection_source="model"):
     # 记录实际候选或本地失败尝试；只有被选中的新候选才能提升策略版本及实验偏好。
     # 回滚时恢复所选历史产物的配套策略，未知外部历史采用保守初值；日志长度受限以控制状态大小。
     result = deepcopy(policy)
@@ -101,7 +158,9 @@ def advance_policy(policy, *, selected, parent_id, candidate_id, plan, attempt_k
         adopted = candidate_id is not None and selected == candidate_id
         result["attempts"].append({"fingerprint": attempt_key, "experiment": plan["experiment"],
                                    "adopted": adopted, "macro_f1_gain": gain,
-                                   "status": "local_training_failed" if experiment_failed else "measured"})
+                                   "status": "local_training_failed" if experiment_failed else "measured",
+                                   **experiment_outcome(adopted=adopted, failed=experiment_failed,
+                                       local_gate=local_gate, host_gate=host_gate, selection_source=selection_source)})
         result["attempts"] = result["attempts"][-128:]
         # “执行过训练”不等于策略改善；只有实际采用新候选才提升版本并记录偏好。
         if adopted:
