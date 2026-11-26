@@ -233,6 +233,8 @@ def render(data, output):
         "xtick.color": "#4f6076", "ytick.color": "#4f6076", "grid.color": "#e4e9ef", "grid.alpha": .8,
         "savefig.facecolor": "white", "svg.fonttype": "none"})
     colors = {"A": "#2563eb", "B": "#087f78", "C": "#cb6a22"}
+    bc_version = data["registration"]["code_versions"]["B"]
+    version_label = "A 现版 / B、C " + bc_version
     blue, green, orange, purple = "#2563eb", "#087f78", "#cb6a22", "#8759b4"
     catalog = []
     def rows(ds): return data["datasets"][ds]["rows"]
@@ -326,7 +328,7 @@ def render(data, output):
     for key, label, color in (("nasa_over", "高估惩罚", purple), ("nasa_under", "低估惩罚", orange)):
         line(axes[1,1], np.array(series("C", key)) / 1e9, label, color)
     axes[1,1].legend(); axes[1,1].set_title("C · 惩罚方向分解"); style(axes[1,1], "NASA / 十亿")
-    finish(fig, "05-c-errors", "C：RMSE、MAE、NASA 与尾部误差", "V18 仅以原 RMSE/MAE 门槛选版；NASA 可能在 RMSE 改善时恶化，曲线保留真实变化。NASA 仅在相同 23,049 条验证样本上比较。")
+    finish(fig, "05-c-errors", "C：RMSE、MAE、NASA 与尾部误差", ("xiaoyang 同时检查 NASA、高估 P99 和最差工况。" if bc_version == "xiaoyang" else "V18 仅以原 RMSE/MAE 门槛选版；NASA 可能在 RMSE 改善时恶化。") + "曲线保留真实变化；NASA 仅在相同验证样本上比较。")
     fig, axes = plt.subplots(2, 2, figsize=(14, 8), layout="constrained")
     for row_index, ds in enumerate("BC"):
         names = list(rows(ds)[0]["metrics"]["groups"])
@@ -404,12 +406,12 @@ def render(data, output):
         table.append(f"<tr><td>{ds}</td><td>{'Macro-F1 ↑' if ds=='A' else 'RMSE ↓'}</td><td>{s['initial_primary']:.6f}</td><td>{s['final_primary']:.6f}</td><td>{s['final_gain']:+.3f} {'百分点' if ds=='A' else '%'}</td><td>{s['adoptions']}/10</td></tr>")
     gallery="".join(f'<section id="{item["name"]}"><h2>{escape(item["title"])}</h2><img src="{item["name"]}.png" alt="{escape(item["title"])}" loading="lazy"><p>{escape(item["note"])}</p><p><a href="{item["name"]}.png">高清 PNG</a> · <a href="{item["name"]}.svg">矢量 SVG</a></p></section>' for item in catalog)
     html='''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>本次新测 · A/B/C 十轮图表</title><style>body{font:16px/1.7 "Microsoft YaHei",sans-serif;color:#182b42;max-width:1260px;margin:auto;padding:24px}h1,h2{font-weight:500}h2{margin-top:38px}a{color:#2456b2}p{color:#4f6076}img{max-width:100%;height:auto}table{border-collapse:collapse;width:100%}td,th{padding:10px;text-align:left;border-bottom:1px solid #dce3ed}section{border-top:1px solid #dce3ed;margin-top:34px}.table{overflow:auto}@media print{section{break-before:page}}</style>'''
-    html+='<h1>本次新测：A 现版 / B、C V18 · 各十轮</h1><p>2026-11-26 · 全部曲线来自此次重新运行的 30 轮；第 0 轮为官方初始检查点，不使用历史结果拼接。离线控制器，真实续训及独立逐条预测，非正式隐藏评分。</p>'
+    html+='<h1>本次新测：'+escape(version_label)+' · 各十轮</h1><p>2026-11-26 · 全部曲线来自此次重新运行的 30 轮；第 0 轮为官方初始检查点，不使用历史结果拼接。离线控制器，真实续训及独立逐条预测，非正式隐藏评分。</p>'
     html+='<div class="table"><table><tr><th>项目</th><th>主指标</th><th>初始</th><th>第 10 轮</th><th>实际提升</th><th>候选采用</th></tr>'+''.join(table)+'</table></div>'
     html+='<p><a href="逐轮指标.csv">逐轮 CSV</a> · <a href="十轮汇总.csv">汇总 CSV</a> · <a href="分组指标.csv">分组 CSV</a> · <a href="A分类指标.csv">分类 CSV</a> · <a href="逐轮指标数据.json">完整指标与来源</a></p>'
     html+='<p>固定公开验证没有阶段切换；本批无法评价正式最差阶段与恢复速度。token usage 和峰值内存缺失，均记未知。各项目并行运行，墙钟仅描述本次环境，不作算法加速或官方资源得分结论。</p>'+gallery+'</html>'
     (output/"index.html").write_text(html,encoding="utf-8")
-    notes="本次新测图表：A 保留现版，B/C 为 V18，各 10 轮。\n所有曲线只使用本次注册运行的独立预测和日志，不使用历史结果。\n打开 index.html 浏览，PNG 为 240 DPI，SVG 可编辑。\nCSV 使用 UTF-8 BOM，可用 Excel 打开。第 0 轮不计入十轮平均。\n离线控制器不等于真实 27B；本机测试不等于比赛容器或隐藏评测。\n候选与实际选中收益分开；缺失 token/内存不填零；固定投影不计算恢复速度。\n"
+    notes="本次新测图表："+version_label+"，各 10 轮。\n所有曲线只使用本次注册运行的独立预测和日志，不使用历史结果。\n打开 index.html 浏览，PNG 为 240 DPI，SVG 可编辑。\nCSV 使用 UTF-8 BOM，可用 Excel 打开。第 0 轮不计入十轮平均。\n离线控制器不等于真实 27B；本机测试不等于比赛容器或隐藏评测。\n候选与实际选中收益分开；缺失 token/内存不填零；固定投影不计算恢复速度。\n"
     (output/"使用说明.txt").write_text(notes,encoding="utf-8")
     return catalog
 
@@ -429,7 +431,8 @@ def verify_and_package(data, catalog, output, reviewed=False):
         "historical_results_used":False,"official_score_verified":False})
     names=[p for p in output.iterdir() if p.is_file() and p.name!="file-manifest.json"]
     write(output/"file-manifest.json",[{"file":p.name,"bytes":p.stat().st_size,"sha256":digest(p)} for p in names])
-    archive=output.parent/"本次新测-ABC十轮图表-20261126.zip"
+    suffix = "-xiaoyang" if data["registration"]["code_versions"]["B"] == "xiaoyang" else ""
+    archive=output.parent/("本次新测-ABC十轮图表"+suffix+"-20261126.zip")
     with zipfile.ZipFile(archive,"w",zipfile.ZIP_DEFLATED,compresslevel=8) as z:
         for p in [*names,output/"file-manifest.json"]:z.write(p,output.name+"/"+p.name)
     with zipfile.ZipFile(archive) as z:assert z.testzip() is None

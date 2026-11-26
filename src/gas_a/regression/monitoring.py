@@ -58,10 +58,10 @@ def monitor(reference, current, train, dataset, thresholds):
             "thresholds": thresholds, "top_features": ordered[:8], "features": ordered}
 
 
-def diagnose(model, validation, reference, metrics, drift):
+def diagnose(model, validation, reference, metrics, drift, *, prediction=None):
     # 只有授权公开 validation 的标签参与误差诊断，不向隐藏预测过程索取真实标签。
     # 寿命分组边界来自 train 的 25%/50%/75% 分位点，避免每轮更换分组后无法对比。
-    error = model.predict(validation["x"]) - validation["y"]
+    error = (model.predict(validation["x"]) if prediction is None else prediction) - validation["y"]
     cuts = np.asarray(reference["target_cuts"], dtype=float)
     if cuts.ndim != 1 or not np.isfinite(cuts).all() or np.any(np.diff(cuts) <= 0):
         raise ValueError("Invalid training-origin RUL diagnosis cut points")

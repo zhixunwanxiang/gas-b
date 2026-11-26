@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import shutil
 import numpy as np
 from contest_harness.errors import HarnessError
 from .data import UNITS, input_values, load_model, load_pair
@@ -66,6 +67,14 @@ def validate_config(config, limits):
                 or type(spec["freeze_features"]) is not bool or spec["loss"] not in ("mse", "huber")):
             raise ValueError("Invalid bounded regression experiment")
         names.add(spec["name"])
+        if "positive_scale" in spec and (spec.get("tree_update") != "C" or
+                type(spec["positive_scale"]) not in (int,float) or not 0 < spec["positive_scale"] <= 1):
+            raise ValueError("Positive residual shrinkage requires a bounded engine tree update")
+        if "tree_update" in spec and (spec.get("dataset") not in ("B","C") or spec["tree_update"] != spec["dataset"]
+                or spec["epochs"] != 1 or spec.get("residual_mode")):
+            raise ValueError("Invalid bounded tree continuation")
+        if "residual_mode" in spec and (spec.get("dataset") != "C" or spec["residual_mode"] != "condition"):
+            raise ValueError("Condition residuals require the C engine profile")
 
 
 def _policy(state, dataset, menu):
@@ -135,6 +144,28 @@ def _history_view(history):
                            "validation_before", "validation_after", "candidate_gate", "host_candidate_gate",
                            "experiment_failure", "selected_local_rmse") if key in config}}, context="regression_history_view"))
     return result
+
+
+def planning_history(history, parent_sha, train_sha, validation_sha):
+    rows = []
+    for entry in _history_view(history):
+        cfg = entry["configuration"]
+        spec = cfg.get("experiment")
+        gate = cfg.get("candidate_gate")
+        host_gate = cfg.get("host_candidate_gate")
+        before, after = cfg.get("validation_before"), cfg.get("validation_after")
+        rows.append({"id": entry["id"], "selected_artifact_id": entry["selected_artifact_id"],
+                     "experiment": spec.get("name") if isinstance(spec, dict) else None,
+                     "same_parent": cfg.get("parent_checkpoint_sha256") == parent_sha,
+                     "same_train": cfg.get("train_sha256") == train_sha,
+                     "same_validation": cfg.get("validation_sha256") == validation_sha,
+                     "before_rmse": before.get("rmse") if isinstance(before, dict) else None,
+                     "after_rmse": after.get("rmse") if isinstance(after, dict) else None,
+                     "local_gate": gate,
+                     "host_gate": {k:host_gate[k] for k in ("eligible","reason") if k in host_gate}
+                                  if isinstance(host_gate, dict) else None,
+                     "failure": cfg.get("experiment_failure"), "reason": entry["reason"][:160]})
+    return rows
 
 
 def _restore_history(rnd, history, run, validation, before, rules, dataset):
@@ -208,20 +239,36 @@ def train(rnd):
         train_data, validation = load_pair(rnd.data.train_path, rnd.data.validation_path, dataset)
     with stage("evaluate_parent", dataset=dataset):
         parent = load_model(checkpoint, dataset, train_data["paths"])
-        before = evaluate(parent, validation, dataset)
+        parent_prediction = parent.predict(validation["x"])
+        before = evaluate(parent, validation, dataset, prediction=parent_prediction)
     with stage("validate_parent_measurement", dataset=dataset):
         parent_host = current_parent_reference(rnd, checkpoint, before, validation["sha256"])
     with stage("history_rpc", dataset=dataset):
         history = rnd.history()
     state = rnd.state_workspace(run / "state")
+    if dataset == "B":
+        anchor = state / "bearing_origin.npz"
+        receipt = state / "bearing_origin.sha256"
+        if not anchor.exists() and not receipt.exists():
+            shutil.copyfile(checkpoint, anchor)
+            receipt.write_text(digest(checkpoint),encoding="ascii")
+            write_json(state / "bearing_origin_context.json", {"scope": "first_actual_parent_seen_by_xiaoyang_code",
+                "round_index": rnd.round_index, "artifact_id": rnd.parent.artifact_id,
+                "checkpoint_sha256": digest(checkpoint)})
+        if anchor.exists() or receipt.exists():
+            if not anchor.is_file() or not receipt.is_file() or digest(anchor) != receipt.read_text(encoding="ascii"):
+                raise ValueError("Invalid bearing origin anchor")
+            if "groups" in validation:
+                validation["baseline_groups"] = evaluate(load_model(anchor,dataset), validation,dataset)["groups"]
+                before["baseline_groups"] = validation["baseline_groups"]
     reference_path = state / "regression_monitor_reference.json"
     # 阶段 3：首轮只从 train 建立监测参考；后续校验其来源和结构，保持最初的比较口径。
     # 平台可以更新公开 train，不能因此重拟合父模型 scaler，也不能把合法新投影判成状态损坏。
     # monitor 看输入变没变，diagnose 看公开标签上的误差分段；二者一起给出可验证的实验线索。
     reference = json.loads(reference_path.read_text(encoding="utf-8")) if reference_path.exists() else fit_reference(train_data, dataset)
     drift = monitor(reference, validation, train_data, dataset, full_config["controller"]["drift_thresholds"])
-    diagnosis = diagnose(parent, validation, reference, before, drift)
-    menu = {spec["name"]: spec for spec in config["experiments"]}
+    diagnosis = diagnose(parent, validation, reference, before, drift, prediction=parent_prediction)
+    menu = {spec["name"]: spec for spec in config["experiments"] if spec.get("dataset", dataset) == dataset}
     policy = _policy(state, dataset, menu)
     # 阶段 4：策略必须与本轮实际父模型配对；换了父产物却没有对应策略时，偏好恢复为初值。
     paired = policy["artifact_policies"].get(rnd.parent.artifact_id)
@@ -235,6 +282,9 @@ def train(rnd):
                  "parent_reference_policy_version": PARENT_REFERENCE_VERSION,
                  "monitor_reference_policy": "fixed_initial_training_projection-v1"}
     allowed, blocked = available_experiments(policy, menu, rnd, train_data, validation, rules, execution)
+    from .composite import MAX_LAYERS
+    allowed = {k:v for k,v in allowed.items() if not v.get("tree_update") or (
+        len(parent.tree_layers) < MAX_LAYERS[dataset] and (dataset != "B" or "baseline_groups" in validation))}
     admission_blocker = None
     if not parent_host["comparable"]:
         # 不可核验的父测量使本轮任何候选都不能上线；直接观察并留证，避免重复消耗训练预算。
@@ -270,7 +320,8 @@ def train(rnd):
                "parent_artifact_id": rnd.parent.artifact_id, "validation_before": before,
                "parent_host_reference": parent_host,
                "admission_blocker": admission_blocker,
-               "history": _history_view(history), "experiments": allowed, "strategy": {
+               "history": planning_history(history, rnd.parent.checkpoint_sha256, train_data["sha256"], validation["sha256"]),
+               "experiments": allowed, "strategy": {
                    "version": policy["version"], "preferred_experiment": policy["preferred_experiment"],
                    "blocked_repeated_experiments": blocked},
                "monitoring": {k: v for k, v in drift.items() if k != "features"}, "diagnosis": diagnosis,

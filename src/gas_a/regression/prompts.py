@@ -1,5 +1,5 @@
 """显式区分当前父模型与历史版本；动作、目标和训练起点必须保持一致。"""
-VERSION = "rul-bc-controller-zh-v4"
+VERSION = "rul-bc-controller-zh-v7-xiaoyang-port1"
 # 提示词版本也进入实验身份，防止已修复的动作说明与旧失败实验被当作完全相同的上下文。
 
 
@@ -25,27 +25,18 @@ def plan_contract(parent_id, before, restored, rollback_ids, experiments):
 
 
 PLAN_INSTRUCTION = (
-    "你是工业剩余寿命回归实验规划者。先读当前身份表和实测分数，再读历史成败、漂移与误差证据。"
-    "actual_current_parent/parent_artifact_id是本轮唯一正在使用的父模型，历史最佳版本不是当前父模型。"
-    "必须逐项选择plan_contract.valid_plan_combinations中的一个完整组合，不能把不同组合的字段混搭。"
-    "observe规划目标必须是当前父模型且本轮不训练；experiment只能从当前父模型续训。规划rollback时experiment=none，本轮不训练，下一轮才从平台实际选中的版本续训。"
-    "最终选版可独立选择本轮已复评合格且在允许列表中的历史版本，不要求规划预先声明rollback，不能把历史ID冒充本轮训练父模型。"
-    "历史项已在同一当前公开验证集重新测量且gate合格时，应直接比较这些实测RMSE；若历史明显优于当前父模型，优先考虑恢复历史版本。"
-    "不能把observe称为保留历史最佳，也不能凭空声称当前父模型就是某个历史ID、把已核验的模型退化解释成未经证实的数据异常。"
-    "RMSE越低越好，MAE是辅助保护，C另记录NASA分数。菜单定义决定是否冻结特征，不能因父版本曾冻结就说它以后不能解冻。"
-    "未采用的历史候选没有成为父模型，不能把再次从相同父权重运行同一方案描述为累积续训；应结合失败次数选择其他允许方案。"
-    "只有明确性能不合格或本地训练失败计入拒绝上限；测量未核验、选版program_guard或另选合格模型不能直接当作训练方案无效。"
-    "parent_host_reference若来自local_current_parent_public_reevaluation，表示当前父权重在本轮公开验证集独立实测，"
-    "host_reference仅保留缺少身份字段的旧宿主摘要；不能再把该摘要的unknown_validation_scope误认为当前父参考不可比。"
-    "admission_blocker非空时应observe并说明阻塞原因，不反复申请无法上线的训练。bias为预测减真实，负数是低估，正数是高估。"
-    "只用公开train更新梯度，validation只评估选版；不使用id/meta/隐藏标签，不重置父权重、Adam或缩放。"
-    "reason说明当前父ID/实测RMSE、拟选版本/实测依据及风险，hypothesis写可验证假设，只返回规定JSON字段。"
+    "历史最佳版本不是当前父模型；只能选择plan_contract.valid_plan_combinations中的完整组合。"
+    "根据validation_before、寿命段误差、工况、历史拒绝原因与算力预算，选择plan_contract允许的完整组合。"
+    "observe与experiment指向当前父；rollback仅用本轮复评合格的历史，下轮才从所选模型训练。"
+    "同条件下被明确拒绝的方案应尝试不同机制；不可比或另选合格产物不能作为性能失败。"
+    "B若误差随振动特征或寿命段显著变化，可优先试bearing_tree_mix的原尺度和对数树融合；检查每根轴承相对父与起点的误差。"
+    "C若多工况偏差明显，可试engine_cumulative_tree的有界残差；若正向修正使高估P99恶化，可试engine_tail_tree保留向下修正、减半向上修正。"
+    "根据测量给假设和风险，不保证收益。bias为预测减真实。admission_blocker存在时观察。"
+    "仅用公开train拟合，禁止使用隐藏答案、id或meta作特征。保留父权重、Adam和缩放。只返回规定JSON。"
 )
 
 SELECT_INSTRUCTION = (
-    "按当前同一公开验证集的RMSE（越低越好）选择response_schema允许列表中的版本，同分保留实际父模型。"
-    "父模型身份由parent_artifact_id决定，不由历史最优分数决定；新候选必须同时通过本地和宿主门槛。"
-    "无论规划action为何，本轮均可选择已获SDK授权、本轮复评达标且在允许列表中的历史模型，无需规划预先声明rollback。"
-    "历史选择资格由historical_admission与当前复评决定；没有新候选回执或新候选被拒绝不代表历史不合格，不能选择未经本轮核验的历史ID。"
-    "reason必须与最终ID及实测分数一致，不把保留故障父模型称为恢复历史模型。只返回规定JSON。"
+    "合格历史版本无需规划预先声明rollback也可最终选择，但不能选择未经本轮核验的历史ID。"
+    "从response_schema的允许ID中，比较同一公开验证上的当前父、候选和重新评估的历史，选择合格且RMSE较低者；同分保留父。"
+    "候选须通过本地与宿主门槛。历史资格独立，见historical_admission。参考MAE、分组与尾部门槛，在reason中写实际差值与选择理由。只返回规定JSON。"
 )

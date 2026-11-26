@@ -1,4 +1,4 @@
-"""Fresh A-current / B,C-V18 SDK rounds from official initial checkpoints, no old results."""
+"""Fresh A/B/C SDK rounds using the active menu, official initial parents and empty state."""
 import argparse
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -35,7 +35,9 @@ def main():
         output.mkdir(parents=True, exist_ok=False)
         config = json.loads((ROOT / "submission_config.json").read_text(encoding="utf-8"))
         menu = [s["name"] for s in config["regression"]["experiments"]]
-        assert menu == ["low_rate", "standard_rate", "head_only", "robust_huber"]
+        is_xiaoyang = any(s.get("tree_update") for s in config["regression"]["experiments"])
+        if not is_xiaoyang:
+            assert menu == ["low_rate", "standard_rate", "head_only", "robust_huber"]
         sources = [*sorted((ROOT / "src").rglob("*.py")), ROOT / "contest_submission.py", ROOT / "harness.py",
                    ROOT / "submission_config.json", ROOT / "scripts/validate_multitask.py", Path(__file__).resolve()]
         sources += [ROOT / name for name in ("tests/test_submission.py", "tests/test_regression.py", "scripts/validate_platform.py")]
@@ -46,12 +48,15 @@ def main():
                 ("checkpoint.npz", "baseline-info.json", "public/train.jsonl", "public/validation.jsonl")}}
         write(registration, {"scope": "fresh_native_offline_sdk_numeric_test", "created_at": datetime.now(timezone(timedelta(hours=8))).isoformat(),
             "timezone": "Asia/Shanghai", "code_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
-            "code_versions": {"A": "current; preserved at rollback", "B": "V18", "C": "V18"},
+            "code_versions": {"A": "current; preserved", "B": "xiaoyang" if is_xiaoyang else "V18", "C": "xiaoyang" if is_xiaoyang else "V18"},
             "sources_sha256": {p.relative_to(ROOT).as_posix(): digest(p) for p in sources},
             "inputs": inputs, "configuration": config, "rounds_per_dataset": 10,
             "experiment_sequences": {"A": ["frozen_router", "frozen_router", "conservative_head", "frozen_router", "conservative_head",
                 "four_sensor", "conservative_head", "five_sensor", "conservative_head", "frozen_router"],
-                "B": (menu * 3)[:10], "C": (menu * 3)[:10]},
+                "B": (["bearing_tree_mix", "robust_huber", "bearing_tree_mix", "robust_huber", "standard_rate",
+                       "head_only", "robust_huber", "low_rate", "robust_huber", "low_rate"] if is_xiaoyang else (menu * 3)[:10]),
+                "C": (["engine_tail_tree", "engine_cumulative_tree", "engine_tail_tree", "robust_huber", "condition_residual",
+                       "engine_tail_tree", "engine_cumulative_tree", "engine_tail_tree", "engine_cumulative_tree", "standard_rate"] if is_xiaoyang else (menu * 3)[:10])},
             "controller": "explicit_offline_stub; no provider calls", "real_model_calls": 0,
             "initial_state": "empty per dataset; official initial checkpoint only", "historical_results_used": False,
             "runtime": "native Windows Python; one numerical thread per process; datasets may run concurrently",

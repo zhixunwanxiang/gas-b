@@ -29,7 +29,11 @@
       {"name": "low_rate", "learning_rate": 0.0003, "epochs": 3, "freeze_features": false, "loss": "mse"},
       {"name": "standard_rate", "learning_rate": 0.001, "epochs": 6, "freeze_features": false, "loss": "mse"},
       {"name": "head_only", "learning_rate": 0.0005, "epochs": 4, "freeze_features": true, "loss": "mse"},
-      {"name": "robust_huber", "learning_rate": 0.0003, "epochs": 5, "freeze_features": false, "loss": "huber"}
+      {"name": "robust_huber", "learning_rate": 0.0003, "epochs": 5, "freeze_features": false, "loss": "huber"},
+      {"name": "condition_residual", "dataset": "C", "learning_rate": 0.001, "epochs": 6, "freeze_features": false, "loss": "mse", "residual_mode": "condition"},
+      {"name":"bearing_tree_mix","dataset":"B","tree_update":"B","epochs":1,"learning_rate":0.00001,"freeze_features":true,"loss":"mse"},
+      {"name":"engine_cumulative_tree","dataset":"C","tree_update":"C","epochs":1,"learning_rate":0.00001,"freeze_features":true,"loss":"mse"},
+      {"name":"engine_tail_tree","dataset":"C","tree_update":"C","positive_scale":0.5,"epochs":1,"learning_rate":0.00001,"freeze_features":true,"loss":"mse"}
     ]
   },
   "experiments": [

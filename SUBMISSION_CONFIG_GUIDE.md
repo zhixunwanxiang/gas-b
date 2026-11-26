@@ -1,5 +1,9 @@
 # submission_config.json 参数与实际代码逻辑
 
+**当前分支 `codex/xiaoyang-bc`：A 保留现版，B/C 使用 xiaoyang 菜单。** 共享 `low_rate`、`standard_rate`、`head_only`、`robust_huber` 保留，新增仅 B 可见的 `bearing_tree_mix`，以及仅 C 可见的 `condition_residual`、`engine_cumulative_tree`、`engine_tail_tree`。树方案执行 1 个真实神经 epoch、学习率 `0.00001`、冻结隐藏层，随后在 train 上拟合新层；原 Adam、缩放、种子和计数继续继承。B 最多 2 个融合层、C 最多 5 个累计层；候选函数从加载父模型开始计时，拟合、验证和导出共同受 30 秒限制。原始数据读取、RPC 和宿主独立测量另计整轮耗时。
+
+B 保留原版相对当前父模型及首个实际父模型的分组保护，默认允许单组 RMSE 增加最多 15%，这是 xiaoyang 的研发参数，不是官方规定。C 同时保护 NASA、高估误差 P99、最差工况组和原 RMSE/MAE 条件。起点文件由 SDK 实际父产物建立并核验；从已有任务中途切换时明确记录为本代码首次看到的父模型，不能冒称官方初始模型。完整说明见 [接入记录](docs/XIAOYANG_BC_INTEGRATION_20261126.md)。以下 V18 回退段落描述 main，后续 v19/v20/v21 段落保留历史含义。
+
 **2026-11-26 当前状态：A 保留现版，B/C 已恢复 V18。** 当前 `regression` 块与 V18 `9ab6a59` 完全一致，仅包含 `low_rate`、`standard_rate`、`head_only`、`robust_huber` 四项共享菜单，预算为最多 8 epoch、30 秒，恢复 V18 的 RMSE/MAE 准入规则。下文标为 v19/v20/v21 的 B/C 扩展是历史说明，当前已撤下；A 的现有完整专家包续训、逐 epoch 选版和资源/实验证据机制继续保留。精确回退范围见 [回退记录](docs/BC_V18_A_CURRENT_20261126.md)。
 
 本文对应当前项目根目录的 `submission_config.json`。原A分类部分共72个参数路径；v5新增的B/C回归参数在下面单独说明。数组中的传感器号、权重候选等作为一个参数整体说明，重复的训练参数含义相同。

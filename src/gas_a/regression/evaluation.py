@@ -8,10 +8,11 @@ from ..parent_checkpoint import verify_selected_checkpoint
 PARENT_REFERENCE_VERSION = "current-parent-public-reevaluation-v2"
 
 
-def evaluate(model, data, dataset):
+def evaluate(model, data, dataset, *, prediction=None):
     # Model.predict 已把标准化输出还原到原单位；这里直接计算分钟/循环上的误差。
     # 正 bias 表示寿命被高估，overestimate_fraction 表示高估样本占比，供诊断使用。
-    prediction = model.predict(data["x"])
+    if prediction is None:
+        prediction = model.predict(data["x"])
     if prediction.shape != data["y"].shape or not np.isfinite(prediction).all() or np.any(prediction < 0):
         raise ValueError("Regression predictions must be finite nonnegative values")
     error = prediction - data["y"]
@@ -28,6 +29,12 @@ def evaluate(model, data, dataset):
         # 极端高估可能导致指数溢出：如实记录 None 和溢出标志，不截断后另报较小分数。
         result.update(nasa_score=score if math.isfinite(score) else None,
                       nasa_score_overflow=not math.isfinite(score))
+        result["p99_overestimate"] = float(np.quantile(np.maximum(0,error), .99))
+    if "groups" in data:
+        g = data["groups"]
+        result["groups"] = {str(k):float(np.sqrt(np.mean(error[g==k]**2))) for k in np.unique(g)}
+    if dataset == "B" and getattr(model, "tree_layers", None):
+        result["requires_bearing_origin"] = True
     return result
 
 
@@ -38,7 +45,25 @@ def promotion_gate(before, after, rules):
     # 绝对收益和相对收益取较严者：默认相对 0.0005 即误差至少降低 0.05%。
     # 还要满足 MAE 最多相对增加 2% 的默认保护；NASA 只记录，不在此处作为硬门槛。
     mae_limit = before["mae"] * (1 + rules["maximum_mae_relative_increase"])
-    return {"eligible": bool(gain > 1e-12 and gain >= required and after["mae"] <= mae_limit + 1e-12),
+    group_losses = []
+    missing_origin = False
+    if before.get("requires_bearing_origin") or after.get("requires_bearing_origin"):
+        keys = set(before.get("groups",{}))
+        missing_origin = not keys or keys != set(after.get("groups",{})) or keys != set(before.get("baseline_groups",{}))
+    for g, old in before.get("groups", {}).items():
+        limit = (1+rules.get("max_group_regression", .15))*min(old,before.get("baseline_groups",{}).get(g,old))
+        if after.get("groups",{}).get(g,float("inf")) > limit + 1e-9:
+            group_losses.append(g)
+    tail_ok = True
+    if "p99_overestimate" in before:
+        nasa = after.get("nasa_score")
+        tail_ok = (nasa is not None and (before["nasa_score"] is None or nasa <= before["nasa_score"]+1e-6)
+                   and after.get("p99_overestimate",float("inf")) <= before["p99_overestimate"]+1e-8)
+        if before.get("groups"):
+            tail_ok = tail_ok and max(after["groups"].values()) <= max(before["groups"].values())+1e-9
+    return {"eligible": bool(gain > 1e-12 and gain >= required and after["mae"] <= mae_limit + 1e-12 and not group_losses and tail_ok and not missing_origin),
+            "origin_groups_missing":bool(missing_origin),
+            "group_vetoes":group_losses, "tail_gate_passed":bool(tail_ok),
             "rmse_reduction": gain, "required_rmse_reduction": required, "mae_limit": mae_limit}
 
 

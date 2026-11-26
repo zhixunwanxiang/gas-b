@@ -1,8 +1,10 @@
 """只读取授权投影；严格沿用官方特征顺序，不把 id/meta 或寿命信息当成输入。"""
 from functools import lru_cache
+import json
 import math
+from pathlib import Path
+import numpy as np
 from ..sensor_training.reference.data import flatten, read_dataset
-from ..sensor_training.reference.model import Model
 
 
 BEARING_FEATURES = (
@@ -72,7 +74,8 @@ def input_values(inputs, dataset=None):
 def load_model(path, dataset, paths=None):
     # 权重文件自身包含任务、数据集 profile、特征路径和目标缩放。
     # 即使 B/C 都输出一个数，也不能把“分钟”的模型直接拿去预测“循环数”。
-    model = Model.load(path)
+    from .composite import BearingPredictor, EnginePredictor
+    model = (EnginePredictor if dataset == "C" else BearingPredictor).load(path)
     if (model.meta["task"] != "regression" or model.meta.get("profile") != dataset
             or model.meta["paths"] != (schema(dataset) if paths is None else paths)):
         raise ValueError("Checkpoint regression profile or feature schema does not match the task")
@@ -86,8 +89,23 @@ def load_model(path, dataset, paths=None):
 def load_pair(train_path, validation_path, dataset):
     # 两份文件分别读取，不把公开验证样本并回训练集；验证标签仅供后续诊断与选版。
     # id 只用于检查投影是否交叉，不进入 x 特征矩阵，也不用于反推寿命。
-    train = read_dataset(train_path, "regression", [], schema(dataset))
-    validation = read_dataset(validation_path, "regression", [], train["paths"])
+    def extract(inputs):
+        _, paths, values = input_values(inputs, dataset)
+        return paths, values
+
+    train = read_dataset(train_path, "regression", [], schema(dataset), validate_inputs=extract)
+    validation = read_dataset(validation_path, "regression", [], train["paths"], validate_inputs=extract,
+                              metadata_fields=("bearing",) if dataset == "B" else ())
     if set(train["ids"]) & set(validation["ids"]):
         raise ValueError("Public training and validation sample IDs overlap")
+    if dataset == "B":
+        groups = validation["metadata"]["bearing"]
+        if all(isinstance(g,str) and g for g in groups):
+            validation["groups"] = np.asarray(groups)
+    else:
+        from .engine import centers_from_train, assign
+        tx = train["x"][:,21:]
+        center, scale = tx.mean(0), np.maximum(tx.std(0),1e-7)
+        clusters = centers_from_train((tx-center)/scale, 42)
+        validation["groups"] = assign((validation["x"][:,21:]-center)/scale, clusters)
     return train, validation

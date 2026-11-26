@@ -64,19 +64,28 @@ def continue_candidate(checkpoint, train, validation, output, spec, limits, rule
     # 训练在加载后的内存副本上进行，original 留作继承关系核验，不修改父文件。
     if digest(checkpoint) != expected_sha:
         raise ValueError("Regression parent checkpoint digest changed")
+    deadline = time.monotonic() + limits["max_seconds_per_candidate"]
     model = load_model(checkpoint, dataset, train["paths"])
     original = deepcopy(model)
     model.meta["learning_rate"] = spec["learning_rate"]
     model.validate()
     before = evaluate(model, validation, dataset)
+    if "baseline_groups" in validation:
+        before["baseline_groups"] = validation["baseline_groups"]
     output = Path(output)
     output.mkdir()  # 候选目录必须全新，不覆盖父产物或之前实验。
-    deadline = time.monotonic() + limits["max_seconds_per_candidate"]
     best, best_metrics, best_eligible, stale = None, None, False, 0
     executed = 0
     for _ in range(min(spec["epochs"], limits["max_epochs"])):
         loss = fit_epoch(model, train, spec, deadline)
+        if spec.get("tree_update"):
+            from .tree_training import fit_layer
+            fit_layer(model, train, dataset, deadline, spec.get("positive_scale", 1.))
+        if spec.get("residual_mode") and not executed:
+            model.update_residual(train, spec["residual_mode"])
         metric = evaluate(model, validation, dataset)
+        if time.monotonic() >= deadline:
+            raise TimeoutError("Regression candidate exceeded its training and measurement budget")
         gate = promotion_gate(before, metric, rules)
         # 先在可上线的 epoch 中选 RMSE 最低者；全部不合格时仍保留真实训练结果供拒绝和归档。
         better = (best is None or (gate["eligible"] and not best_eligible)
@@ -95,6 +104,12 @@ def continue_candidate(checkpoint, train, validation, output, spec, limits, rule
     if best is None:
         raise ValueError("No completed regression epoch")
     best.save(output / "checkpoint.npz")
+    roundtrip = load_model(output / "checkpoint.npz", dataset, train["paths"])
+    probe = validation["x"][:min(32,len(validation["x"]))]
+    if not np.allclose(roundtrip.predict(probe), best.predict(probe), rtol=1e-10, atol=1e-9):
+        raise ValueError("Regression artifact round-trip prediction mismatch")
+    if time.monotonic() >= deadline:
+        raise TimeoutError("Regression export and round-trip check exceeded candidate budget")
     # selected_epoch/final_steps 属于导出的最佳状态；executed_* 属于实际尝试到的末尾状态。
     # 两者可能不同，因此同时留档，不能把“执行过更多轮”写成选中模型的累计轮数。
     report = {"dataset": dataset, "task": "regression", "parent_checkpoint_sha256": expected_sha,
@@ -109,6 +124,21 @@ def continue_candidate(checkpoint, train, validation, output, spec, limits, rule
                          "input_scaler_preserved": bool(np.array_equal(best.mean, original.mean) and np.array_equal(best.scale, original.scale)),
                          "target_scaler_preserved": all(best.meta[k] == original.meta[k] for k in ("target_mean", "target_scale")),
                          "actual_continuation": best.meta["steps"] > original.meta["steps"]}}
+    old_bundle, new_bundle = original.meta.get("rul_tree_bundle_v1"), roundtrip.meta.get("rul_tree_bundle_v1")
+    old_layers = old_bundle["layers"] if old_bundle else []
+    new_layers = new_bundle["layers"] if new_bundle else []
+    expected_added = executed if spec.get("tree_update") else 0
+    # selected_epoch may precede the final executed epoch. Tree menus are one epoch.
+    report["checks"]["existing_tree_layers_preserved"] = new_layers[:len(old_layers)] == old_layers
+    report["checks"]["bounded_tree_continuation"] = len(new_layers) == len(old_layers) + expected_added
+    if old_bundle and dataset == "C":
+        report["checks"]["cumulative_anchor_and_radius_preserved"] = all(new_bundle[k] == old_bundle[k] for k in ("anchor", "radius"))
+    if not spec.get("residual_mode"):
+        report["checks"]["existing_engine_residual_preserved"] = roundtrip.meta.get("rul_residual_v1") == original.meta.get("rul_residual_v1")
+    report["checks"]["parent_file_unchanged"] = digest(checkpoint) == expected_sha
+    report.update(predictor_format=roundtrip.meta["format"], tree_layers_before=len(old_layers), tree_layers_after=len(new_layers),
+                  predictor_scope="complete_xiaoyang_regression_predictor",
+                  format_migration={"from": original.meta["format"], "to": roundtrip.meta["format"]})
     if not all(report["checks"].values()):
         raise ValueError("Regression continuation state was not preserved")
     # 与三份官方续训指南的结果目录保持一致；两份报告来自同一个对象，不另算或美化成绩。
