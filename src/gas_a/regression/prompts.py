@@ -1,5 +1,5 @@
 """显式区分当前父模型与历史版本；动作、目标和训练起点必须保持一致。"""
-VERSION = "rul-bc-controller-zh-v6"
+VERSION = "rul-bc-controller-zh-v8"
 # 提示词版本也进入实验身份，防止已修复的动作说明与旧失败实验被当作完全相同的上下文。
 
 
@@ -33,7 +33,14 @@ PLAN_INSTRUCTION = (
     "历史项已在同一当前公开验证集重新测量且gate合格时，应直接比较这些实测RMSE；若历史明显优于当前父模型，优先考虑恢复历史版本。"
     "不能把observe称为保留历史最佳，也不能凭空声称当前父模型就是某个历史ID、把已核验的模型退化解释成未经证实的数据异常。"
     "RMSE越低越好，MAE是辅助保护，C另记录NASA分数。菜单定义决定是否冻结特征，不能因父版本曾冻结就说它以后不能解冻。"
-    "B的underestimate_mild对train中的负残差加权1.25，适用于已测得的低估；它可能增加短寿命高估，须同时检查分段偏差和MAE。C的fine_rate是小步续训，不是统一抬高预测值。"
+    "B优先检验有证据的balanced_short与同预算low_rate；设备字段仅用于train权重和评测，不进入预测。underestimate_mild是研究候选，未开放时不得选择。"
+    "C先用fine_short；tail_short是研究候选，未开放时不得选择。尾部权重阈值只来自train的父残差，不统一抬高预测、不截断真实寿命。"
+    "先使用2至3epoch的短菜单检验假设，再根据已测收益选择允许的完整预算方案；不能临时扩预算。"
+    "原RMSE门槛保留，逐epoch、新候选及历史都需通过分组、MAE保护；C同时约束NASA和P99，阶段参考用于累计退化保护。"
+    "group_evaluation.source=train_input_proxy只代表输入代理分组，不能声称已通过真实设备保护。"
+    "stage_reference.scope_kind=data_projection_event不是正式阶段；没有正式阶段证据不能声称恢复速度已改善。"
+    "cached_identical_evaluation是通过身份核验的旧测量，不能称为本轮重新预测；数据或实现变化必须实测。"
+    "observe且只有实际父模型一个合格选择时，本次真实规划决定也作为最终保留决定，reason须明确保留实际父ID。"
     "未采用的历史候选没有成为父模型，不能把再次从相同父权重运行同一方案描述为累积续训；应结合失败次数选择其他允许方案。"
     "experiment_evidence逐方案区分当前父权重、train、validation、参数和执行策略完全相同的尝试。"
     "completed_identical_rejection为true表示该固定条件下已完成且性能失败，程序会屏蔽重复数值实验；数据、父模型或执行规则改变后可重新验证。"
@@ -43,7 +50,7 @@ PLAN_INSTRUCTION = (
     "parent_host_reference若来自local_current_parent_public_reevaluation，表示当前父权重在本轮公开验证集独立实测，"
     "host_reference仅保留缺少身份字段的旧宿主摘要；不能再把该摘要的unknown_validation_scope误认为当前父参考不可比。"
     "admission_blocker非空时应observe并说明阻塞原因，不反复申请无法上线的训练。bias为预测减真实，负数是低估，正数是高估。"
-    "只用公开train更新梯度，validation只评估选版；不使用id/meta/隐藏标签，不重置父权重、Adam或缩放。"
+    "只用公开train更新梯度，validation只评估选版；id/meta不作预测特征，不获取隐藏标签，不重置父权重、Adam或缩放。"
     "reason说明当前父ID/实测RMSE、拟选版本/实测依据及风险，hypothesis写可验证假设，只返回规定JSON字段。"
 )
 

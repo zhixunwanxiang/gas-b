@@ -9,11 +9,47 @@ from .evaluation import evaluate, promotion_gate
 from ..sensor_training.io import append_jsonl, digest, write_json
 
 
-def fit_epoch(model, train, spec, deadline):
-    # 输入与目标都使用父检查点已有的缩放，绝不在验证集上重新拟合 scaler。
-    # 随机顺序由父 seed 和累计 epoch 决定：从同一父状态重放时得到同一批次顺序。
+def prepare_training(model, train, spec):
     x = model.normalized(train["x"])
     target = (train["y"] - model.meta["target_mean"]) / model.meta["target_scale"]
+    weights = np.ones(len(x))
+    evidence = {"mode": spec.get("weighting", "uniform"), "fit_scope": "authorized_train_only"}
+    if spec.get("weighting") == "bearing_sqrt_inverse":
+        labels = train.get("groups")
+        if labels is None:
+            raise ValueError("Balanced training requires documented train groups")
+        _, inverse, counts = np.unique(labels, return_inverse=True, return_counts=True)
+        raw = np.sqrt(len(x) / (len(counts) * counts))
+        lo, hi = 0., 100.
+        for _ in range(60):
+            mid = (lo + hi) / 2
+            if np.sum(counts * np.clip(raw * mid, .5, 2.)) / len(x) < 1:
+                lo = mid
+            else:
+                hi = mid
+        weights = np.clip(raw * ((lo + hi) / 2), .5, 2.)[inverse]
+        evidence.update(group_source=train["grouping"]["source"], groups=len(counts),
+                        group_counts=counts.tolist())
+    elif spec.get("weighting") == "parent_tail":
+        residual = np.abs(model.predict(train["x"]) - train["y"])
+        threshold = float(np.quantile(residual, spec.get("tail_quantile", .9)))
+        weights = np.where(residual >= threshold, spec.get("tail_weight", 2.), 1.)
+        weights /= weights.mean()
+        evidence.update(threshold=threshold, quantile=spec.get("tail_quantile", .9),
+                        tail_rows=int(np.count_nonzero(residual >= threshold)),
+                        parent_steps=model.meta["steps"])
+    elif spec.get("weighting", "uniform") != "uniform":
+        raise ValueError("Unknown regression weighting")
+    evidence.update(minimum_weight=float(weights.min()), maximum_weight=float(weights.max()),
+                    mean_weight=float(weights.mean()))
+    return {"x": x, "target": target, "weights": weights, "evidence": evidence}
+
+
+def fit_epoch(model, train, spec, deadline, *, prepared=None):
+    # 输入与目标都使用父检查点已有的缩放，绝不在验证集上重新拟合 scaler。
+    # 随机顺序由父 seed 和累计 epoch 决定：从同一父状态重放时得到同一批次顺序。
+    prepared = prepare_training(model, train, spec) if prepared is None else prepared
+    x, target = prepared["x"], prepared["target"]
     rng = np.random.default_rng(np.random.SeedSequence([model.meta["seed"], model.meta["epochs"]]))
     order = rng.permutation(len(x))
     active = ("w2", "b2") if spec["freeze_features"] else ("w1", "b1", "w2", "b2")
@@ -35,11 +71,12 @@ def fit_epoch(model, train, spec, deadline):
         else:
             losses = error ** 2
             delta = (2 * error / len(indices))[:, None]
+        weights = prepared["weights"][indices]
         if spec.get("underestimate_weight", 1.0) != 1.0:
             # 仅根据 train 残差方向加权，预测和验证计算保持原始 RMSE/MAE 定义。
-            weights = np.where(error < 0, spec["underestimate_weight"], 1.0)
-            losses = losses * weights
-            delta = delta * weights[:, None]
+            weights = weights * np.where(error < 0, spec["underestimate_weight"], 1.0)
+        losses = losses * weights
+        delta = delta * weights[:, None]
         total += float(losses.sum())
         gradients = {"w2": hidden.T @ delta, "b2": delta.sum(axis=0)}
         # tanh 隐藏层的导数为 1-hidden**2；整个反向传播只访问 train 的 batch 与标签。
@@ -65,11 +102,14 @@ def fit_epoch(model, train, spec, deadline):
     return total / len(x)
 
 
-def continue_candidate(checkpoint, train, validation, output, spec, limits, rules, dataset, expected_sha):
+def continue_candidate(checkpoint, train, validation, output, spec, limits, rules, dataset, expected_sha,
+                       *, reference=None):
     # 再次核对实际父文件，防止“声明从父模型续训，实际读了固定本机权重”。
     # 训练在加载后的内存副本上进行，original 留作继承关系核验，不修改父文件。
     if digest(checkpoint) != expected_sha:
         raise ValueError("Regression parent checkpoint digest changed")
+    started = time.monotonic()
+    deadline = started + limits["max_seconds_per_candidate"]
     model = load_model(checkpoint, dataset, train["paths"])
     original = deepcopy(model)
     model.meta["learning_rate"] = spec["learning_rate"]
@@ -77,13 +117,15 @@ def continue_candidate(checkpoint, train, validation, output, spec, limits, rule
     before = evaluate(model, validation, dataset)
     output = Path(output)
     output.mkdir()  # 候选目录必须全新，不覆盖父产物或之前实验。
-    deadline = time.monotonic() + limits["max_seconds_per_candidate"]
+    prepared = prepare_training(model, train, spec)
     best, best_metrics, best_eligible, stale = None, None, False, 0
     executed = 0
     for _ in range(min(spec["epochs"], limits["max_epochs"])):
-        loss = fit_epoch(model, train, spec, deadline)
+        loss = fit_epoch(model, train, spec, deadline, prepared=prepared)
         metric = evaluate(model, validation, dataset)
-        gate = promotion_gate(before, metric, rules)
+        if time.monotonic() >= deadline:
+            raise TimeoutError("Regression candidate exceeded its training and measurement budget")
+        gate = promotion_gate(before, metric, rules, reference=reference)
         # 先在可上线的 epoch 中选 RMSE 最低者；全部不合格时仍保留真实训练结果供拒绝和归档。
         better = (best is None or (gate["eligible"] and not best_eligible)
                   or (gate["eligible"] == best_eligible and metric["rmse"] < best_metrics["rmse"]))
@@ -106,6 +148,7 @@ def continue_candidate(checkpoint, train, validation, output, spec, limits, rule
     report = {"dataset": dataset, "task": "regression", "parent_checkpoint_sha256": expected_sha,
               "checkpoint_sha256": digest(output / "checkpoint.npz"), "train_sha256": train["sha256"],
               "validation_sha256": validation["sha256"], "configuration": spec,
+              "weighting_evidence": prepared["evidence"],
               "initial_steps": original.meta["steps"], "final_steps": best.meta["steps"],
               "initial_epochs": original.meta["epochs"], "selected_epoch": best.meta["epochs"],
               "executed_epochs": executed, "executed_final_steps": model.meta["steps"],

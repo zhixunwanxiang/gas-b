@@ -76,7 +76,7 @@ class NonfiniteRuntimeMetadataTest(unittest.TestCase):
             host.write = inject
             state = self.run_peer(host)
             evidence = [json.loads(line) for line in (state / "model-responses.jsonl").read_text(encoding="utf-8").splitlines()]
-            self.assertEqual(len(evidence), 2)
+            self.assertEqual(len(evidence), 2 if dataset == "A" else 1)
             self.assertEqual(host.record["model_call_ids"], host.calls)
             self.assertTrue(all(e["recording_warnings"]["nonfinite_fields"] for e in evidence))
             self.assertTrue(all(e["response"]["optional_diagnostic"] is None for e in evidence))

@@ -124,7 +124,7 @@ class RecoveryCloudTest(unittest.TestCase):
             self.assertTrue(result["requirements_passed"])
             self.assertTrue(result["checks"]["actual_historical_rollback"])
             self.assertTrue(result["checks"]["next_round_uses_complete_restored_artifact"])
-            self.assertEqual(result["real_model_calls"], 4)  # Synthetic receipts, never an actual provider call in these unit tests.
+            self.assertEqual(result["real_model_calls"], 4 if dataset == "A" else 3)  # Synthetic receipts only.
 
     def test_retaining_fault_parent_cannot_be_reported_as_recovery(self):
         result = self.run_recovery("B", retain=True)

@@ -187,7 +187,11 @@ class PolicyHistorySelectionTest(unittest.TestCase):
                 self.assertTrue(request["historical_admission"]["history-good"]["eligible"])
                 self.assertIn("history-good", request["response_schema"]["selected_artifact_id"])
                 if action == "experiment":
-                    self.assertIsNotNone(host.candidate)
+                    if dataset == "A" or not cfg.get("submission_skipped"):
+                        self.assertIsNotNone(host.candidate)
+                    else:
+                        self.assertIsNone(host.candidate)
+                        self.assertFalse(cfg["candidate_gate"]["eligible"])
                     self.assertEqual(cfg["parent_checkpoint_sha256"], parent_sha)
                     self.assertFalse(cfg["host_candidate_gate"]["eligible"])
                 else:
@@ -221,7 +225,11 @@ class PolicyHistorySelectionTest(unittest.TestCase):
             with patch.object(module, "_restore_history", side_effect=stale):
                 record = self.run_peer(host)
             self.assertEqual(host.record["selected_artifact_id"], host.frame["parent_artifact"]["artifact_id"])
-            self.assertEqual(record["selection_calls"]["decision_source"], "program_guard")
+            if dataset == "A":
+                self.assertEqual(record["selection_calls"]["decision_source"], "program_guard")
+            else:
+                self.assertTrue(record["selection_calls"]["selection_reused_plan"])
+                self.assertEqual(len(host.calls), 1)
 
     def test_planning_guard_still_locks_selection_to_actual_parent(self):
         for dataset in "ABC":
@@ -243,7 +251,11 @@ class PolicyHistorySelectionTest(unittest.TestCase):
             self.force_selection(host, "history-good")
             record = self.run_peer(host)
             self.assertEqual(host.record["selected_artifact_id"], host.frame["parent_artifact"]["artifact_id"])
-            self.assertEqual(record["selection_calls"]["decision_source"], "program_guard")
+            if dataset == "A":
+                self.assertEqual(record["selection_calls"]["decision_source"], "program_guard")
+            else:
+                self.assertTrue(record["selection_calls"]["selection_reused_plan"])
+                self.assertEqual(len(host.calls), 1)
             self.assertIsNone(host.candidate)
 
 

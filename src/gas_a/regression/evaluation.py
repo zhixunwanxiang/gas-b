@@ -6,18 +6,20 @@ from ..sensor_training.io import digest
 from ..parent_checkpoint import verify_selected_checkpoint
 
 PARENT_REFERENCE_VERSION = "current-parent-public-reevaluation-v2"
+EVALUATION_VERSION = "rul-group-tail-stage-guards-v1"
 
 
-def evaluate(model, data, dataset):
+def evaluate(model, data, dataset, *, prediction=None):
     # Model.predict 已把标准化输出还原到原单位；这里直接计算分钟/循环上的误差。
     # 正 bias 表示寿命被高估，overestimate_fraction 表示高估样本占比，供诊断使用。
-    prediction = model.predict(data["x"])
+    prediction = model.predict(data["x"]) if prediction is None else np.asarray(prediction)
     if prediction.shape != data["y"].shape or not np.isfinite(prediction).all() or np.any(prediction < 0):
         raise ValueError("Regression predictions must be finite nonnegative values")
     error = prediction - data["y"]
     result = {"rmse": float(np.sqrt(np.mean(error ** 2))), "mae": float(np.mean(np.abs(error))),
               "bias": float(error.mean()), "overestimate_fraction": float(np.mean(error > 0)),
-              "rows": len(error)}
+               "rows": len(error), "dataset": dataset,
+               "absolute_error_p99": float(np.quantile(np.abs(error), .99))}
     if not all(math.isfinite(result[k]) for k in ("rmse", "mae", "bias")):
         raise ValueError("Nonfinite regression measurement")
     if dataset == "C":
@@ -28,18 +30,77 @@ def evaluate(model, data, dataset):
         # 极端高估可能导致指数溢出：如实记录 None 和溢出标志，不截断后另报较小分数。
         result.update(nasa_score=score if math.isfinite(score) else None,
                       nasa_score_overflow=not math.isfinite(score))
+        with np.errstate(over="ignore"):
+            penalties = np.expm1(exponent)
+        for name, mask in (("over", error >= 0), ("under", error < 0)):
+            value = float(penalties[mask].sum())
+            result["nasa_" + name] = value if math.isfinite(value) else None
+    labels = data.get("groups")
+    if labels is not None:
+        groups = {}
+        for label in np.unique(labels):
+            values = error[labels == label]
+            groups[str(label)] = {"rows": len(values), "rmse": float(np.sqrt(np.mean(values ** 2))),
+                                  "mae": float(np.abs(values).mean())}
+        result["group_evaluation"] = {**data["grouping"], "groups": groups,
+            "mean_rmse": float(np.mean([v["rmse"] for v in groups.values()])),
+            "worst_rmse": max(v["rmse"] for v in groups.values())}
     return result
 
 
-def promotion_gate(before, after, rules):
+def promotion_gate(before, after, rules, *, reference=None):
     # 改善量为 父 RMSE - 新 RMSE；分钟和循环分别比较，不把它们转成分类百分点。
     gain = before["rmse"] - after["rmse"]
     required = max(rules["minimum_rmse_absolute_gain"], before["rmse"] * rules["minimum_rmse_relative_gain"])
     # 绝对收益和相对收益取较严者：默认相对 0.0005 即误差至少降低 0.05%。
     # 还要满足 MAE 最多相对增加 2% 的默认保护；NASA 只记录，不在此处作为硬门槛。
     mae_limit = before["mae"] * (1 + rules["maximum_mae_relative_increase"])
-    return {"eligible": bool(gain > 1e-12 and gain >= required and after["mae"] <= mae_limit + 1e-12),
-            "rmse_reduction": gain, "required_rmse_reduction": required, "mae_limit": mae_limit}
+    result = {"eligible": bool(gain > 1e-12 and gain >= required and after["mae"] <= mae_limit + 1e-12),
+              "rmse_reduction": gain, "required_rmse_reduction": required, "mae_limit": mae_limit}
+    guards = rules.get("guards")
+    if not guards:
+        return result
+    failures = []
+    def no_increase(key, current, anchor, factor=1.0):
+        a, b = current.get(key), anchor.get(key)
+        if key == "nasa_score" and anchor.get("nasa_score_overflow") is True and type(a) in (int, float) and math.isfinite(a):
+            return
+        if (type(a) not in (int, float) or type(b) not in (int, float)
+                or not math.isfinite(a) or not math.isfinite(b) or a > b * factor + 1e-10):
+            failures.append(key)
+    no_increase("mae", after, before)
+    dataset = before.get("dataset")
+    if dataset == "C":
+        no_increase("nasa_score", after, before)
+        no_increase("absolute_error_p99", after, before)
+    for label, anchor in (("parent", before), ("stage_reference", reference)):
+        if anchor is None:
+            if label == "stage_reference" and guards.get("require_stage_reference"):
+                failures.append("stage_reference_unavailable")
+            continue
+        left, right = after.get("group_evaluation"), anchor.get("group_evaluation")
+        if (not isinstance(left, dict) or not isinstance(right, dict)
+                or left.get("source") != right.get("source")
+                or left.get("fit_sha256") != right.get("fit_sha256")
+                or set(left.get("groups", {})) != set(right.get("groups", {}))):
+            failures.append(label + ":group_scope_unavailable")
+            continue
+        no_increase("mean_rmse", left, right)
+        no_increase("worst_rmse", left, right)
+        for group, old in right["groups"].items():
+            new = left["groups"][group]
+            if old["rows"] < guards.get("minimum_group_rows", 20) or new["rows"] != old["rows"]:
+                failures.append(label + ":insufficient_group:" + group)
+            elif new["rmse"] > old["rmse"] * (1 + guards.get("maximum_group_relative_increase", .02)) + 1e-10:
+                failures.append(label + ":group_regression:" + group)
+        if dataset == "C" and label == "stage_reference":
+            no_increase("nasa_score", after, anchor)
+            no_increase("absolute_error_p99", after, anchor)
+    result.update(eligible=result["eligible"] and not failures, guard_failures=failures,
+                  guard_version=EVALUATION_VERSION,
+                  group_guard_scope=after.get("group_evaluation", {}).get("source"),
+                  device_protection_verified=(dataset == "B" and after.get("group_evaluation", {}).get("source") == "public_bearing_metadata"))
+    return result
 
 
 def measurement(value, validation_sha256, *, binding=None):

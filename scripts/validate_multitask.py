@@ -91,7 +91,7 @@ def measure(runtime, directory, descriptor, validation_path, validation, dataset
 
 
 def run_dataset(base, out, dataset, rounds, runtime, *, peer_factory=None, journal=None, max_rounds=None, exchange_options=None,
-                compact_validation=False, aggregate_parent=False, experiment_sequence=None):
+                compact_validation=False, aggregate_parent=False, experiment_sequence=None, projection_callback=None):
     # 一个数据集的多轮宿主：registry 保存真实产物目录，current 永远是上轮最终选中的 ID。
     # peer_factory 决定模型来源（真实回复或记录重放）；缺省才使用明确标识的离线模型替身。
     out.mkdir()
@@ -117,6 +117,10 @@ def run_dataset(base, out, dataset, rounds, runtime, *, peer_factory=None, journ
     score = baseline = measured(out / "initial", initial_descriptor)
     for index in range(1, (max_rounds or rounds) + 1):
         directory, parent_receipt = registry[current]
+        if projection_callback and projection_callback(index, out / "data"):
+            _, validation = (classification_pair(out / "data/train.jsonl", out / "data/validation.jsonl") if dataset == "A"
+                             else regression_pair(out / "data/train.jsonl", out / "data/validation.jsonl", dataset))
+            score = measured(directory, parent_receipt["artifact"])
         parent = directory / parent_receipt["artifact"]["checkpoint_paths"][0]
         host = (peer_factory(out, parent, dataset, index, history, state) if peer_factory else
                 OfflineHost(out, parent, index, history=history, state=state) if dataset == "A" else

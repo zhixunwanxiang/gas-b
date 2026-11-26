@@ -95,7 +95,7 @@ def _schema_values(inputs, schema):
     return values
 
 
-def read_dataset(path, task, classes=None, expected_paths=None, *, validate_inputs=None):
+def read_dataset(path, task, classes=None, expected_paths=None, *, validate_inputs=None, metadata_fields=()):
     path = Path(path)
     if not path.is_file() or path.is_symlink() or path.stat().st_size > MAX_BYTES:
         raise ValueError("dataset must be a regular JSONL file no larger than 128 MiB")
@@ -104,6 +104,7 @@ def read_dataset(path, task, classes=None, expected_paths=None, *, validate_inpu
     seen = set()
     paths = expected_paths
     schema = None
+    metadata = {key: [] for key in metadata_fields}
     for number, line in enumerate(raw.decode("utf-8").splitlines(), 1):
         if not line.strip():
             continue
@@ -141,8 +142,16 @@ def read_dataset(path, task, classes=None, expected_paths=None, *, validate_inpu
         else:
             raise ValueError("unsupported task")
         ids.append(identity); seen.add(identity); features.append(values); targets.append(target)
+        meta = row.get("meta")
+        for key in metadata:
+            value = meta.get(key) if isinstance(meta, dict) else None
+            # Optional trace fields never enter features, scalers or targets.
+            metadata[key].append(value if type(value) in (str, int) else None)
     if not ids:
         raise ValueError("dataset is empty")
-    return {"ids": ids, "x": np.asarray(features, dtype=np.float64),
+    result = {"ids": ids, "x": np.asarray(features, dtype=np.float64),
             "y": np.asarray(targets, dtype=np.int64 if task == "classification" else np.float64),
             "paths": paths, "sha256": sha256(raw)}
+    if metadata_fields:
+        result["metadata"] = metadata
+    return result

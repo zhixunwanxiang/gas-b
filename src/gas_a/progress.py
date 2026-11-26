@@ -24,7 +24,7 @@ class ResourceLedger:
     def __init__(self, **fields):
         self.fields = fields
         self.started, self.cpu_started = time.monotonic(), time.process_time()
-        self.stages, self.calls = [], []
+        self.stages, self.calls, self.transfers = [], [], []
 
     def snapshot(self, cutoff):
         known = [call["usage"] for call in self.calls if call["usage"] is not None]
@@ -39,6 +39,26 @@ class ResourceLedger:
                 "known_token_subtotal": totals,
                 "token_totals": totals if complete else None,
                 "missing_usage_calls": len(self.calls) - len(known)}
+
+
+def resource_snapshot():
+    ledger = _resources.get()
+    if ledger is None:
+        return {}
+    result = ledger.snapshot("before_save_state")
+    result["transfers"] = list(ledger.transfers)
+    result["known_upload_payload_bytes"] = sum(t["payload_bytes"] for t in ledger.transfers)
+    result["upload_byte_scope"] = "file payloads; excludes protocol framing; acknowledgements recorded separately"
+    return result
+
+
+def record_transfer(kind, directory):
+    item = {"kind": kind, "payload_bytes": sum(p.stat().st_size for p in directory.rglob("*") if p.is_file()),
+            "acknowledged": False}
+    ledger = _resources.get()
+    if ledger is not None:
+        ledger.transfers.append(item)
+    return item
 
 
 @contextmanager
@@ -75,7 +95,7 @@ def save_resources(directory):
     if ledger is not None:
         from .sensor_training.io import write_json
         # 本次 save_state/finish 尚未发生，完整耗时在 callback_exit 的 stderr 摘要中。
-        write_json(directory / "resources.json", ledger.snapshot("before_save_state"))
+        write_json(directory / "resources.json", resource_snapshot())
 
 
 @contextmanager

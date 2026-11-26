@@ -238,6 +238,8 @@ Dockerfile 会把本文件复制进镜像；本地改完后，正式提交镜像
 
 2026-11-26 测评优化：`regression.experiments` 继续作为 B/C 的共享基础菜单，新增 `regression.dataset_experiments` 按数据集追加菜单。当前只为 C 追加 `fine_rate`，参数为 MSE、学习率 `0.00003`、最多 8 epoch、不冻结特征层。B 的四个基础方案保持原参数。追加方案与基础方案的名称必须唯一，仍受 `regression.limits` 与原 RMSE/MAE 门槛约束。
 
+v21 开发分支在以上基础上新增 `head_short`、B `balanced_short`、C `fine_short` 和研究项 `tail_short`。`research_only=true` 的项默认不进入可执行菜单；`underestimate_mild` 保留名称供旧策略读取。`enable_research_experiments`、`single_choice_observe` 必须是布尔值。`regression.guards.B/C` 控制最低分组样本数、单组退化上限和参考要求；当前研发值分别为 20、2%、必须具备同范围参考。新保护取原 RMSE/MAE 门槛与 MAE、分组、C NASA/P99 保护的交集，不修改宿主指标。无宿主阶段标识时，参考仅属于投影事件，不能称为正式阶段。
+
 A 已采用路由父模型后执行非路由方案时，保留实际父产物的辅助专家和路由策略，仅续训主组件。该路径的逐 epoch 选择、早停及最终门槛均比较完整预测器，记录 `epoch_history_scope=complete_bundle_with_retained_auxiliaries`。显式 `frozen_router` 仍重新训练辅助专家并校准路由，其主组件 epoch 曲线与最终完整路由分数分别标注范围。
 
 A 与 B/C 的规划增加 `experiment_evidence`，逐方案展示相同父权重、训练数据、验证数据、方案与执行策略下的尝试、拒绝和最好增益。历史比较为 `different` 或 `unknown` 时，不作为当前条件已失败的证据。菜单限制、两阶段真实模型调用和最终准入规则保持原有流程。
