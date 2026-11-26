@@ -88,10 +88,10 @@ class CompletedReplyRecoveryTest(unittest.TestCase):
                     sources = [decisions[key]["decision_source"] for key in ("planning_calls", "selection_calls")]
                     if case in ("plain", "fence_crlf", "metadata_surrogate"):
                         self.assertEqual(sources, ["model", "model"])
-                        self.assertEqual(len(host.calls), 2 if dataset == "A" else 1)
+                        self.assertEqual(len(host.calls), 2)
                     elif case == "repair_once":
                         self.assertEqual(sources, ["model", "model"])
-                        self.assertEqual(len(host.calls), 3 if dataset == "A" else 2)
+                        self.assertEqual(len(host.calls), 3)
                         self.assertEqual(evidence[1]["request"]["correction"]["previous_completed_response"],
                                          evidence[0]["response"]["choices"][0]["message"]["content"])
                     elif case in ("wrong_parent", "unknown_experiment"):

@@ -16,9 +16,6 @@
     "early_stopping_patience": 6
   },
   "regression": {
-    "enable_research_experiments": false,
-    "single_choice_observe": true,
-    "prediction_budget": {"maximum_cpu_ratio": 2.0},
     "controller": {
       "json_corrections": 1,
       "max_history_restores": 2,
@@ -27,35 +24,13 @@
       "minimum_rmse_relative_gain": 0.0005,
       "maximum_mae_relative_increase": 0.02
     },
-    "guards": {
-      "B": {"minimum_group_rows": 20, "maximum_group_relative_increase": 0.02, "require_stage_reference": true},
-      "C": {"minimum_group_rows": 20, "maximum_group_relative_increase": 0.02, "require_stage_reference": true}
-    },
     "limits": {"max_epochs": 8, "max_seconds_per_candidate": 30, "early_stopping_patience": 3},
     "experiments": [
       {"name": "low_rate", "learning_rate": 0.0003, "epochs": 3, "freeze_features": false, "loss": "mse"},
       {"name": "standard_rate", "learning_rate": 0.001, "epochs": 6, "freeze_features": false, "loss": "mse"},
       {"name": "head_only", "learning_rate": 0.0005, "epochs": 4, "freeze_features": true, "loss": "mse"},
-      {"name": "head_short", "learning_rate": 0.0005, "epochs": 3, "freeze_features": true, "loss": "mse"},
       {"name": "robust_huber", "learning_rate": 0.0003, "epochs": 5, "freeze_features": false, "loss": "huber"}
-    ],
-    "dataset_experiments": {
-      "B": [
-        {"name": "underestimate_mild", "learning_rate": 0.001, "epochs": 8, "freeze_features": false, "loss": "mse", "underestimate_weight": 1.25, "research_only": true},
-        {"name": "balanced_short", "learning_rate": 0.0003, "epochs": 3, "freeze_features": false, "loss": "mse", "weighting": "bearing_sqrt_inverse"},
-        {"name": "balanced_mild", "learning_rate": 0.0003, "epochs": 3, "freeze_features": false, "loss": "mse", "weighting": "bearing_sqrt_inverse", "balance_strength": 0.5, "research_only": true},
-        {"name": "fast_rbf_linear", "component_update": "fixed_rbf", "component_updates": 1, "freeze_features": true, "loss": "mse", "basis_width": 8, "residual_space": "linear", "weighting": "bearing_sqrt_inverse", "balance_strength": 0.25, "research_only": true},
-        {"name": "fast_rbf_log", "component_update": "fixed_rbf", "component_updates": 1, "freeze_features": true, "loss": "mse", "basis_width": 8, "residual_space": "log", "weighting": "bearing_sqrt_inverse", "balance_strength": 0.25, "research_only": true}
-      ],
-      "C": [
-        {"name": "fine_rate", "learning_rate": 0.00003, "epochs": 8, "freeze_features": false, "loss": "mse"},
-        {"name": "fine_short", "learning_rate": 0.00003, "epochs": 3, "freeze_features": false, "loss": "mse"},
-        {"name": "condition_ridge", "component_updates": 1, "freeze_features": true, "loss": "mse", "component_update": "condition_ridge"},
-        {"name": "tail_short", "learning_rate": 0.00003, "epochs": 3, "freeze_features": false, "loss": "mse", "weighting": "parent_tail", "tail_quantile": 0.9, "tail_weight": 2.0, "research_only": true},
-        {"name": "fast_rbf_8", "component_update": "fixed_rbf", "component_updates": 1, "freeze_features": true, "loss": "mse", "basis_width": 8, "residual_space": "linear", "research_only": true},
-        {"name": "fast_rbf_16", "component_update": "fixed_rbf", "component_updates": 1, "freeze_features": true, "loss": "mse", "basis_width": 16, "residual_space": "linear", "research_only": true}
-      ]
-    }
+    ]
   },
   "experiments": [
     {

@@ -1,4 +1,4 @@
-"""Exercise the four report optimizations with SDK 1.0.4 and an offline controller."""
+"""Exercise current A and restored V18 B/C with SDK 1.0.4 and an offline controller."""
 import argparse
 import json
 from pathlib import Path
@@ -32,8 +32,8 @@ def main():
               "four_sensor", "conservative_head", "five_sensor", "conservative_head", "frozen_router"],
         "B": ["robust_huber", "standard_rate", "head_only", "low_rate", "robust_huber",
               "standard_rate", "head_only", "low_rate", "robust_huber", "standard_rate"],
-        "C": ["robust_huber", "standard_rate", "head_only", "fine_rate", "fine_rate",
-              "low_rate", "head_only", "fine_rate", "robust_huber", "fine_rate"],
+        "C": ["robust_huber", "standard_rate", "head_only", "low_rate", "robust_huber",
+              "standard_rate", "head_only", "low_rate", "robust_huber", "standard_rate"],
     }
     reports = [run_dataset(args.baseline_root / BASELINES[key], args.output / key, key, args.rounds, runtime,
                            compact_validation=True, aggregate_parent=True, experiment_sequence=sequences[key])
@@ -41,8 +41,9 @@ def main():
     checks = {"all_rounds_completed": all(len(r["rounds"]) == args.rounds for r in reports),
               "no_public_regression": all(r["not_worse_than_public_baseline"] for r in reports),
               "all_sdk_model_receipts_present": all(row["model_call_ids"] for r in reports for row in r["rounds"]),
-              "c_fine_rate_executed": any(row["record"]["configuration"].get("experiment", {}).get("name") == "fine_rate"
-                  for row in reports[2]["rounds"] if row["record"]["configuration"].get("experiment")),
+              "bc_v18_menu_only": all(row["record"]["configuration"].get("experiment", {}).get("name") in
+                  ("low_rate", "standard_rate", "head_only", "robust_huber")
+                  for report in reports[1:] for row in report["rounds"] if row["record"]["configuration"].get("experiment")),
               "a_retained_bundle_executed": any(row["record"]["configuration"].get("checkpoint_selection", {}).get(
                   "predictor_scope") == "complete_bundle_with_retained_auxiliaries" for row in reports[0]["rounds"])}
     audit = runtime.audit() if runtime else None

@@ -21,6 +21,11 @@ def main():
     parser.add_argument('--expected-image-id')
     parser.add_argument('--docker-executable', default='docker')
     args = parser.parse_args()
+    config = json.loads((ROOT / 'submission_config.json').read_text(encoding='utf-8'))['regression']
+    extras = config.get('dataset_experiments', {})
+    if (not any(s['name'] == 'underestimate_mild' for s in extras.get('B', []))
+            or not any(s['name'] == 'fine_rate' for s in extras.get('C', []))):
+        parser.error('This historical v20 driver does not apply to restored V18 B/C; use scripts/validate_multitask.py.')
     args.output.mkdir(parents=True, exist_ok=False)
     reference = json.loads(args.reference.read_text(encoding='utf-8'))
     previous = {r['dataset']: r['final'] for r in reference['datasets']}

@@ -140,8 +140,7 @@ def run_dataset(base, out, dataset, rounds, runtime, *, peer_factory=None, journ
             # 平台反馈复现：start 只有具名指标，不含冗余范围/摘要；原始帧仍完整留档。
             host.frame["current_validation"] = {"metrics": score}
         config = json.loads((ROOT / "submission_config.json").read_text(encoding="utf-8"))
-        from gas_a.regression.submission import dataset_config
-        menu = config["experiments"] if dataset == "A" else dataset_config(config, dataset)["experiments"]
+        menu = config["experiments"] if dataset == "A" else config["regression"]["experiments"]
         if peer_factory is None:
             host.experiment = (experiment_sequence[(index - 1) % len(experiment_sequence)] if experiment_sequence
                                else menu[(index - 1) % len(menu)]["name"])

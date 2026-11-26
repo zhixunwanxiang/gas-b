@@ -1,5 +1,7 @@
 # submission_config.json 参数与实际代码逻辑
 
+**2026-11-26 当前状态：A 保留现版，B/C 已恢复 V18。** 当前 `regression` 块与 V18 `9ab6a59` 完全一致，仅包含 `low_rate`、`standard_rate`、`head_only`、`robust_huber` 四项共享菜单，预算为最多 8 epoch、30 秒，恢复 V18 的 RMSE/MAE 准入规则。下文标为 v19/v20/v21 的 B/C 扩展是历史说明，当前已撤下；A 的现有完整专家包续训、逐 epoch 选版和资源/实验证据机制继续保留。精确回退范围见 [回退记录](docs/BC_V18_A_CURRENT_20261126.md)。
+
 本文对应当前项目根目录的 `submission_config.json`。原A分类部分共72个参数路径；v5新增的B/C回归参数在下面单独说明。数组中的传感器号、权重候选等作为一个参数整体说明，重复的训练参数含义相同。
 
 v20 补充：B 独立菜单新增 `underestimate_mild`，MSE、学习率 `0.001`、最多 8 epoch，`underestimate_weight=1.25`。只对 train 中预测低于目标的残差加权，仍以原始 RMSE、MAE 测量并执行原门槛；权重合法范围为有限数 `1～1.5`，默认 `1`。C 不开放此项。

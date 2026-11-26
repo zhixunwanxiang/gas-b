@@ -2,7 +2,7 @@
 from functools import lru_cache
 import math
 from ..sensor_training.reference.data import flatten, read_dataset
-from .model import Model
+from ..sensor_training.reference.model import Model
 
 
 BEARING_FEATURES = (
@@ -86,11 +86,8 @@ def load_model(path, dataset, paths=None):
 def load_pair(train_path, validation_path, dataset):
     # 两份文件分别读取，不把公开验证样本并回训练集；验证标签仅供后续诊断与选版。
     # id 只用于检查投影是否交叉，不进入 x 特征矩阵，也不用于反推寿命。
-    fields = ("bearing",) if dataset == "B" else ("source_subset", "unit")
-    train = read_dataset(train_path, "regression", [], schema(dataset), metadata_fields=fields)
-    validation = read_dataset(validation_path, "regression", [], train["paths"], metadata_fields=fields)
+    train = read_dataset(train_path, "regression", [], schema(dataset))
+    validation = read_dataset(validation_path, "regression", [], train["paths"])
     if set(train["ids"]) & set(validation["ids"]):
         raise ValueError("Public training and validation sample IDs overlap")
-    from .grouping import fit_groups, attach_groups
-    fitted = fit_groups(train, dataset)
-    return attach_groups(train, dataset, fitted), attach_groups(validation, dataset, fitted)
+    return train, validation

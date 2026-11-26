@@ -9,7 +9,6 @@ import unittest
 from unittest.mock import patch
 
 from tests.test_submission import ROOT, OfflineHost, simulated_checkpoint_identity, writes_only_in
-from tests.test_regression import make_fixture, RegressionHost
 from contest_harness.round import Round
 from gas_a.continuation import continue_candidate
 from gas_a.frozen_router import FrozenRouter, load_predictor, _expert_scores, _new_stream
@@ -17,7 +16,6 @@ from gas_a.evolution import experiment_evidence, fingerprint, promotion_gate
 from gas_a.sensor_training.data import load_pair, evaluate
 from gas_a.sensor_training.reference.data import flatten, read_dataset
 from gas_a.sensor_training.io import digest
-from gas_a.regression.submission import dataset_config, train as regression_train
 from gas_a import submission
 
 
@@ -134,22 +132,6 @@ class FirstFourTest(unittest.TestCase):
         self.assertEqual(changed["remaining_rejection_budget"], 2)
         self.assertIsNone(changed["best_current_condition_gain"])
 
-    def test_c_fine_rate_menu_is_isolated_from_b_and_reaches_sdk_training(self):
-        self.assertNotIn("fine_rate", [s["name"] for s in dataset_config(self.config, "B")["experiments"]])
-        self.assertIn("fine_rate", [s["name"] for s in dataset_config(self.config, "C")["experiments"]])
-        root = self.root / "c-fine-sdk"
-        parent = make_fixture(root, "C")
-        host = RegressionHost(root, parent, "C")
-        host.experiment = "fine_rate"
-        rnd = Round.start(host, host)
-        rnd.parent.root = parent.parent
-        with patch.dict(os.environ, {"CONTEST_WORK": str(root / "work")}):
-            regression_train(rnd)
-        self.assertTrue(rnd._finished)
-        self.assertEqual(host.record["configuration"]["experiment"]["learning_rate"], .00003)
-        plan = json.loads(host.messages[0][0]["content"])
-        self.assertIn("fine_rate", plan["experiment_evidence"])
-        self.assertEqual(len(rnd.call_ids), 2)
 
     def test_schema_reuse_keeps_feature_order_and_rejects_later_row_changes(self):
         import numpy as np
