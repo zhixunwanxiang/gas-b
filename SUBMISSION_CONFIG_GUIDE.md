@@ -240,6 +240,8 @@ Dockerfile 会把本文件复制进镜像；本地改完后，正式提交镜像
 
 v21 开发分支在以上基础上新增 `head_short`、B `balanced_short`、C `fine_short` 和研究项 `tail_short`。`research_only=true` 的项默认不进入可执行菜单；`underestimate_mild` 保留名称供旧策略读取。`enable_research_experiments`、`single_choice_observe` 必须是布尔值。`regression.guards.B/C` 控制最低分组样本数、单组退化上限和参考要求；当前研发值分别为 20、2%、必须具备同范围参考。新保护取原 RMSE/MAE 门槛与 MAE、分组、C NASA/P99 保护的交集，不修改宿主指标。无宿主阶段标识时，参考仅属于投影事件，不能称为正式阶段。
 
+C `condition_ridge` 使用 `component_updates=1`，没有神经网络 `epochs` 或 `learning_rate` 字段。它保留实际父 MLP 的全部权重、Adam、输入/目标缩放及计数，在 train 上以每行 0.02 的岭惩罚、0.5 的收缩量更新同一个工况头。新增修正幅度由首次 train 父残差绝对值的 90% 分位点乘 0.25 确定，后续继承。`training.json` 单列神经 epoch/step 不增加及组件更新计数；完整检查点外层格式为 `contest.cpu-rul-components.v1`，旧加载器不能将它当成普通 MLP。该项仍受 30 秒候选预算和全部选版保护约束。B `balanced_mild` 使用均衡权重与均匀权重各半混合，当前属于默认关闭的研究项。
+
 A 已采用路由父模型后执行非路由方案时，保留实际父产物的辅助专家和路由策略，仅续训主组件。该路径的逐 epoch 选择、早停及最终门槛均比较完整预测器，记录 `epoch_history_scope=complete_bundle_with_retained_auxiliaries`。显式 `frozen_router` 仍重新训练辅助专家并校准路由，其主组件 epoch 曲线与最终完整路由分数分别标注范围。
 
 A 与 B/C 的规划增加 `experiment_evidence`，逐方案展示相同父权重、训练数据、验证数据、方案与执行策略下的尝试、拒绝和最好增益。历史比较为 `different` 或 `unknown` 时，不作为当前条件已失败的证据。菜单限制、两阶段真实模型调用和最终准入规则保持原有流程。

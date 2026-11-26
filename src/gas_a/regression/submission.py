@@ -52,7 +52,8 @@ def dataset_config(full_config, dataset):
     specs = [*shared["experiments"], *extras.get(dataset, [])]
     for spec in specs:
         if (spec.get("weighting") == "bearing_sqrt_inverse" and dataset != "B"
-                or spec.get("weighting") == "parent_tail" and dataset != "C"):
+                or spec.get("weighting") == "parent_tail" and dataset != "C"
+                or spec.get("component_update") and dataset != "C"):
             raise ValueError("Regression weighting belongs to a different dataset")
     return {**shared, "controller": {**shared["controller"], "guards": shared.get("guards", {}).get(dataset)},
             "experiments": specs}
@@ -79,11 +80,19 @@ def validate_config(config, limits):
         raise ValueError("Invalid regression training limits")
     names = set()
     for spec in config["experiments"]:
-        if (not isinstance(spec["name"], str) or not spec["name"] or spec["name"] in names
-                or type(spec["epochs"]) is not int or not 1 <= spec["epochs"] <= limits["max_epochs"]
-                or isinstance(spec["learning_rate"], bool) or not 0 < spec["learning_rate"] <= .01
-                or type(spec["freeze_features"]) is not bool or spec["loss"] not in ("mse", "huber")):
+        if (not isinstance(spec, dict) or not isinstance(spec.get("name"), str) or not spec["name"] or spec["name"] in names
+                or type(spec.get("freeze_features")) is not bool or spec.get("loss") not in ("mse", "huber")):
             raise ValueError("Invalid bounded regression experiment")
+        if spec.get("component_update") is None:
+            rate = spec.get("learning_rate")
+            if (type(spec.get("epochs")) is not int or not 1 <= spec["epochs"] <= limits["max_epochs"]
+                    or type(rate) not in (int, float) or not np.isfinite(rate) or not 0 < rate <= .01
+                    or "component_updates" in spec):
+                raise ValueError("Invalid bounded neural regression experiment")
+        elif (spec["component_update"] != "condition_ridge" or type(spec.get("component_updates")) is not int
+                or spec["component_updates"] != 1 or spec["freeze_features"] is not True or spec["loss"] != "mse"
+                or any(k in spec for k in ("epochs", "learning_rate", "weighting", "underestimate_weight", "balance_strength"))):
+            raise ValueError("Invalid bounded component update")
         weight = spec.get("underestimate_weight", 1.0)
         if type(weight) not in (int, float) or not np.isfinite(weight) or not 1 <= weight <= 1.5:
             raise ValueError("Invalid regression bias correction")
@@ -95,6 +104,10 @@ def validate_config(config, limits):
                 value = spec.get(key)
                 if type(value) not in (int, float) or not np.isfinite(value) or not low <= value <= high:
                     raise ValueError("Invalid tail weighting")
+        if "balance_strength" in spec and (spec.get("weighting") != "bearing_sqrt_inverse"
+                or type(spec["balance_strength"]) not in (int, float)
+                or not np.isfinite(spec["balance_strength"]) or not .25 <= spec["balance_strength"] <= 1.):
+            raise ValueError("Invalid balanced weighting strength")
         if "research_only" in spec and type(spec["research_only"]) is not bool:
             raise ValueError("Invalid research experiment flag")
     guards = rules.get("guards")
@@ -405,6 +418,9 @@ def train(rnd):
         # 阶段 7：本地算准入、写诊断证据，并把候选交给宿主真实测量；上传成功不等于准许上线。
         gate = promotion_gate(before, report["validation_after"], rules, reference=stage_reference)
         cfg.update(validation_after=report["validation_after"], candidate_gate=gate)
+        append_jsonl(state / "regression_training_evidence.jsonl", {"round_index": rnd.round_index,
+            "report": report, "epoch_history": [json.loads(line) for line in
+                (candidate / "history.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]})
         write_json(candidate / "monitoring.json", drift)
         write_json(candidate / "diagnosis.json", diagnosis)
         write_json(candidate / "planning.json", {"decision": plan, **planning_calls})

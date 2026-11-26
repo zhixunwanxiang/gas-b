@@ -18,6 +18,10 @@ from gas_a.regression.data import load_model, load_pair
 from gas_a.regression.evaluation import evaluate, promotion_gate
 from gas_a.regression.grouping import fit_groups, attach_groups
 from gas_a.regression.training import prepare_training
+from gas_a.regression.training import continue_candidate
+from gas_a.regression.model import component_digest
+from gas_a.sensor_training.reference.model import Model as OriginalModel
+from gas_a.sensor_training.io import digest
 from tests.test_regression import make_fixture, RegressionHost
 from tests.test_submission import ROOT, writes_only_in
 
@@ -200,12 +204,152 @@ class ScoreAlignedRegressionTest(unittest.TestCase):
 
     def test_unsupported_residual_is_rejected_instead_of_silently_dropped(self):
         _, parent, _, _ = self.fixture("C")
-        model = load_model(parent, "C")
+        model = OriginalModel.load(parent)
         model.meta["rul_residual_v1"] = {"weights": [1.]}
         path = self.root / "unsupported.npz"
         model.save(path)
         with self.assertRaisesRegex(ValueError, "complete compatible loader"):
             load_model(path, "C")
+
+    def test_zero_component_and_export_preserve_complete_prediction(self):
+        _, parent, train, val = self.fixture("C")
+        model = load_model(parent, "C")
+        expected = model.predict(val["x"])
+        self.assertTrue(model.initialize_component(train))
+        np.testing.assert_array_equal(model.predict(val["x"]), expected)
+        model.update_component(train)
+        path = self.root / "complete.npz"
+        model.save(path)
+        loaded = load_model(path, "C")
+        with self.assertRaises(ValueError):
+            OriginalModel.load(path)  # Older MLP-only code must fail instead of dropping the head.
+        np.testing.assert_array_equal(model.predict(val["x"]), loaded.predict(val["x"]))
+        np.testing.assert_allclose(loaded.predict(val["x"]), np.asarray([loaded.predict(x[None])[0] for x in val["x"]]), atol=1e-10)
+        self.assertEqual(loaded.meta["regression_components"]["updates"], 1)
+
+    def test_component_update_inherits_adam_without_inventing_neural_steps(self):
+        _, parent, train, val = self.fixture("C")
+        cfg = submission.dataset_config(self.config, "C")
+        spec = next(s for s in cfg["experiments"] if s["name"] == "condition_ridge")
+        original = load_model(parent, "C")
+        before = evaluate(original, val, "C")
+        source = parent
+        for index in (1, 2):
+            out = self.root / f"component-{index}"
+            report = continue_candidate(source, train, val, out, spec, cfg["limits"], cfg["controller"], "C",
+                digest(source), reference=before)
+            loaded = load_model(out / "checkpoint.npz", "C")
+            self.assertEqual(report["executed_epochs"], 0)
+            self.assertEqual(report["final_steps"], original.meta["steps"])
+            self.assertEqual(loaded.meta["regression_components"]["updates"], index)
+            self.assertTrue(all(report["checks"].values()))
+            for key in original.params:
+                np.testing.assert_array_equal(loaded.params[key], original.params[key])
+                np.testing.assert_array_equal(loaded.first[key], original.first[key])
+                np.testing.assert_array_equal(loaded.second[key], original.second[key])
+            source = out / "checkpoint.npz"
+        inherited = component_digest(loaded.meta["regression_components"])
+        neural = next(s for s in cfg["experiments"] if s["name"] == "head_short")
+        report = continue_candidate(source, train, val, self.root / "neural", neural,
+            cfg["limits"], cfg["controller"], "C", digest(source), reference=before)
+        resumed = load_model(self.root / "neural/checkpoint.npz", "C")
+        self.assertEqual(component_digest(resumed.meta["regression_components"]), inherited)
+        self.assertGreater(resumed.meta["steps"], loaded.meta["steps"])
+
+    def test_sdk_can_submit_and_predict_complete_component_checkpoint(self):
+        root, parent, _, val = self.fixture("C")
+        model = load_model(parent, "C")
+        model.params["b2"] += 2
+        parent.unlink()
+        model.save(parent)
+        host = RegressionHost(root, parent, "C")
+        host.experiment = "condition_ridge"
+        config_root = self.root / "configuration"
+        config_root.mkdir()
+        self.config["regression"]["enable_research_experiments"] = True
+        (config_root / "submission_config.json").write_text(json.dumps(self.config), encoding="utf-8")
+        with patch.object(submission, "ROOT", config_root):
+            record = self.run_host(host)
+        self.assertIsNotNone(host.candidate)
+        self.assertEqual(record["selected_artifact_id"], "candidate-1")
+        loaded = load_model(host.candidate / "checkpoint.npz", "C")
+        self.assertEqual(loaded.meta["regression_components"]["updates"], 1)
+        self.assertEqual(loaded.meta["steps"], model.meta["steps"])
+        sample = SimpleNamespace(inputs=json.loads((root / "data/validation.jsonl").read_text(encoding="utf-8").splitlines()[0])["inputs"],
+                                 dataset_key="C", task="regression")
+        with patch.dict(os.environ, {"CONTEST_ARTIFACT_PATH": str(host.candidate / "checkpoint.npz")}):
+            value = contest_submission.predict(sample, host.candidate)["value"]
+        self.assertAlmostEqual(value, loaded.predict(val["x"][:1])[0])
+
+    def test_compiled_head_matches_clipped_basis_for_normal_and_extreme_inputs(self):
+        _, parent, train, val = self.fixture("C")
+        model = load_model(parent, "C")
+        model.initialize_component(train)
+        model.update_component(train)
+        x = np.vstack((val["x"], np.full((1, 24), 1e6), np.full((1, 24), -1e6)))
+        normalized = model.normalized(x)
+        c = model.component
+        groups = model.component_groups(normalized)
+        from gas_a.regression.model import basis
+        correction = basis(normalized[:, :21], c["means"][0], c["scales"][0]) @ c["weights"][0]
+        correction += np.einsum("ij,ij->i", basis(normalized[:, :21], c["means"][groups], c["scales"][groups]), c["weights"][groups])
+        raw = OriginalModel.forward(model, normalized)[1][:, 0]
+        cap = model.meta["regression_components"]["cap"]
+        expected = np.maximum(0, (raw + np.clip(correction, -cap, cap)) * model.meta["target_scale"] + model.meta["target_mean"])
+        np.testing.assert_allclose(model.predict(x), expected, rtol=1e-12, atol=1e-10)
+
+    def test_history_restores_complete_component_after_parent_fault(self):
+        root, parent, train, _ = self.fixture("C")
+        model = load_model(parent, "C")
+        model.initialize_component(train)
+        model.update_component(train)
+        historical = root / "historical"
+        historical.mkdir()
+        model.save(historical / "checkpoint.npz")
+        expected_component = component_digest(model.meta["regression_components"])
+        model.params["b2"] += 100
+        parent.unlink()
+        model.save(parent)
+        host = RegressionHost(root, parent, "C")
+        host.add_artifact("history-head", historical)
+        original_write = host.write
+        def choose_history(text):
+            result = original_write(text)
+            frame = json.loads(text)
+            if frame["type"] == "model_request":
+                request = json.loads(frame["messages"][0]["content"])
+                value = ({"action": "rollback", "experiment": "none", "target_artifact_id": "history-head",
+                          "hypothesis": "Restore the measured complete historical predictor.", "reason": "The restored predictor passed current-scope guards."}
+                         if request["phase"] == "plan" else {"selected_artifact_id": "history-head", "reason": "Select the authorized complete predictor."})
+                host.pending[-1]["response"]["choices"][0]["message"]["content"] = json.dumps(value)
+            return result
+        host.write = choose_history
+        record = self.run_host(host)
+        self.assertEqual(record["selected_artifact_id"], "history-head")
+        self.assertTrue(record["historical_validation"]["history-head"]["gate"]["eligible"])
+        self.assertEqual(component_digest(load_model(historical / "checkpoint.npz", "C").meta["regression_components"]), expected_component)
+
+    def test_missing_unknown_and_overflowed_component_metadata_are_rejected(self):
+        _, parent, train, _ = self.fixture("C")
+        model = load_model(parent, "C")
+        model.initialize_component(train)
+        complete = self.root / "complete.npz"
+        model.save(complete)
+        with np.load(complete, allow_pickle=False) as stored:
+            arrays = {key: stored[key].copy() for key in stored}
+        original = json.loads(str(arrays["metadata"]))
+        for index, kind in enumerate(("missing", "unknown", "overflow")):
+            metadata = deepcopy(original)
+            if kind == "missing":
+                del metadata["regression_components"]
+            elif kind == "unknown":
+                metadata["regression_components"]["format"] = "unknown-format"
+            else:
+                metadata["regression_components"]["cap"] = 10 ** 400
+            broken = self.root / f"broken-{index}.npz"
+            np.savez(broken, **{**arrays, "metadata": np.asarray(json.dumps(metadata))})
+            with self.assertRaises(ValueError):
+                load_model(broken, "C")
 
 
 if __name__ == "__main__":

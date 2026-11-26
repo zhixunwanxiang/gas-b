@@ -24,7 +24,7 @@ def actual_record(out, row):
 
 def probe(args, config):
     rows = []
-    for dataset, names in (("B", ("low_rate", "balanced_short")), ("C", ("fine_short", "tail_short"))):
+    for dataset, names in (("B", ("low_rate", "balanced_short", "balanced_mild")), ("C", ("fine_short", "tail_short", "condition_ridge"))):
         base = args.baseline_root / BASELINES[dataset]
         train, validation = load_pair(base / "public/train.jsonl", base / "public/validation.jsonl", dataset)
         cfg = dataset_config(config, dataset)
@@ -87,8 +87,8 @@ def rounds(args):
               "four_sensor", "conservative_head", "five_sensor", "conservative_head", "frozen_router"],
         "B": ["balanced_short", "low_rate", "head_short", "standard_rate", "robust_huber",
               "balanced_short", "low_rate", "head_short", "balanced_short", "standard_rate"],
-        "C": ["fine_short", "tail_short", "head_short", "fine_rate", "low_rate",
-              "tail_short", "robust_huber", "fine_short", "head_short", "tail_short"]}
+        "C": ["fine_short", "condition_ridge", "head_short", "condition_ridge", "fine_rate",
+              "condition_ridge", "low_rate", "head_short", "condition_ridge", "robust_huber"]}
     summary = []
     for dataset in args.datasets:
         base = args.baseline_root / BASELINES[dataset]
@@ -117,8 +117,9 @@ def rounds(args):
                "state_payload_bytes": sum(p.stat().st_size for p in out.glob("host-*/state/**/*") if p.is_file())}
         if dataset != "A":
             ledger = json.loads((out / "host-10/state/regression_stage_evidence.json").read_text(encoding="utf-8"))
+            stage_keys = [r["stage_key"] for r in ledger["rounds"]]
             row.update(mean_relative_gain=ledger.get("mean_relative_gain"), worst_relative_gain=ledger.get("worst_relative_gain"),
-                       stage_events=len({r["stage_key"] for r in ledger["rounds"]}),
+                       stage_events=1 + sum(a != b for a, b in zip(stage_keys, stage_keys[1:])),
                        recovery_observations=[{k: r[k] for k in ("round", "stage_key", "relative_gain", "recovered_round", "confirmed_round")}
                                               for r in ledger["rounds"]])
         summary.append(row)

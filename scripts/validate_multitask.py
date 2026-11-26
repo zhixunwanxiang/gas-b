@@ -1,5 +1,6 @@
 """A/B/C 原生入口与实际数值训练的离线验收；模型决策使用明确标注的宿主替身，不计真实27B成绩。"""
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -50,6 +51,8 @@ def measure(runtime, directory, descriptor, validation_path, validation, dataset
         env.update(CONTEST_ARTIFACT_PATH=str(directory / descriptor["checkpoint_paths"][0]),
                    CONTEST_PREDICTION_CONTEXT=json.dumps(context))
     rows = [json.loads(line) for line in validation_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    write_json(out / "validation-scope.json", {"validation_sha256": digest(validation_path), "sample_ids": [row["id"] for row in rows],
+        "canonical_rows_sha256": hashlib.sha256(json.dumps(rows, sort_keys=True, separators=(",", ":")).encode()).hexdigest()})
     # 标签只留在宿主用于算分，stdin 发送 task 和 inputs；预测容器只挂载模型，不挂载 validation 文件。
     inputs = "".join(json.dumps({"task": task, "inputs": row["inputs"]}) + "\n" for row in rows)
     try:

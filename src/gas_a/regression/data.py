@@ -2,7 +2,7 @@
 from functools import lru_cache
 import math
 from ..sensor_training.reference.data import flatten, read_dataset
-from ..sensor_training.reference.model import Model
+from .model import Model
 
 
 BEARING_FEATURES = (
@@ -73,8 +73,6 @@ def load_model(path, dataset, paths=None):
     # 权重文件自身包含任务、数据集 profile、特征路径和目标缩放。
     # 即使 B/C 都输出一个数，也不能把“分钟”的模型直接拿去预测“循环数”。
     model = Model.load(path)
-    if model.meta.get("rul_residual_v1") is not None or model.meta.get("regression_components") is not None:
-        raise ValueError("Unsupported regression component format; a complete compatible loader is required")
     if (model.meta["task"] != "regression" or model.meta.get("profile") != dataset
             or model.meta["paths"] != (schema(dataset) if paths is None else paths)):
         raise ValueError("Checkpoint regression profile or feature schema does not match the task")
