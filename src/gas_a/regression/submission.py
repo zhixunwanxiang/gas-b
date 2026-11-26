@@ -13,7 +13,7 @@ from .monitoring import fit_reference, monitor, diagnose
 from .training import continue_candidate
 from .prompts import VERSION as PROMPT_VERSION, plan_contract, PLAN_INSTRUCTION, SELECT_INSTRUCTION
 from ..evolution import (available_experiments, fingerprint, experiment_outcome,
-                         validate_attempts, eligible_history, EXPERIMENT_POLICY_VERSION)
+                         validate_attempts, eligible_history, experiment_evidence, EXPERIMENT_POLICY_VERSION)
 from ..host_validation import HOST_ADMISSION_VERSION, bind_candidate_validation
 from ..progress import progress, stage
 from ..sensor_training.io import append_jsonl, digest, write_json
@@ -42,6 +42,15 @@ def predict(sample, model_dir):
     return {"value": result}  # SDK 原样包装为 outputs:{value:...}；不伪装成分类概率。
 
 
+def dataset_config(full_config, dataset):
+    """Keep B's shared menu and append only the selected dataset's experiments."""
+    shared = full_config["regression"]
+    extras = shared.get("dataset_experiments", {})
+    if not isinstance(extras, dict) or set(extras) - {"B", "C"} or any(not isinstance(v, list) for v in extras.values()):
+        raise ValueError("Invalid dataset-specific regression menu")
+    return {**shared, "experiments": [*shared["experiments"], *extras.get(dataset, [])]}
+
+
 def validate_config(config, limits):
     # 将可执行方案限制在预先配置的范围：AI 只能选菜单，不能临时增加轮数、学习率或放宽门槛。
     # Python 的 bool 是 int 子类，因此预算字段特意用 type(...) is int 排除 true/false。
@@ -65,6 +74,9 @@ def validate_config(config, limits):
                 or isinstance(spec["learning_rate"], bool) or not 0 < spec["learning_rate"] <= .01
                 or type(spec["freeze_features"]) is not bool or spec["loss"] not in ("mse", "huber")):
             raise ValueError("Invalid bounded regression experiment")
+        weight = spec.get("underestimate_weight", 1.0)
+        if type(weight) not in (int, float) or not np.isfinite(weight) or not 1 <= weight <= 1.5:
+            raise ValueError("Invalid regression bias correction")
         names.add(spec["name"])
 
 
@@ -133,7 +145,7 @@ def _history_view(history):
                        "configuration": {key: config[key] for key in (
                            "dataset", "experiment", "parent_checkpoint_sha256", "train_sha256", "validation_sha256",
                            "validation_before", "validation_after", "candidate_gate", "host_candidate_gate",
-                           "experiment_failure", "selected_local_rmse") if key in config}}, context="regression_history_view"))
+                           "experiment_failure", "experiment_outcome", "execution_policy", "selected_local_rmse") if key in config}}, context="regression_history_view"))
     return result
 
 
@@ -188,7 +200,7 @@ def train(rnd):
     if rnd.limits.get("artifact_upload_protocol") != "chunked-v1":
         raise HarnessError("CHUNKED_UPLOAD_UNSUPPORTED", "SDK 1.0.4 requires chunked-v1 uploads")
     full_config = json.loads((ROOT / "submission_config.json").read_text(encoding="utf-8"))
-    config = full_config["regression"]
+    config = dataset_config(full_config, dataset)
     limits, rules = config["limits"], config["controller"]
     validate_config(config, limits)
     work = Path(os.environ.get("CONTEST_WORK", "/workspace")).resolve()
@@ -229,7 +241,9 @@ def train(rnd):
         policy.update(paired)
     elif policy["artifact_policies"]:
         policy.update(version=1, preferred_experiment=None)
+    from ..evolution import REPEAT_POLICY
     execution = {"format": "rul.execution.v1", "rules": rules, "limits": limits, "prompt_version": PROMPT_VERSION,
+                 "repeat_policy": REPEAT_POLICY,
                  "experiment_policy_version": EXPERIMENT_POLICY_VERSION,
                  "host_admission_policy_version": HOST_ADMISSION_VERSION,
                  "parent_reference_policy_version": PARENT_REFERENCE_VERSION,
@@ -273,6 +287,9 @@ def train(rnd):
                "history": _history_view(history), "experiments": allowed, "strategy": {
                    "version": policy["version"], "preferred_experiment": policy["preferred_experiment"],
                    "blocked_repeated_experiments": blocked},
+               "experiment_evidence": experiment_evidence(_history_view(history), policy["attempts"], menu,
+                   rnd.parent.checkpoint_sha256, train_data["sha256"], validation["sha256"], execution, rules,
+                   gain_key="rmse_reduction", blocked=blocked if not admission_blocker else list(menu)),
                "monitoring": {k: v for k, v in drift.items() if k != "features"}, "diagnosis": diagnosis,
                "historical_validation": restored, "promotion_rules": rules,
                "plan_contract": plan_contract(rnd.parent.artifact_id, before, restored, rollback_ids, allowed),
@@ -390,6 +407,8 @@ def train(rnd):
     record = portable_record(record, context="regression_round_record")
     append_jsonl(state / "decisions.jsonl", record)
     write_json(run / "round_summary.json", record)
+    from ..progress import save_resources
+    save_resources(state)
     with stage("save_state_rpc", dataset=dataset):
         rnd.save_state(state)
     # 阶段 11：保存的是可写状态副本；finish 引用实际读过的历史和本轮真实回执，等待宿主确认后退出。

@@ -91,7 +91,7 @@ def measure(runtime, directory, descriptor, validation_path, validation, dataset
 
 
 def run_dataset(base, out, dataset, rounds, runtime, *, peer_factory=None, journal=None, max_rounds=None, exchange_options=None,
-                compact_validation=False, aggregate_parent=False):
+                compact_validation=False, aggregate_parent=False, experiment_sequence=None):
     # 一个数据集的多轮宿主：registry 保存真实产物目录，current 永远是上轮最终选中的 ID。
     # peer_factory 决定模型来源（真实回复或记录重放）；缺省才使用明确标识的离线模型替身。
     out.mkdir()
@@ -133,9 +133,13 @@ def run_dataset(base, out, dataset, rounds, runtime, *, peer_factory=None, journ
             # 平台反馈复现：start 只有具名指标，不含冗余范围/摘要；原始帧仍完整留档。
             host.frame["current_validation"] = {"metrics": score}
         config = json.loads((ROOT / "submission_config.json").read_text(encoding="utf-8"))
-        menu = config["experiments"] if dataset == "A" else config["regression"]["experiments"]
+        from gas_a.regression.submission import dataset_config
+        menu = config["experiments"] if dataset == "A" else dataset_config(config, dataset)["experiments"]
         if peer_factory is None:
-            host.experiment = menu[(index - 1) % len(menu)]["name"]
+            host.experiment = (experiment_sequence[(index - 1) % len(experiment_sequence)] if experiment_sequence
+                               else menu[(index - 1) % len(menu)]["name"])
+            if host.experiment not in {spec["name"] for spec in menu}:
+                raise ValueError("Validation sequence requests an unconfigured experiment")
         for identifier, (source, _) in registry.items():
             host.add_artifact(identifier, source)
         # The host remeasures every newly uploaded candidate through the same native prediction entry.

@@ -24,7 +24,7 @@ from .continuation import continue_candidate
 from .parent_checkpoint import primary_checkpoint
 from .frozen_router import load_predictor, checkpoint_paths as artifact_checkpoint_paths
 from .monitoring import fit_reference, monitor, diagnose
-from .evolution import (load_policy, available_experiments, promotion_gate,
+from .evolution import (load_policy, available_experiments, promotion_gate, experiment_evidence,
                         fingerprint, advance_policy, validate_controller, eligible_history)
 from .controller_prompts import (VERSION as CONTROLLER_PROMPT_VERSION, execution_policy,
                                  enrich_plan, enrich_selection, request_digest)
@@ -173,6 +173,8 @@ def _decision(rnd, request, fields, token_limit, validate, corrections=1, eviden
                 # Qwen can otherwise spend the entire authorized budget reasoning.
                 max_tokens=min(token_limit, rnd.max_output_tokens), temperature=0, enable_thinking=False,
             )
+        from .progress import record_model_receipt
+        record_model_receipt(receipt)
         call_ids.append(receipt.call_id)
         if evidence_path is not None:
             append_jsonl(evidence_path, portable_record({"round_index": rnd.round_index, "phase": request.get("phase"),
@@ -294,7 +296,7 @@ def _history_view(records):
             compact["configuration"] = {k: cfg[k] for k in (
                 "round_index", "parent_checkpoint_sha256", "train_sha256", "validation_sha256",
                 "local_validation_before", "local_validation_after", "selected_local_macro_f1",
-                "candidate_gate", "host_candidate_gate", "experiment_failure",
+                "candidate_gate", "host_candidate_gate", "experiment_failure", "experiment_outcome",
                 "execution_policy", "controller_prompt_version") if k in cfg}
             spec = cfg.get("experiment")
             if isinstance(spec, dict):
@@ -410,7 +412,10 @@ def train(rnd):
         "request": "Use drift, diagnosis, history and bounded strategy evidence to choose observation, one continuation experiment, or a validated historical rollback. Observation is appropriate when no useful experiment remains.",
         "parent_checkpoint_sha256": rnd.parent.checkpoint_sha256,
         "parent_artifact_id": rnd.parent.artifact_id,
+        "parent_predictor_scope": "complete_frozen_bundle" if parent.meta.get("prediction_bundle") else "single_network",
         "validation_before": before, "history": _history_view(history), "experiments": allowed_menu,
+        "experiment_evidence": experiment_evidence(_history_view(history), policy["attempts"], menu,
+            rnd.parent.checkpoint_sha256, train_data["sha256"], validation["sha256"], execution, controller, blocked=blocked),
         "host_parent_reference": host_parent,
         "monitoring": {key: value for key, value in drift.items() if key != "features"},
         "diagnosis": diagnosis, "historical_validation": restored,
@@ -568,6 +573,8 @@ def train(rnd):
     append_jsonl(state / "decisions.jsonl", record)
     write_json(run / "round_summary.json", record)
     # 阶段 12：先提交完整原生状态，再结束本轮。下一轮父模型仍以宿主 start 为准，不由 state 擅自指定。
+    from .progress import save_resources
+    save_resources(state)
     with stage("save_state_rpc", dataset="A"):
         rnd.save_state(state)
     # finish 引用本轮实际读取的历史和真实模型回执，等待宿主确认后由 SDK 结束进程。

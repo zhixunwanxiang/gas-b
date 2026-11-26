@@ -30,11 +30,17 @@ def fit_epoch(model, train, spec, deadline):
         if spec["loss"] == "huber":
             # Huber 在目标标准化后使用固定 delta=1，降低大残差对梯度的支配；不修改原始寿命标签。
             absolute = np.abs(error)
-            total += float(np.where(absolute <= 1, .5 * error ** 2, absolute - .5).sum())
+            losses = np.where(absolute <= 1, .5 * error ** 2, absolute - .5)
             delta = (np.clip(error, -1, 1) / len(indices))[:, None]
         else:
-            total += float(np.sum(error ** 2))
+            losses = error ** 2
             delta = (2 * error / len(indices))[:, None]
+        if spec.get("underestimate_weight", 1.0) != 1.0:
+            # 仅根据 train 残差方向加权，预测和验证计算保持原始 RMSE/MAE 定义。
+            weights = np.where(error < 0, spec["underestimate_weight"], 1.0)
+            losses = losses * weights
+            delta = delta * weights[:, None]
+        total += float(losses.sum())
         gradients = {"w2": hidden.T @ delta, "b2": delta.sum(axis=0)}
         # tanh 隐藏层的导数为 1-hidden**2；整个反向传播只访问 train 的 batch 与标签。
         if not spec["freeze_features"]:

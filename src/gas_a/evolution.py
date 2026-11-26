@@ -7,6 +7,7 @@ import json
 import math
 
 EXPERIMENT_POLICY_VERSION = "classified-rejections-fresh-history-v2"
+REPEAT_POLICY = "skip-completed-identical-performance-rejection-v1"
 OUTCOMES = {"adopted", "performance_rejected", "measurement_unverified",
             "controller_guard", "not_selected", "local_training_failed", "unclassified"}
 
@@ -126,11 +127,70 @@ def available_experiments(policy, menu, rnd, train, validation, config, executio
     for name, spec in menu.items():
         identity = fingerprint(rnd.parent.checkpoint_sha256, train["sha256"], validation["sha256"], spec, execution_policy)
         rejected = sum(a["fingerprint"] == identity and counted_rejection(a) for a in policy["attempts"])
-        if rejected >= config["max_repeat_rejections"]:
+        matching = [a for a in policy["attempts"] if a["fingerprint"] == identity]
+        if rejected >= config["max_repeat_rejections"] or _completed_rejection(matching, execution_policy):
             blocked.append(name)
         else:
             allowed[name] = spec
     return allowed, blocked
+
+
+def _completed_rejection(attempts, execution):
+    # 固定 seed、父优化器、数据和参数的已完成数值实验可重放；同条件性能失败不重复付出计算。
+    # 超时/本地异常、核验拒绝和未采用不触发此规则；换数据或父模型会生成新身份。
+    return (isinstance(execution, dict) and execution.get("repeat_policy") == REPEAT_POLICY
+            and any(not a["adopted"] and a.get("outcome") == "performance_rejected" for a in attempts))
+
+
+def experiment_evidence(history, attempts, menu, parent_sha, train_sha, validation_sha, execution, rules,
+                        *, gain_key="macro_f1_gain", blocked=()):
+    """Expose exact-condition attempts separately from old or incomplete history."""
+    def spec_digest(spec):
+        return "sha256:" + hashlib.sha256(json.dumps(spec, sort_keys=True, allow_nan=False,
+                                                     separators=(",", ":")).encode()).hexdigest()
+    evidence = {}
+    for name, spec in menu.items():
+        identity = fingerprint(parent_sha, train_sha, validation_sha, spec, execution)
+        matching = [a for a in attempts if a.get("fingerprint") == identity]
+        gains = [a[gain_key] for a in matching if type(a.get(gain_key)) in (int, float) and math.isfinite(a[gain_key])]
+        recent = []
+        for item in history[-10:]:
+            cfg = item.get("configuration", {})
+            old_spec = cfg.get("experiment") if isinstance(cfg, dict) else None
+            if not isinstance(old_spec, dict) or old_spec.get("name") != name:
+                continue
+            comparisons = {key: cfg[field] == current if cfg.get(field) is not None else None
+                for key, field, current in (
+                    ("parent", "parent_checkpoint_sha256", parent_sha), ("train", "train_sha256", train_sha),
+                    ("validation", "validation_sha256", validation_sha), ("execution", "execution_policy", execution))}
+            comparisons["experiment"] = cfg.get("experiment_config_sha256", spec_digest(old_spec)) == spec_digest(spec)
+            status = ("different" if False in comparisons.values() else
+                      "same" if all(value is True for value in comparisons.values()) else "unknown")
+            gate = cfg.get("candidate_gate")
+            outcome = cfg.get("experiment_outcome")
+            gate = gate if isinstance(gate, dict) else {}
+            outcome = outcome if isinstance(outcome, dict) else {}
+            recent.append({"history_id": item["id"], "conditions": status,
+                           "matches": comparisons, "recorded_gain": gate.get(gain_key),
+                           "reason": outcome.get("reason") or ("local_training_failed" if cfg.get("experiment_failure")
+                               else "class_recall_regression" if gate.get("class_recall_losses")
+                               else "local_promotion_gate_rejected" if gate.get("eligible") is False
+                               else "see_host_admission"),
+                           "counts_as_current_condition_evidence": status == "same"})
+        rejections = sum(counted_rejection(a) for a in matching)
+        evidence[name] = {"available": name not in blocked, "current_condition_attempts": len(matching),
+                          "current_condition_counted_rejections": rejections,
+                          "remaining_rejection_budget": (0 if _completed_rejection(matching, execution)
+                              else max(0, rules["max_repeat_rejections"] - rejections)),
+                          "completed_identical_rejection": bool(_completed_rejection(matching, execution)),
+                          "best_current_condition_gain": max(gains) if gains else None,
+                          "gain_metric": gain_key,
+                          "current_condition_outcomes": {outcome: sum(a.get("outcome") == outcome for a in matching)
+                              for outcome in sorted(OUTCOMES) if any(a.get("outcome") == outcome for a in matching)},
+                          "recent_history": recent[-3:],
+                          "interpretation": "current_conditions_attempted" if matching or any(
+                              row["conditions"] == "same" for row in recent) else "no_verified_attempt_for_current_conditions"}
+    return evidence
 
 
 def promotion_gate(before, after, config):

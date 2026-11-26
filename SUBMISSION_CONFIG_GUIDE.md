@@ -2,6 +2,12 @@
 
 本文对应当前项目根目录的 `submission_config.json`。原A分类部分共72个参数路径；v5新增的B/C回归参数在下面单独说明。数组中的传感器号、权重候选等作为一个参数整体说明，重复的训练参数含义相同。
 
+v20 补充：B 独立菜单新增 `underestimate_mild`，MSE、学习率 `0.001`、最多 8 epoch，`underestimate_weight=1.25`。只对 train 中预测低于目标的残差加权，仍以原始 RMSE、MAE 测量并执行原门槛；权重合法范围为有限数 `1～1.5`，默认 `1`。C 不开放此项。
+
+v20 的执行策略启用 `repeat_policy=skip-completed-identical-performance-rejection-v1`：父模型、train、validation、方案和执行策略全部一致时，一次已完成的明确性能失败即可暂停该项；本地异常仍按下表的 2 次上限处理，测量未核验、控制器保护和合格但未采用不因此屏蔽。换父模型或数据会重新开放。该规则同时用于 A/B/C。
+
+每轮 SDK 保存的 `resources.json` 记录 CPU、阶段耗时、进程峰值内存及实际返回的模型 token 用量。保存截点为 `before_save_state`；保存状态和 finish 的完整耗时见 stderr 的退出总计。预测进程退出时只输出一次汇总。宿主不返回 usage 时标为未知，不能将其当作零成本；这些记录不等于正式资源效率评分。
+
 ## v5新增：regression（只影响B/C，不修改A的分类门槛）
 
 实现位于 `src/gas_a/regression/submission.py`、`training.py` 和 `evaluation.py`。
@@ -229,3 +235,9 @@ Dockerfile 会把本文件复制进镜像；本地改完后，正式提交镜像
 本文已同步控制器 v3 的宿主测量保护、本地失败恢复及 home 轮数修复；JSON 参数值未调整。主、五传感器和 home 的新增轮数均受 `limits.max_epochs` 限制，home 在每个 epoch 前检查候选截止时间，内部仍没有逐 batch 的截止时间检查。训练预算和选版执行策略参与实验签名；仅改提示词措辞不会清空失败记录。本地训练失败会计入 `max_repeat_rejections`。正式选版另需通过宿主回执校验，不能只凭本地高分绕过未知或冲突的宿主测量，见 [修复说明](docs/CODE_FIXES_20261122.md)。
 
 2026-11-25 策略调整：实验记录增加 `outcome`、`reason`、`counts_toward_rejection_limit`，配置摘要保存 `experiment_outcome`。规划 `action` 继续表示本轮是否从实际父模型训练；最终 `selection_action` 单独记录 `adopt_candidate`、`retain_parent` 或 `rollback`。最终选版可选择 SDK 当前允许、确实已恢复且在本轮相同验证摘要下复评合格的历史产物，无需规划预先选择 `rollback`；恢复次数上限不变。规划进入 `program_guard` 时仍只允许实际父模型。执行策略版本与提示词版本同步更新，旧失败记录保留，不再把未知原因的未采用当作性能失败。
+
+2026-11-26 测评优化：`regression.experiments` 继续作为 B/C 的共享基础菜单，新增 `regression.dataset_experiments` 按数据集追加菜单。当前只为 C 追加 `fine_rate`，参数为 MSE、学习率 `0.00003`、最多 8 epoch、不冻结特征层。B 的四个基础方案保持原参数。追加方案与基础方案的名称必须唯一，仍受 `regression.limits` 与原 RMSE/MAE 门槛约束。
+
+A 已采用路由父模型后执行非路由方案时，保留实际父产物的辅助专家和路由策略，仅续训主组件。该路径的逐 epoch 选择、早停及最终门槛均比较完整预测器，记录 `epoch_history_scope=complete_bundle_with_retained_auxiliaries`。显式 `frozen_router` 仍重新训练辅助专家并校准路由，其主组件 epoch 曲线与最终完整路由分数分别标注范围。
+
+A 与 B/C 的规划增加 `experiment_evidence`，逐方案展示相同父权重、训练数据、验证数据、方案与执行策略下的尝试、拒绝和最好增益。历史比较为 `different` 或 `unknown` 时，不作为当前条件已失败的证据。菜单限制、两阶段真实模型调用和最终准入规则保持原有流程。

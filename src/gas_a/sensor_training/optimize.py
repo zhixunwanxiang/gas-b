@@ -325,7 +325,7 @@ def fit_weighted(model, train, spec, weak_class, deadline, *, on_epoch=None,
     return epoch_records, weights.tolist()
 
 
-def train_candidate(parent, train, validation, directory, spec, diagnosis, limits):
+def train_candidate(parent, train, validation, directory, spec, diagnosis, limits, *, validation_predictor=None):
     """为单次候选创建独立目录；任何训练异常均写入 failure.json 并保留已消耗资源。"""
     # 独立新目录保证候选不会覆盖父产物或其他实验；失败报告保留已发生的资源和配置证据。
     spec = bounded_experiment(spec, limits)
@@ -333,7 +333,8 @@ def train_candidate(parent, train, validation, directory, spec, diagnosis, limit
     directory.mkdir(parents=True, exist_ok=False)
     started, cpu_started = time.monotonic(), time.process_time()
     try:
-        return _train_candidate(parent, train, validation, directory, spec, diagnosis, limits, started, cpu_started)
+        return _train_candidate(parent, train, validation, directory, spec, diagnosis, limits, started, cpu_started,
+                                validation_predictor=validation_predictor)
     except Exception as exc:
         write_json(directory / "failure.json", {"format": "gas-a.failed-experiment.v1", "configuration": spec,
                    "error": f"{type(exc).__name__}: {exc}", "resources": _resources(started, cpu_started),
@@ -348,7 +349,8 @@ def _resources(started, cpu_started):
             "new_label_requests": 0, "scope": "本进程候选加载、评估、续训及导出，计至报告写入前；平台额度另行计量"}
 
 
-def _train_candidate(parent, train, validation, directory, spec, diagnosis, limits, attempt_started, cpu_started):
+def _train_candidate(parent, train, validation, directory, spec, diagnosis, limits, attempt_started, cpu_started,
+                     *, validation_predictor=None):
     """从父模型完整状态续训，保存源码快照、逐 epoch 证据和最终选定的 checkpoint。"""
     # 训练前先快照父模型和源码；逐 epoch 记录门槛及完整状态，选择后导出、重载复评。
     # 已执行的训练量与最终导出 epoch 分开记录，早停或回选最佳 epoch 不会抹去实际成本。
@@ -369,7 +371,10 @@ def _train_candidate(parent, train, validation, directory, spec, diagnosis, limi
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes((source_root / name).read_bytes())
     stage_id = directory.parent.name + "/" + directory.name
-    before = evaluate(model, validation)
+    def measure(current):
+        return evaluate(validation_predictor(current) if validation_predictor else current, validation)
+    anchor_before = evaluate(model, validation)
+    before = measure(model) if validation_predictor else anchor_before
     train_before = evaluate(model, train)
     migration = None
     # 可选架构变化先保函数迁移，并在 train/validation 上验证续训前预测一致，不能重新初始化后冒称续训。
@@ -404,7 +409,9 @@ def _train_candidate(parent, train, validation, directory, spec, diagnosis, limi
         nonlocal best, best_key, best_record, stale
         # 在下一次参数更新前，评估当前 epoch 对应的模型。
         record.update(stage_id=stage_id, seed=model.meta["seed"], step=record["steps"],
-                      validation=evaluate(model, validation))
+                      validation=measure(model))
+        if validation_predictor:
+            record["anchor_validation"] = evaluate(model, validation)
         controller_policy = limits.get("controller_checkpoint_gate")
         policy = limits.get("checkpoint_gate")
         # 平台训练路径使用正式控制器门槛；即使某 epoch 的 F1 更高，只要类别保护不合格就不能排在合格 epoch 前。
@@ -442,7 +449,7 @@ def _train_candidate(parent, train, validation, directory, spec, diagnosis, limi
 
     started = time.monotonic()
     epoch_records, weights = fit_weighted(model, train, spec, diagnosis["weakest_class"],
-                                        started + limits["max_seconds_per_candidate"], on_epoch=record_epoch)
+                                        attempt_started + limits["max_seconds_per_candidate"], on_epoch=record_epoch)
     executed_steps, executed_epochs = model.meta["steps"], model.meta["epochs"]
     # 导出最佳 epoch 时恢复权重、Adam 矩与计数器；实际执行量单独保留用于成本核算。
     # 最佳 epoch 选择只改变导出状态；实际训练已执行的 epoch/step 另记，不回退成本记录。
@@ -459,7 +466,7 @@ def _train_candidate(parent, train, validation, directory, spec, diagnosis, limi
     frozen_after = frozen_state_hashes(reloaded, frozen)
     if frozen_before != frozen_after:
         raise ValueError("Frozen weights or Adam state changed")
-    if abs(evaluate(reloaded, validation)["macro_f1"] - after["macro_f1"]) > 1e-12:
+    if abs(measure(reloaded)["macro_f1"] - after["macro_f1"]) > 1e-12:
         raise ValueError("Reloaded checkpoint prediction changed")
     projected_count = ((16 - len(spec["kept_sensors"])) * 8 * model.params["w1"].shape[1]
                        if "kept_sensors" in spec else 0)
@@ -500,6 +507,12 @@ def _train_candidate(parent, train, validation, directory, spec, diagnosis, limi
               "train_before": train_before, "train_after": evaluate(model, train),
               "terminal_validation": epoch_records[-1]["validation"],
               "training_seconds": time.monotonic() - started, "official_scoring_ready": False}
+    if validation_predictor:
+        report.update(anchor_validation_before=anchor_before,
+                      anchor_validation_after=evaluate(reloaded, validation),
+                      epoch_history_scope="complete_bundle_with_retained_auxiliaries",
+                      training_metrics_scope="primary_neural_component_only")
+        report["checkpoint_selection"]["predictor_scope"] = report["epoch_history_scope"]
     report["resources"] = _resources(attempt_started, cpu_started)
     configuration = {**spec, **architecture_shape(model),
                      "activation": "tanh_with_identity_residual_layers" if isinstance(model, MigratedModel) else "tanh", "optimizer": "Adam",

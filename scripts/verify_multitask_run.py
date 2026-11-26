@@ -19,7 +19,7 @@ def verify(root):
     assert image["runtime_probe"]["verified"]
     assert summary["real_model_calls"] == 0
     assert summary["runtime"]["container_policy_verified"]
-    datasets = [report["dataset"] for report in summary["reports"]]
+    datasets = [report["dataset"] for report in (summary.get("reports") or summary.get("datasets", []))]
     assert datasets and len(set(datasets)) == len(datasets) and set(datasets) <= {"A", "B", "C"}
     groups, rows_checked, complete = 0, 0, {}
     for dataset in datasets:

@@ -1,5 +1,5 @@
 """显式区分当前父模型与历史版本；动作、目标和训练起点必须保持一致。"""
-VERSION = "rul-bc-controller-zh-v4"
+VERSION = "rul-bc-controller-zh-v6"
 # 提示词版本也进入实验身份，防止已修复的动作说明与旧失败实验被当作完全相同的上下文。
 
 
@@ -33,7 +33,12 @@ PLAN_INSTRUCTION = (
     "历史项已在同一当前公开验证集重新测量且gate合格时，应直接比较这些实测RMSE；若历史明显优于当前父模型，优先考虑恢复历史版本。"
     "不能把observe称为保留历史最佳，也不能凭空声称当前父模型就是某个历史ID、把已核验的模型退化解释成未经证实的数据异常。"
     "RMSE越低越好，MAE是辅助保护，C另记录NASA分数。菜单定义决定是否冻结特征，不能因父版本曾冻结就说它以后不能解冻。"
+    "B的underestimate_mild对train中的负残差加权1.25，适用于已测得的低估；它可能增加短寿命高估，须同时检查分段偏差和MAE。C的fine_rate是小步续训，不是统一抬高预测值。"
     "未采用的历史候选没有成为父模型，不能把再次从相同父权重运行同一方案描述为累积续训；应结合失败次数选择其他允许方案。"
+    "experiment_evidence逐方案区分当前父权重、train、validation、参数和执行策略完全相同的尝试。"
+    "completed_identical_rejection为true表示该固定条件下已完成且性能失败，程序会屏蔽重复数值实验；数据、父模型或执行规则改变后可重新验证。"
+    "recent_history中conditions=different或unknown不证明当前条件失败；recorded_gain不能当作当前收益。"
+    "数据或父模型变化后结合新误差重新判断；没有逐项同条件证据不能声称所有菜单都已失败，observe须说明具体证据与风险。"
     "只有明确性能不合格或本地训练失败计入拒绝上限；测量未核验、选版program_guard或另选合格模型不能直接当作训练方案无效。"
     "parent_host_reference若来自local_current_parent_public_reevaluation，表示当前父权重在本轮公开验证集独立实测，"
     "host_reference仅保留缺少身份字段的旧宿主摘要；不能再把该摘要的unknown_validation_scope误认为当前父参考不可比。"

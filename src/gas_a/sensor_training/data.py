@@ -37,23 +37,13 @@ def load_unlabelled(path):
 
 
 def load_data(path, expected_paths=None):
-    # 在通用 reference 特征展开之前检查输入，仅允许 128 维 features 数组。
-    """先限定任务 A 的输入结构，再由 reference 加载器校验样本 ID、标签与特征 schema。"""
-    with open(path, encoding="utf-8") as stream:
-        for number, line in enumerate(stream, 1):
-            if not line.strip():
-                continue
-            try:
-                row = json_value(line)
-            except ValueError as error:
-                raise ValueError(f"{Path(path).name}: line {number}: {error}") from error
-            inputs = row.get("inputs") if isinstance(row, dict) else None
-            if not isinstance(inputs, dict) or set(inputs) != {"features"}:
-                raise ValueError(f"{Path(path).name}: line {number}: A input must contain only inputs.features; IDs and targets are not features")
-            values = inputs["features"]
-            if not isinstance(values, list) or len(values) != 128:
-                raise ValueError(f"{Path(path).name}: line {number}: A requires exactly 128 features")
-    result = read_dataset(path, "classification", CLASSES, expected_paths)
+    """Validate A's strict schema in the same parse as IDs, labels and numbers."""
+    def validate(inputs):
+        if not isinstance(inputs, dict) or set(inputs) != {"features"}:
+            raise ValueError("A input must contain only inputs.features; IDs and targets are not features")
+        if not isinstance(inputs["features"], list) or len(inputs["features"]) != 128:
+            raise ValueError("A requires exactly 128 features")
+    result = read_dataset(path, "classification", CLASSES, expected_paths, validate_inputs=validate)
     if result["x"].shape[1] != 128:
         raise ValueError("A requires 128 numeric features")
     return result

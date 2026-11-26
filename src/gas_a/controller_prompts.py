@@ -8,15 +8,17 @@ The host attaches the official prompt. These are participant instructions only.
 import hashlib
 from .host_validation import HOST_ADMISSION_VERSION
 from .sensor_training.io import json_text
-from .evolution import EXPERIMENT_POLICY_VERSION
+from .evolution import EXPERIMENT_POLICY_VERSION, REPEAT_POLICY
 from .sensor_training.reference.data import finite_number
 
-VERSION = "gas-a-controller-zh-v6"
-EPOCH_POLICY_VERSION = "same-promotion-gate-per-epoch-v1"
-ROUTING_POLICY_VERSION = "protected-class-bounded-routing-v2"
+VERSION = "gas-a-controller-zh-v8"
+EPOCH_POLICY_VERSION = "retained-complete-bundle-per-epoch-v2"
+ROUTING_POLICY_VERSION = "protected-routing-retained-auxiliaries-v3"
 
 PLAN = """你是任务 A 的受控工业模型实验负责人。目标是在同一份授权公开验证集上，找到能真正通过上线门槛的 Macro-F1 改进，而非只生成更高但不可上线的候选。
 先比较当前逐类错误、混淆矩阵、传感器分布变化和 history_feedback，再在 response_schema 允许值内选择一个动作。admission 明确给出了最低 F1、受保护类别召回底线和未受保护的小样本类别；底线是约束，不是应主动牺牲到的目标。
+experiment_evidence 按每个菜单项给出当前父模型、train、validation、方案和执行策略完全相同的尝试与拒绝次数。recent_history 的 conditions=different 或 unknown 不证明当前条件已失败，recorded_gain 只属于旧条件。数据摘要变化后应依据新错误重新判断；没有逐项同条件证据时，不得声称所有方案均已失败或模型达到上限。observe 应引用具体方案、当前证据和风险。
+completed_identical_rejection=true 表示固定条件下已完成的确定性训练已被性能门槛拒绝，本条件不再重复；换数据或父模型后重新判断。超时、测量核验和控制器错误不等于已完成的性能失败。
 实验选择：优先检验有数据依据、尚未在相同父摘要+数据摘要+执行策略下验证的方案。根据 experiment_guide 判断该方案实际能改变什么，比较其潜在收益与类别代价。弱类增强与固定类别增强可能相乘，不能把增强弱类等同于整体收益。漂移大小不是特征重要性，更不证明传感器物理故障。
 历史学习：区分无增益、类别召回超限、合格但未采用和不同数据/父模型的结果。同条件已失败且执行策略未改变时，不机械重复；执行策略已修复时允许明确说明变化后重新检验。不要把不同验证集或不同父模型的绝对分数直接作为本轮收益。
 宿主核验：host_parent_reference 是本轮实际父模型的核验结果。历史 parent_measurement_unverified 属于测量核验拒绝，不能直接当作训练方案无效；当前父测量已核验且执行策略改变时，可重新检验有本地收益的允许方案。frozen_router 会在有界融合权重菜单中优先选择通过相同类别保护的路由。
@@ -36,7 +38,7 @@ reason 简短列出：同口径父/候选/历史分数、关键类别召回或�
 
 def execution_policy(controller, limits):
     # 把逐 epoch 选择、最终晋升和训练预算绑定为可序列化证据，供历史可比性和实验指纹使用。
-    return {"epoch_policy_version": EPOCH_POLICY_VERSION,
+    return {"epoch_policy_version": EPOCH_POLICY_VERSION, "repeat_policy": REPEAT_POLICY,
             "experiment_policy_version": EXPERIMENT_POLICY_VERSION,
             "routing_policy_version": ROUTING_POLICY_VERSION,
             "host_admission_policy_version": HOST_ADMISSION_VERSION,
@@ -107,6 +109,7 @@ def enrich_plan(request, controller, train, validation, policy):
                       "output_head_only" if spec.get("freeze") == "features" else "neural_continuation_with_sensor_projection",
                       "kept_sensors": kept, "learning_rate": spec["learning_rate"], "epochs": spec["epochs"],
                       "routing_selection": spec.get("routing", {}).get("selection"),
+                      "preserves_parent_auxiliaries": request.get("parent_predictor_scope") == "complete_frozen_bundle" and "routing" not in spec,
                       "weak_class": weak,
                       "weak_class_extra_multiplier_before_frequency_normalization": spec["weak_boost"] * spec.get("class_boosts", {}).get(weak, 1),
                       "risk": "sensor exclusion and class reweighting may trade recall between classes; head-only may provide little gain"}

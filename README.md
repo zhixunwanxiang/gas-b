@@ -1,6 +1,6 @@
 # Gas RSI：工业模型自进化系统
 
-更新日期：2026-11-25。
+更新日期：2026-11-26。
 
 项目支持 A 气体识别、B 轴承剩余寿命、C 发动机剩余寿命，使用 contest-harness SDK 1.0.4 接入平台。
 
@@ -14,18 +14,20 @@
 
 新增回归测试为 `tests/test_parent_checkpoint_manifest.py`，离线容器宿主支持 `--aggregate-parent` 和 `--compact-validation` 联合测试；聚合算法只是测试夹具，程序不会自行重算或替换官方身份。
 
-当前交付为 **v18 父产物清单校验版**，修复已在 v17 镜像中复现的聚合摘要误比较错误，并保留此前历史输入、数值溢出和路由清单结构保护。
+当前交付为 **v20 按项调优版**，继承 v19 的完整专家包续训、解析提速和 C `fine_rate`。新增 B 温和低估加权 `underestimate_mild`、相同条件已完成性能失败的去重，以及 CPU/耗时/token 资源记录。未过门槛的 C 偏置与残差修正未加入菜单。实施结果见 [v20 验收记录](docs/ITEM_TUNING_V20_20261126.md)。
+
+后续平台反馈：用户确认 v20 的 B/C 隐藏集表现未达到提分预期。本地协议通过与公开集小幅收益不能视为正式泛化验收通过；已补充分设备和尾部诊断，见 [B/C 平台反馈复核](docs/BC_V20_PLATFORM_REVIEW_20261126.md)。
 
 | 项目 | 内容 |
 |---|---|
-| 镜像标签 | `gas-rsi-abc:wyx-sdk104-v18-parent-manifest-20261125` |
-| 不可变镜像 ID | `sha256:3bf46eec43814d6fcaef9e885d7629d8b87507115d87e4c36fc5c6d72522c774` |
-| 镜像包 | [v18 TAR](output/submission-wyx-sdk104-v18-parent-manifest-20261125/gas-rsi-abc-wyx-sdk104-v18-parent-manifest-20261125.tar) |
-| 完整交付目录 | `output/submission-wyx-sdk104-v18-parent-manifest-20261125/` |
-| 交付总量 | 镜像、源码审查包及说明合计小于 **60 MiB**；逐文件摘要见目录内 `delivery-manifest.json` |
-| 已测源码快照 | `runtime/parent-manifest-v18-20261125/source/`，交付包另含更新后的 README；应用代码摘要与镜像逐文件匹配 |
+| 镜像标签 | `gas-rsi-abc:wyx-sdk104-v20-item-tuning-20261126` |
+| 不可变镜像 ID | `sha256:7acb79daae6b23287372a2ee2e4b2e1fc0719afed928c886cd88ace5fee8d400` |
+| 镜像包 | [v20 TAR](output/submission-wyx-sdk104-v20-item-tuning-20261126/gas-rsi-abc-wyx-sdk104-v20-item-tuning-20261126.tar) |
+| 完整交付目录 | `output/submission-wyx-sdk104-v20-item-tuning-20261126/` |
+| 交付摘要 | 逐文件大小与 SHA-256 见目录内 `delivery-manifest.json` |
+| 已测源码快照 | `runtime/item-tuning-v20-20261126/source/`，应用代码与镜像逐文件一致；文档随后同步交付状态 |
 | 运行依赖 | Python 3.12.13、NumPy 1.26.4、SDK 1.0.4 |
-| 验证范围 | 离线宿主模拟、真实数值训练与容器预测；未确认正式平台通过 |
+| 验证范围 | 官方 SDK、公开数据真实训练、A/B/C 各十轮容器预测；决策使用离线替身，未重新测量正式隐藏成绩 |
 
 本 README 的更新不会改变已经交付的镜像、源码审查包及其摘要。
 

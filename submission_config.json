@@ -30,7 +30,15 @@
       {"name": "standard_rate", "learning_rate": 0.001, "epochs": 6, "freeze_features": false, "loss": "mse"},
       {"name": "head_only", "learning_rate": 0.0005, "epochs": 4, "freeze_features": true, "loss": "mse"},
       {"name": "robust_huber", "learning_rate": 0.0003, "epochs": 5, "freeze_features": false, "loss": "huber"}
-    ]
+    ],
+    "dataset_experiments": {
+      "B": [
+        {"name": "underestimate_mild", "learning_rate": 0.001, "epochs": 8, "freeze_features": false, "loss": "mse", "underestimate_weight": 1.25}
+      ],
+      "C": [
+        {"name": "fine_rate", "learning_rate": 0.00003, "epochs": 8, "freeze_features": false, "loss": "mse"}
+      ]
+    }
   },
   "experiments": [
     {

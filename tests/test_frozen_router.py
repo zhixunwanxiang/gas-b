@@ -232,13 +232,20 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         self.assertIsInstance(load_predictor(restored / "checkpoint.npz"), FrozenRouter)
         self.assertIsNone(host.candidate)
 
-    def test_a_plain_continuation_of_a_routed_parent_has_no_stale_bundle_marker(self):
+    def test_plain_continuation_preserves_actual_parent_bundle_and_auxiliary_bytes(self):
         spec = dict(next(s for s in self.config["experiments"] if s["name"] == "conservative_head"), epochs=1)
         report = continue_candidate(self.bundle / "checkpoint.npz", self.train, self.validation,
                                     self.root / "plain-child", spec, {"weakest_class": "Acetaldehyde"}, self.config["limits"])
         model = load_predictor(self.root / "plain-child/checkpoint.npz")
-        self.assertNotIsInstance(model, FrozenRouter)
-        self.assertNotIn("prediction_bundle", model.meta)
+        self.assertIsInstance(model, FrozenRouter)
+        self.assertEqual(model.policy, load_predictor(self.bundle / "checkpoint.npz").policy)
+        for role in ("five_sensor", "home_trunk", "home_router"):
+            self.assertEqual(digest(model.component_paths[role]), digest(self.bundle / "routing" / (role + ".npz")))
+        self.assertAlmostEqual(evaluate(model, self.validation)["macro_f1"], report["validation_after"]["macro_f1"])
+        independent = self.root / "independent-model"
+        shutil.copytree(self.root / "plain-child", independent)
+        isolated = load_predictor(independent / "checkpoint.npz")
+        np.testing.assert_array_equal(model.predict(self.validation["x"]), isolated.predict(self.validation["x"]))
         self.assertAlmostEqual(report["validation_before"]["macro_f1"], self.report["validation_after"]["macro_f1"])
 
     def test_controller_epoch_gate_compares_against_complete_routed_parent(self):
@@ -249,6 +256,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
                                     self.root / "guarded-plain-child", spec, {"weakest_class": "Acetaldehyde"},
                                     {**self.config["limits"], "controller_checkpoint_gate": gate})
         reference = report["checkpoint_selection"]["reference_metrics"]["macro_f1"]
+        self.assertEqual(report["epoch_history_scope"], "complete_bundle_with_retained_auxiliaries")
         self.assertAlmostEqual(reference, self.report["validation_after"]["macro_f1"])
         for epoch in report["epoch_history"]:
             self.assertAlmostEqual(epoch["controller_gate"]["macro_f1_gain"], epoch["validation"]["macro_f1"] - reference)

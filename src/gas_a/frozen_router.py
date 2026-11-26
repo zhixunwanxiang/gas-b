@@ -49,9 +49,12 @@ def _expert_scores(models, policy, x, stream):
         adjusted, stream["drift"] = correct(x, reference, stream["drift"])
     else:
         adjusted = x
-    four = (reference.predict(x) + reference.predict(adjusted)) * .5
+    four = reference.predict(x)
     five_model = models["five_sensor"]
-    five = (five_model.predict(x) + five_model.predict(adjusted)) * .5
+    five = five_model.predict(x)
+    if policy["feature_correction"]:
+        four = (four + reference.predict(adjusted)) * .5
+        five = (five + five_model.predict(adjusted)) * .5
     home = home_probabilities(HomeExpert(models["home_trunk"], models["home_router"]),
                               adjusted, policy["cutoffs"])
     return four, five, home, alarm
@@ -235,6 +238,46 @@ def _replace_checkpoint(model, target):
         os.replace(temporary, target)
     finally:
         Path(temporary).unlink(missing_ok=True)
+
+
+def retain_bundle(parent, candidate, validation):
+    """Export the continued primary with byte-identical actual-parent auxiliaries."""
+    candidate = Path(candidate)
+    primary_path = candidate / "checkpoint.npz"
+    primary = load_model(primary_path, parent.meta["paths"])
+    auxiliary = candidate / "routing"
+    auxiliary.mkdir()
+    files = {"four_sensor": primary_path}
+    retained = {}
+    for role in COMPONENTS[1:]:
+        source = parent.component_paths[role]
+        expected = parent.manifest["components"][role]["sha256"]
+        if digest(source) != expected:
+            raise ValueError("Retained parent component changed: " + role)
+        target = auxiliary / (role + ".npz")
+        shutil.copyfile(source, target)
+        if digest(target) != expected:
+            raise ValueError("Retained component copy differs: " + role)
+        files[role] = target
+        retained[role] = {"sha256": expected, "unchanged": True}
+    models = {**parent.models, "four_sensor": primary}
+    measured = evaluate(FrozenRouter(models, parent.manifest, files, candidate / MANIFEST), validation)
+    primary.meta["prediction_bundle"] = {"format": FORMAT, "manifest": MANIFEST}
+    _replace_checkpoint(primary, primary_path)
+    manifest = deepcopy(parent.manifest)
+    manifest["components"] = {role: {"path": path.relative_to(candidate).as_posix(), "sha256": digest(path)}
+                              for role, path in files.items()}
+    manifest["prediction_parameter_count"] = sum(model.meta["parameter_count"] for model in models.values())
+    manifest["prediction_parameter_count"] += sum(len(head["w"]) + 1
+        for head in models["home_router"].meta["private_joint_rescue"].values())
+    manifest["calibration"] = {"scope": "authorized_public_validation", "validation_sha256": validation["sha256"],
+        "validation_rows": len(validation["y"]), "selected_metrics": measured,
+        "policy_source": "retained_actual_parent_policy", "retained_components": retained}
+    write_json(candidate / MANIFEST, manifest)
+    exported = evaluate(load_predictor(primary_path, validation["paths"]), validation)
+    if abs(exported["macro_f1"] - measured["macro_f1"]) > 1e-12:
+        raise ValueError("Retained exported bundle differs from epoch predictor")
+    return exported, manifest
 
 
 def build_bundle(parent_path, parent_predictor, train, validation, candidate, spec, diagnosis, limits, started):

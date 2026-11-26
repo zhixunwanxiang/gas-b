@@ -63,7 +63,39 @@ def flatten(inputs):
     return paths, values
 
 
-def read_dataset(path, task, classes=None, expected_paths=None):
+def _schema(inputs):
+    # The first row has already passed flatten's field/depth checks.
+    if isinstance(inputs, dict):
+        return ("dict", tuple((key, _schema(inputs[key])) for key in sorted(inputs)))
+    if isinstance(inputs, list):
+        return ("list", tuple(_schema(value) for value in inputs))
+    return ("number", ())
+
+
+def _schema_values(inputs, schema):
+    """Validate every row without rebuilding and JSON-encoding every feature path."""
+    values = []
+    def visit(value, node):
+        kind, children = node
+        if kind == "dict":
+            if not isinstance(value, dict) or value.keys() != {key for key, _ in children}:
+                raise ValueError("feature schema changed")
+            for key, child in children:
+                visit(value[key], child)
+        elif kind == "list":
+            if not isinstance(value, list) or len(value) != len(children):
+                raise ValueError("feature schema changed")
+            for item, child in zip(value, children):
+                visit(item, child)
+        elif not finite_number(value):
+            raise ValueError("model inputs must contain finite numeric features only")
+        else:
+            values.append(float(value))
+    visit(inputs, schema)
+    return values
+
+
+def read_dataset(path, task, classes=None, expected_paths=None, *, validate_inputs=None):
     path = Path(path)
     if not path.is_file() or path.is_symlink() or path.stat().st_size > MAX_BYTES:
         raise ValueError("dataset must be a regular JSONL file no larger than 128 MiB")
@@ -71,6 +103,7 @@ def read_dataset(path, task, classes=None, expected_paths=None):
     ids, features, targets = [], [], []
     seen = set()
     paths = expected_paths
+    schema = None
     for number, line in enumerate(raw.decode("utf-8").splitlines(), 1):
         if not line.strip():
             continue
@@ -84,13 +117,18 @@ def read_dataset(path, task, classes=None, expected_paths=None):
         if not isinstance(identity, str) or not identity or identity in seen:
             raise ValueError(f"line {number}: sample IDs must be nonempty and unique")
         try:
-            current_paths, values = flatten(row["inputs"])
+            if validate_inputs:
+                validate_inputs(row["inputs"])
+            if schema is None:
+                current_paths, values = flatten(row["inputs"])
+                if paths is not None and current_paths != paths:
+                    raise ValueError("feature schema changed")
+                paths = current_paths
+                schema = _schema(row["inputs"])
+            else:
+                values = _schema_values(row["inputs"], schema)
         except ValueError as error:
             raise ValueError(f"{path.name}: line {number}: {error}") from error
-        if paths is None:
-            paths = current_paths
-        if current_paths != paths:
-            raise ValueError(f"line {number}: feature schema changed")
         answer = row["answer"]
         if task == "classification":
             if not isinstance(answer, str) or not classes or answer not in classes:
