@@ -11,7 +11,7 @@ from ..sensor_training.io import digest, write_json
 def implementation_identity():
     root = Path(__file__).resolve().parents[1]
     names = ("regression/assessment.py", "regression/evaluation.py", "regression/data.py", "regression/model.py",
-             "regression/grouping.py", "sensor_training/reference/model.py")
+             "regression/grouping.py", "regression/fast_component.py", "regression/timing.py", "sensor_training/reference/model.py")
     return "sha256:" + hashlib.sha256(b"".join((root / n).read_bytes() for n in names)).hexdigest()
 
 

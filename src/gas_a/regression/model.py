@@ -6,6 +6,7 @@ import math
 import numpy as np
 from ..sensor_training.reference.model import Model as ReferenceModel, FORMAT as NEURAL_FORMAT
 from .grouping import fit_groups
+from . import fast_component
 
 COMPONENT_FORMAT = "rul.condition-ridge.v1"
 PREDICTOR_FORMAT = "contest.cpu-rul-components.v1"
@@ -22,6 +23,28 @@ def basis(x, mean, scale):
 
 class Model(ReferenceModel):
     def validate(self):
+        state = self.meta.get(fast_component.KEY)
+        self.fast_component = None
+        if state is None:
+            if self.meta.get("format") == fast_component.PREDICTOR_FORMAT:
+                raise ValueError("Missing fixed RBF component")
+            self._validate_components()
+            return
+        if self.meta.get("format") != fast_component.PREDICTOR_FORMAT or self.meta.get("neural_format") != NEURAL_FORMAT:
+            raise ValueError("Fixed RBF component requires its complete predictor format")
+        arrays = fast_component.validate(state, self.meta.get("profile"), len(self.meta.get("paths", [])))
+        old_format, total = self.meta["format"], self.meta.get("prediction_parameter_count")
+        self.meta["format"] = PREDICTOR_FORMAT if self.meta.get("regression_components") is not None else NEURAL_FORMAT
+        self.meta["prediction_parameter_count"] = self.meta["parameter_count"] + (self.meta.get("regression_components") or {}).get("parameter_count", 0)
+        try:
+            self._validate_components()
+            if type(total) is not int or total != self.meta["prediction_parameter_count"] + state["parameter_count"]:
+                raise ValueError("Complete fast predictor parameter count mismatch")
+        finally:
+            self.meta["format"], self.meta["prediction_parameter_count"] = old_format, total
+        self.fast_component = arrays
+
+    def _validate_components(self):
         head = self.meta.get("regression_components")
         complete = self.meta.get("format") == PREDICTOR_FORMAT
         if complete:
@@ -86,6 +109,26 @@ class Model(ReferenceModel):
         return ((setting[:, None] - c["centers"]) ** 2).sum(2).argmin(1) + 1
 
     def forward(self, x):
+        hidden, output = self._forward_components(x)
+        if self.fast_component is not None:
+            centers, weights = self.fast_component
+            head = self.meta[fast_component.KEY]
+            correction = fast_component.design(x, centers, head["bandwidth"]) @ weights
+            if not np.isfinite(correction).all():
+                raise ValueError("Nonfinite fixed RBF correction")
+            correction = np.clip(correction, -head["cap"], head["cap"])
+            if head["space"] == "linear":
+                output[:, 0] += correction
+            else:
+                raw = np.maximum(0., output[:, 0] * self.meta["target_scale"] + self.meta["target_mean"])
+                with np.errstate(over="ignore", invalid="ignore"):
+                    delta = (raw + 1.) * np.expm1(correction) / self.meta["target_scale"]
+                if not np.isfinite(delta).all():
+                    raise ValueError("Nonfinite log-space RBF correction")
+                output[:, 0] += delta
+        return hidden, output
+
+    def _forward_components(self, x):
         hidden, output = super().forward(x)
         c = self.component
         if c is not None:
@@ -115,6 +158,16 @@ class Model(ReferenceModel):
             output[:, 0] += np.clip(correction, -self.meta["regression_components"]["cap"], self.meta["regression_components"]["cap"])
         return hidden, output
 
+    def neural_output_derivative(self, x):
+        """Derivative of the full normalized output with respect to the MLP output."""
+        head = self.meta.get(fast_component.KEY)
+        if head is None or head["space"] != "log":
+            return None
+        centers, weights = self.fast_component
+        correction = np.clip(fast_component.design(x, centers, head["bandwidth"]) @ weights, -head["cap"], head["cap"])
+        base = self._forward_components(x)[1][:, 0] * self.meta["target_scale"] + self.meta["target_mean"]
+        return np.where(base > 0., np.exp(correction), 1.)
+
     def initialize_component(self, train):
         if self.component is not None:
             return False
@@ -138,9 +191,9 @@ class Model(ReferenceModel):
             "initial_train_sha256": train["sha256"], "parameter_count": (len(centers) + 1) * 43,
             "setting_mean": grouping["mean"], "setting_scale": grouping["scale"], "centers": centers.tolist(),
             "means": means.tolist(), "scales": scales.tolist(), "weights": np.zeros((len(centers) + 1, 43)).tolist()}
-        self.meta["prediction_parameter_count"] = self.meta["parameter_count"] + (len(centers) + 1) * 43
+        self.meta["prediction_parameter_count"] = self.meta["parameter_count"] + (len(centers) + 1) * 43 + self.meta.get(fast_component.KEY, {}).get("parameter_count", 0)
         self.meta["neural_format"] = NEURAL_FORMAT
-        self.meta["format"] = PREDICTOR_FORMAT
+        self.meta["format"] = fast_component.PREDICTOR_FORMAT if fast_component.KEY in self.meta else PREDICTOR_FORMAT
         self.validate()
         return True
 
@@ -166,4 +219,21 @@ class Model(ReferenceModel):
         head.update(weights=weights.tolist(), updates=head["updates"] + 1, last_train_sha256=train["sha256"],
                     solver="ridge_closed_form", ridge_per_train_row=.02, update_shrink=.5)
         self.meta["regression_components"] = head
+        self.validate()
+
+    def initialize_fast_component(self, train, spec):
+        state = self.meta.get(fast_component.KEY)
+        if state is not None:
+            if state["width"] != spec["basis_width"] or state["space"] != spec["residual_space"]:
+                raise ValueError("Existing fixed RBF basis and target space must be inherited")
+            return False
+        state = fast_component.initialize(self, train, spec)
+        count = self.meta.get("prediction_parameter_count", self.meta["parameter_count"])
+        self.meta.update({fast_component.KEY: state, "prediction_parameter_count": count + state["parameter_count"],
+                          "format": fast_component.PREDICTOR_FORMAT, "neural_format": NEURAL_FORMAT})
+        self.validate()
+        return True
+
+    def update_fast_component(self, train, sample_weights, deadline):
+        self.meta[fast_component.KEY] = fast_component.update(self, train, self.meta[fast_component.KEY], sample_weights, deadline)
         self.validate()

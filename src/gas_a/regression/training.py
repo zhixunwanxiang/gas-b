@@ -6,7 +6,9 @@ import time
 import numpy as np
 from .data import load_model
 from .evaluation import evaluate, promotion_gate
-from .model import component_digest, COMPONENT_FORMAT
+from .model import component_digest
+from . import fast_component
+from .timing import measure as measure_prediction_time
 from ..sensor_training.io import append_jsonl, digest, write_json
 
 
@@ -80,6 +82,11 @@ def fit_epoch(model, train, spec, deadline, *, prepared=None):
             weights = weights * np.where(error < 0, spec["underestimate_weight"], 1.0)
         losses = losses * weights
         delta = delta * weights[:, None]
+        derivative = getattr(model, "neural_output_derivative", None)
+        if derivative is not None:
+            jacobian = derivative(batch)
+            if jacobian is not None:
+                delta *= jacobian[:, None]
         total += float(losses.sum())
         gradients = {"w2": hidden.T @ delta, "b2": delta.sum(axis=0)}
         # tanh 隐藏层的导数为 1-hidden**2；整个反向传播只访问 train 的 batch 与标签。
@@ -168,6 +175,12 @@ def continue_candidate(checkpoint, train, validation, output, spec, limits, rule
         report["checks"]["existing_component_preserved"] = component_digest(best.meta["regression_components"]) == component_digest(original.meta["regression_components"])
         report["prediction_parameter_count"] = best.meta["prediction_parameter_count"]
         report["predictor_scope"] = "complete_regression_predictor"
+    if original.meta.get(fast_component.KEY) is not None:
+        report["checks"]["existing_fast_component_preserved"] = component_digest(best.meta[fast_component.KEY]) == component_digest(original.meta[fast_component.KEY])
+        report["prediction_timing"] = measure_prediction_time(original, best, validation["x"], rules, deadline)
+        if report["prediction_timing"] is None:
+            raise ValueError("Fast predictor continuation requires a prediction budget")
+        report["selected_epoch_eligible"] &= report["prediction_timing"]["eligible"]
     if not all(report["checks"].values()):
         raise ValueError("Regression continuation state was not preserved")
     # 与三份官方续训指南的结果目录保持一致；两份报告来自同一个对象，不另算或美化成绩。
@@ -178,16 +191,27 @@ def continue_candidate(checkpoint, train, validation, output, spec, limits, rule
 
 def continue_component(checkpoint, model, original, train, validation, output, spec, rules,
                        dataset, expected_sha, deadline, reference):
-    """Fit the one persistent C head; never invent MLP epochs or Adam steps."""
-    if dataset != "C" or spec["component_update"] != "condition_ridge":
+    """Update one fixed component; never invent MLP epochs or Adam steps."""
+    fast = spec["component_update"] == "fixed_rbf"
+    if not fast and (dataset != "C" or spec["component_update"] != "condition_ridge"):
         raise ValueError("Unsupported regression component update")
+    if fast and dataset not in ("B", "C"):
+        raise ValueError("Fixed RBF supports B/C only")
+    if (fast or original.meta.get(fast_component.KEY) is not None) and not rules.get("prediction_budget"):
+        raise ValueError("Fast component requires a prediction budget")
     before = evaluate(original, validation, dataset)
-    old = deepcopy(original.meta.get("regression_components"))
-    initialized = model.initialize_component(train)
+    key = fast_component.KEY if fast else "regression_components"
+    other_key = "regression_components" if fast else fast_component.KEY
+    old = deepcopy(original.meta.get(key))
+    initialized = model.initialize_fast_component(train, spec) if fast else model.initialize_component(train)
     if (not np.array_equal(model.predict(train["x"]), original.predict(train["x"]))
             or not np.array_equal(model.predict(validation["x"]), original.predict(validation["x"]))):
         raise ValueError("Zero component migration changed parent predictions")
-    model.update_component(train)
+    if fast:
+        prepared = prepare_training(model, train, spec)
+        model.update_fast_component(train, prepared["weights"], deadline)
+    else:
+        model.update_component(train)
     if time.monotonic() >= deadline:
         raise TimeoutError("Regression component fitting budget exhausted")
     output = Path(output)
@@ -197,23 +221,28 @@ def continue_component(checkpoint, model, original, train, validation, output, s
     after = evaluate(loaded, validation, dataset)
     if time.monotonic() >= deadline:
         raise TimeoutError("Complete regression component export and measurement budget exhausted")
-    head = loaded.meta["regression_components"]
+    head = loaded.meta[key]
     base_preserved = (all(np.array_equal(getattr(original, group)[name], getattr(loaded, group)[name])
                           for group in ("params", "first", "second") for name in original.params)
                       and all(loaded.meta[k] == original.meta[k] for k in
                               ("seed", "epochs", "steps", "learning_rate", "target_mean", "target_scale"))
                       and np.array_equal(loaded.mean, original.mean) and np.array_equal(loaded.scale, original.scale))
-    inherited = old is None or all(head[key] == old[key] for key in
-        ("format", "cap", "initial_train_sha256", "setting_mean", "setting_scale", "centers", "means", "scales"))
+    stats = (("format", "cap", "initial_train_sha256", "profile", "width", "space", "bandwidth", "centers") if fast else
+             ("format", "cap", "initial_train_sha256", "setting_mean", "setting_scale", "centers", "means", "scales"))
+    inherited = old is None or all(head[name] == old[name] for name in stats)
     checks = {"seed_preserved": loaded.meta["seed"] == original.meta["seed"],
               "input_scaler_preserved": bool(np.array_equal(loaded.mean, original.mean) and np.array_equal(loaded.scale, original.scale)),
               "target_scaler_preserved": all(loaded.meta[k] == original.meta[k] for k in ("target_mean", "target_scale")),
               "frozen_mlp_and_adam_preserved": base_preserved, "component_statistics_inherited": inherited,
+              "other_component_preserved": original.meta.get(other_key) == loaded.meta.get(other_key),
               "actual_component_continuation": head["updates"] == (old["updates"] if old else 0) + 1,
               "parent_file_unchanged": digest(checkpoint) == expected_sha}
     if not all(checks.values()):
         raise ValueError("Complete regression component continuation invariants failed")
     gate = promotion_gate(before, after, rules, reference=reference)
+    timing = measure_prediction_time(original, loaded, validation["x"], rules, deadline) if fast or original.meta.get(fast_component.KEY) is not None else None
+    if timing is not None:
+        gate["eligible"] &= timing["eligible"]
     record = {"epoch": loaded.meta["epochs"], "step": loaded.meta["steps"], "component_updates": head["updates"],
               "validation": after, "gate": gate, "scope": "complete_predictor_with_frozen_mlp"}
     append_jsonl(output / "history.jsonl", record)
@@ -225,11 +254,12 @@ def continue_component(checkpoint, model, original, train, validation, output, s
         "executed_epochs": 0, "executed_final_steps": loaded.meta["steps"], "executed_component_updates": 1,
         "component_updates_before": old["updates"] if old else 0, "component_updates_after": head["updates"],
         "component_parent_sha256": component_digest(old) if old else None,
-        "component_sha256": component_digest(head), "component_format": COMPONENT_FORMAT,
+        "component_sha256": component_digest(head), "component_format": head["format"], "component_key": key,
         "component_initialized_from_zero": initialized, "prediction_parameter_count": loaded.meta["prediction_parameter_count"],
         "format_migration": {"from": original.meta["format"], "to": loaded.meta["format"], "zero_prediction_change_verified": True},
-        "weighting_evidence": {"mode": "condition_ridge", "fit_scope": "authorized_train_only", "solver": "ridge_closed_form",
+        "weighting_evidence": {**(prepared["evidence"] if fast else {"mode": "condition_ridge", "fit_scope": "authorized_train_only"}), "solver": head.get("solver", "ridge_closed_form"),
                                "frozen_mlp_epochs_added": 0, "frozen_mlp_steps_added": 0},
+        "prediction_timing": timing,
         "validation_before": before, "validation_after": after, "selected_epoch_eligible": gate["eligible"],
         "checks": checks}
     write_json(output / "training.json", report)

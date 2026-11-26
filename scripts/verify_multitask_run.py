@@ -107,16 +107,26 @@ def verify(root):
                     assert np.array_equal(original.mean, child.mean) and np.array_equal(original.scale, child.scale)
                     assert all(original.meta[k] == child.meta[k] for k in ("seed", "target_mean", "target_scale"))
                     old_head, new_head = original.meta.get("regression_components"), child.meta.get("regression_components")
+                    old_fast, new_fast = original.meta.get("regression_fast_component"), child.meta.get("regression_fast_component")
                     if training["configuration"].get("component_update"):
                         assert all(np.array_equal(getattr(original, group)[name], getattr(child, group)[name])
                                    for group in ("params", "first", "second") for name in original.params)
                         assert all(original.meta[k] == child.meta[k] for k in ("epochs", "steps", "learning_rate"))
-                        assert new_head["updates"] == (old_head["updates"] if old_head else 0) + 1
-                        if old_head:
-                            assert all(old_head[k] == new_head[k] for k in ("cap", "means", "scales", "centers", "setting_mean", "setting_scale"))
+                        fast_update = training["configuration"]["component_update"] == "fixed_rbf"
+                        prior, updated = (old_fast, new_fast) if fast_update else (old_head, new_head)
+                        assert updated["updates"] == (prior["updates"] if prior else 0) + 1
+                        assert (old_head == new_head) if fast_update else (old_fast == new_fast)
+                        fields = (("cap", "bandwidth", "centers", "width", "space") if fast_update else
+                                  ("cap", "means", "scales", "centers", "setting_mean", "setting_scale"))
+                        if prior:
+                            assert all(prior[k] == updated[k] for k in fields)
                     else:
                         assert child.meta["steps"] > original.meta["steps"] and child.meta["epochs"] > original.meta["epochs"]
                         assert old_head == new_head
+                        assert old_fast == new_fast
+                    if new_fast is not None:
+                        timing = training["prediction_timing"]
+                        assert timing["eligible"] and timing["median_cpu_ratio"] <= timing["maximum_cpu_ratio"] <= 2
             assert finish["selected_artifact_id"] in registry
             selected_before = finish["selected_artifact_id"]
             complete[dataset] += complete_experiment({"history_ids": finish["history_ids"],

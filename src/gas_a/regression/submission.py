@@ -53,9 +53,11 @@ def dataset_config(full_config, dataset):
     for spec in specs:
         if (spec.get("weighting") == "bearing_sqrt_inverse" and dataset != "B"
                 or spec.get("weighting") == "parent_tail" and dataset != "C"
-                or spec.get("component_update") and dataset != "C"):
+                or spec.get("component_update") == "fixed_rbf" and dataset == "C" and spec.get("residual_space") != "linear"
+                or spec.get("component_update") == "condition_ridge" and dataset != "C"):
             raise ValueError("Regression weighting belongs to a different dataset")
-    return {**shared, "controller": {**shared["controller"], "guards": shared.get("guards", {}).get(dataset)},
+    return {**shared, "controller": {**shared["controller"], "guards": shared.get("guards", {}).get(dataset),
+                                    "prediction_budget": shared.get("prediction_budget")},
             "experiments": specs}
 
 
@@ -79,6 +81,12 @@ def validate_config(config, limits):
             or not 0 < limits["max_seconds_per_candidate"] <= 300):
         raise ValueError("Invalid regression training limits")
     names = set()
+    prediction_budget = rules.get("prediction_budget")
+    if prediction_budget is not None and (not isinstance(prediction_budget, dict)
+            or type(prediction_budget.get("maximum_cpu_ratio")) not in (int, float)
+            or not np.isfinite(prediction_budget["maximum_cpu_ratio"])
+            or not 1 <= prediction_budget["maximum_cpu_ratio"] <= 2):
+        raise ValueError("Invalid regression prediction CPU budget")
     for spec in config["experiments"]:
         if (not isinstance(spec, dict) or not isinstance(spec.get("name"), str) or not spec["name"] or spec["name"] in names
                 or type(spec.get("freeze_features")) is not bool or spec.get("loss") not in ("mse", "huber")):
@@ -89,10 +97,16 @@ def validate_config(config, limits):
                     or type(rate) not in (int, float) or not np.isfinite(rate) or not 0 < rate <= .01
                     or "component_updates" in spec):
                 raise ValueError("Invalid bounded neural regression experiment")
-        elif (spec["component_update"] != "condition_ridge" or type(spec.get("component_updates")) is not int
+        elif (spec["component_update"] not in ("condition_ridge", "fixed_rbf") or type(spec.get("component_updates")) is not int
                 or spec["component_updates"] != 1 or spec["freeze_features"] is not True or spec["loss"] != "mse"
-                or any(k in spec for k in ("epochs", "learning_rate", "weighting", "underestimate_weight", "balance_strength"))):
+                or any(k in spec for k in ("epochs", "learning_rate", "underestimate_weight"))):
             raise ValueError("Invalid bounded component update")
+        if spec.get("component_update") == "condition_ridge" and any(k in spec for k in ("weighting", "balance_strength", "basis_width", "residual_space")):
+            raise ValueError("Condition ridge configuration must remain inherited")
+        if spec.get("component_update") == "fixed_rbf" and (type(spec.get("basis_width")) is not int
+                or spec["basis_width"] not in (8, 16) or spec.get("residual_space") not in ("linear", "log")
+                or prediction_budget is None):
+            raise ValueError("Fixed RBF requires a fixed basis and prediction budget")
         weight = spec.get("underestimate_weight", 1.0)
         if type(weight) not in (int, float) or not np.isfinite(weight) or not 1 <= weight <= 1.5:
             raise ValueError("Invalid regression bias correction")
@@ -320,6 +334,10 @@ def train(rnd):
     research_disabled = [name for name, spec in allowed.items()
                          if spec.get("research_only") and not config.get("enable_research_experiments", False)]
     allowed = {name: spec for name, spec in allowed.items() if name not in research_disabled}
+    inherited_fast = parent.meta.get("regression_fast_component")
+    if inherited_fast is not None:
+        allowed = {name: spec for name, spec in allowed.items() if spec.get("component_update") != "fixed_rbf"
+                   or (spec["basis_width"] == inherited_fast["width"] and spec["residual_space"] == inherited_fast["space"])}
     admission_blocker = None
     if not parent_host["comparable"]:
         # 不可核验的父测量使本轮任何候选都不能上线；直接观察并留证，避免重复消耗训练预算。
@@ -417,6 +435,14 @@ def train(rnd):
     if report is not None:
         # 阶段 7：本地算准入、写诊断证据，并把候选交给宿主真实测量；上传成功不等于准许上线。
         gate = promotion_gate(before, report["validation_after"], rules, reference=stage_reference)
+        if spec.get("component_update") == "fixed_rbf" or inherited_fast is not None:
+            timing = report.get("prediction_timing") or {}
+            ratio = timing.get("median_cpu_ratio")
+            timing_ok = (timing.get("eligible") is True and type(ratio) in (int, float)
+                         and np.isfinite(ratio) and ratio <= rules["prediction_budget"]["maximum_cpu_ratio"])
+            gate.update(eligible=gate["eligible"] and timing_ok, prediction_cpu_gate=timing)
+            if not timing_ok:
+                gate.setdefault("guard_failures", []).append("prediction_cpu_budget")
         cfg.update(validation_after=report["validation_after"], candidate_gate=gate)
         append_jsonl(state / "regression_training_evidence.jsonl", {"round_index": rnd.round_index,
             "report": report, "epoch_history": [json.loads(line) for line in
