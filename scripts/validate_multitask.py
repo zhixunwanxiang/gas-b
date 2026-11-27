@@ -20,6 +20,7 @@ from scripts.validate_platform import BOOTSTRAP, exchange, receipt
 from scripts.docker_rehearsal import DockerRuntime, child_environment
 from gas_a.sensor_training.io import digest, write_json
 from gas_a.regression.data import load_pair as regression_pair
+from gas_a.regression.schedule import ordered_experiments
 from gas_a.regression.evaluation import evaluate as regression_evaluate
 from gas_a.sensor_training.data import load_pair as classification_pair, evaluate as classification_evaluate
 from gas_a.frozen_router import load_predictor
@@ -31,7 +32,10 @@ PREDICT_ARGV = ["python3", "/app/harness.py", "predict"]
 def complete_experiment(row):
     """Count measured model decisions; a program guard is not a closed loop."""
     cfg = row["record"]["configuration"]
-    return (bool(row["history_ids"]) and row["candidate_submitted"]
+    locally_measured = (cfg.get("candidate_upload_skipped") == "local_promotion_gate_rejected"
+                        and isinstance(cfg.get("validation_after"), dict) and isinstance(cfg.get("candidate_gate"), dict)
+                        and cfg["candidate_gate"].get("eligible") is False and not cfg.get("experiment_failure"))
+    return (bool(row["history_ids"]) and (row["candidate_submitted"] or locally_measured)
             and cfg.get("action") == "experiment"
             and cfg.get("controller_decisions") == {"plan": "model", "select": "model"})
 
@@ -94,7 +98,10 @@ def measure(runtime, directory, descriptor, validation_path, validation, dataset
 
 
 def run_dataset(base, out, dataset, rounds, runtime, *, peer_factory=None, journal=None, max_rounds=None, exchange_options=None,
-                compact_validation=False, aggregate_parent=False, experiment_sequence=None, projection_callback=None):
+                compact_validation=False, aggregate_parent=False, experiment_sequence=None, projection_callback=None,
+                follow_menu_priority=False):
+    if follow_menu_priority and (peer_factory is not None or experiment_sequence is not None):
+        raise ValueError("Menu priority replay requires an unscripted offline peer")
     # 一个数据集的多轮宿主：registry 保存真实产物目录，current 永远是上轮最终选中的 ID。
     # peer_factory 决定模型来源（真实回复或记录重放）；缺省才使用明确标识的离线模型替身。
     out.mkdir()
@@ -140,11 +147,14 @@ def run_dataset(base, out, dataset, rounds, runtime, *, peer_factory=None, journ
             # 平台反馈复现：start 只有具名指标，不含冗余范围/摘要；原始帧仍完整留档。
             host.frame["current_validation"] = {"metrics": score}
         config = json.loads((ROOT / "submission_config.json").read_text(encoding="utf-8"))
-        menu = config["experiments"] if dataset == "A" else config["regression"]["experiments"]
-        if peer_factory is None:
+        names = ([spec["name"] for spec in config["experiments"]] if dataset == "A"
+                 else list(ordered_experiments(config["regression"], dataset)))
+        if follow_menu_priority:
+            host.experiment = None  # Offline peer follows the first permitted experiment in the actual request.
+        elif peer_factory is None:
             host.experiment = (experiment_sequence[(index - 1) % len(experiment_sequence)] if experiment_sequence
-                               else menu[(index - 1) % len(menu)]["name"])
-            if host.experiment not in {spec["name"] for spec in menu}:
+                               else names[(index - 1) % len(names)])
+            if host.experiment not in names:
                 raise ValueError("Validation sequence requests an unconfigured experiment")
         for identifier, (source, _) in registry.items():
             host.add_artifact(identifier, source)
@@ -185,6 +195,16 @@ def run_dataset(base, out, dataset, rounds, runtime, *, peer_factory=None, journ
         row = {"round": index, "history_ids": host.record["history_ids"], "candidate_submitted": host.candidate is not None,
                "model_call_ids": host.record["model_call_ids"], "selected_artifact_id": current, "metrics": score,
                "finish_acknowledged": True, "record": host.record}
+        if peer_factory is None and dataset in ("B", "C"):
+            plan_request = json.loads(host.messages[0][0]["content"])
+            configuration = host.record["configuration"]
+            actual = (configuration.get("experiment") or {}).get("name")
+            unavailable = plan_request.get("strategy", {}).get("unavailable_experiments", {})
+            requested = (plan_request.get("strategy", {}).get("scheduled_experiment_preference")
+                         if follow_menu_priority else host.experiment)
+            row["experiment_schedule"] = {"requested": requested, "executed": actual,
+                "substitution_reason": None if actual == requested else unavailable.get(
+                    requested, "observed_or_selected_other_action")}
         records.append(row)
         if journal:
             journal.after_round(host)

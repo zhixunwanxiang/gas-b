@@ -187,9 +187,14 @@ class PolicyHistorySelectionTest(unittest.TestCase):
                 self.assertTrue(request["historical_admission"]["history-good"]["eligible"])
                 self.assertIn("history-good", request["response_schema"]["selected_artifact_id"])
                 if action == "experiment":
-                    self.assertIsNotNone(host.candidate)
                     self.assertEqual(cfg["parent_checkpoint_sha256"], parent_sha)
-                    self.assertFalse(cfg["host_candidate_gate"]["eligible"])
+                    if dataset != "A" and not cfg["candidate_gate"]["eligible"]:
+                        self.assertIsNone(host.candidate)
+                        self.assertEqual(cfg["candidate_upload_skipped"], "local_promotion_gate_rejected")
+                        self.assertEqual(cfg["experiment_outcome"]["outcome"], "performance_rejected")
+                    else:
+                        self.assertIsNotNone(host.candidate)
+                        self.assertFalse(cfg["host_candidate_gate"]["eligible"])
                 else:
                     self.assertIsNone(host.candidate)
                 next_host = (OfflineHost(host.root, historical / "checkpoint.npz", 2,

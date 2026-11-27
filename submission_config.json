@@ -22,14 +22,35 @@
       "max_repeat_rejections": 2,
       "minimum_rmse_absolute_gain": 0.000001,
       "minimum_rmse_relative_gain": 0.0005,
-      "maximum_mae_relative_increase": 0.02
+      "maximum_mae_relative_increase": 0.02,
+      "maximum_nasa_relative_increase": 0.05,
+      "bearing_device_guard": {"minimum_rows": 30, "relative_increase": 0.05, "absolute_increase": 10}
     },
     "limits": {"max_epochs": 8, "max_seconds_per_candidate": 30, "early_stopping_patience": 3},
+    "skip_locally_rejected_uploads": true,
+    "default_first_experiment": {"C": "cmapss_condition_mlp"},
+    "preferred_experiment_sequence": {
+      "B": ["bearing_balanced", "bearing_log_ridge", "bearing_balanced_half", "bearing_rbf", "low_rate", "bearing_upward_guard"]
+    },
     "experiments": [
       {"name": "low_rate", "learning_rate": 0.0003, "epochs": 3, "freeze_features": false, "loss": "mse"},
       {"name": "standard_rate", "learning_rate": 0.001, "epochs": 6, "freeze_features": false, "loss": "mse"},
       {"name": "head_only", "learning_rate": 0.0005, "epochs": 4, "freeze_features": true, "loss": "mse"},
-      {"name": "robust_huber", "learning_rate": 0.0003, "epochs": 5, "freeze_features": false, "loss": "huber"}
+      {"name": "robust_huber", "learning_rate": 0.0003, "epochs": 5, "freeze_features": false, "loss": "huber", "huber_quantile": 0.8},
+      {"name": "bearing_balanced", "datasets": ["B"], "learning_rate": 0.0003, "epochs": 3, "freeze_features": false, "loss": "mse", "device_balance": 0.25},
+      {"name": "bearing_log_ridge", "datasets": ["B"], "method": "frozen_ridge", "transform": "bearing_log", "ridge": 0.1, "strengths": [0.1, 0.25, 0.5, 1.0], "learning_rate": 0.0003, "epochs": 1, "freeze_features": true, "loss": "mse"},
+      {"name": "cmapss_tail", "datasets": ["C"], "learning_rate": 0.0003, "epochs": 3, "freeze_features": false, "loss": "mse", "tail_boost": 1.5},
+      {"name": "cmapss_condition_ridge", "datasets": ["C"], "method": "frozen_ridge", "transform": "condition", "ridge": 0.1, "strengths": [0.1, 0.25, 0.5, 1.0], "learning_rate": 0.0003, "epochs": 1, "freeze_features": true, "loss": "mse"},
+      {"name": "cmapss_bounded_residual", "datasets": ["C"], "method": "cmapss_bounded_residual", "strengths": [0.5, 1.0], "learning_rate": 0.0015, "epochs": 1, "freeze_features": true, "loss": "mse"},
+      {"name": "bearing_balanced_half", "datasets": ["B"], "learning_rate": 0.0003, "epochs": 3, "freeze_features": false, "loss": "mse", "device_balance": 0.5},
+      {"name": "bearing_rbf", "datasets": ["B"], "method": "frozen_residual", "transform": "bearing_log", "basis": "rbf", "ridge": 0.1, "strengths": [0.1, 0.25, 0.5, 1.0], "learning_rate": 0.0003, "epochs": 1, "freeze_features": true, "loss": "mse"},
+      {"name": "bearing_mlp", "datasets": ["B"], "method": "frozen_residual", "transform": "bearing_log", "basis": "tanh", "ridge": 0.1, "strengths": [0.1, 0.25, 0.5, 1.0], "learning_rate": 0.0003, "epochs": 1, "freeze_features": true, "loss": "mse"},
+      {"name": "bearing_stumps", "datasets": ["B"], "method": "frozen_residual", "transform": "bearing_log", "basis": "stumps", "ridge": 0.1, "strengths": [0.1, 0.25, 0.5, 1.0], "learning_rate": 0.0003, "epochs": 1, "freeze_features": true, "loss": "mse"},
+      {"name": "bearing_upward_guard", "datasets": ["B"], "method": "bearing_upward_guard", "strengths": [1.0], "learning_rate": 0.0015, "epochs": 1, "freeze_features": true, "loss": "mse"},
+      {"name": "cmapss_soft_ridge", "datasets": ["C"], "method": "frozen_residual", "transform": "condition_soft", "basis": "linear", "ridge": 0.1, "strengths": [0.1, 0.25, 0.5, 1.0], "learning_rate": 0.0003, "epochs": 1, "freeze_features": true, "loss": "mse"},
+      {"name": "cmapss_condition_mlp", "datasets": ["C"], "method": "frozen_residual", "transform": "condition_soft", "basis": "tanh", "ridge": 0.1, "strengths": [0.1, 0.25, 0.5, 1.0], "learning_rate": 0.0003, "epochs": 1, "freeze_features": true, "loss": "mse"},
+      {"name": "cmapss_stratified", "datasets": ["C"], "learning_rate": 0.0003, "epochs": 3, "freeze_features": false, "loss": "mse", "sampling": "device_condition"},
+      {"name": "cmapss_asymmetric", "datasets": ["C"], "learning_rate": 0.0003, "epochs": 3, "freeze_features": false, "loss": "nasa_proxy"}
     ]
   },
   "experiments": [
@@ -94,6 +115,7 @@
       "l2": 0.0002,
       "batch_size": 128,
       "freeze": "features"
-    }
+    },
+    {"name": "pair_review", "pair_review": true}
   ]
 }

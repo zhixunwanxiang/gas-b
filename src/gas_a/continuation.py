@@ -4,6 +4,7 @@
 import hashlib
 from pathlib import Path
 import json
+import shutil
 import time
 
 import numpy as np
@@ -30,6 +31,65 @@ def state_identity(model):
             "normalization": _arrays({"mean": model.mean, "scale": model.scale})}
 
 
+def _write_continuation(directory, parent_sha, parent_artifact_id, initial, child, projection, checks):
+    train, validation = projection
+    write_json(Path(directory) / "continuation.json", {
+        "format": "gas-a.continuation.v1", "dataset_key": "A",
+        "parent": {"artifact_id": parent_artifact_id, "checkpoint_sha256": parent_sha, "state": initial},
+        "child": {"checkpoint_path": "checkpoint.npz", "checkpoint_sha256": digest(Path(directory) / "checkpoint.npz"),
+                  "state": state_identity(child)},
+        "public_projection": {"train_sha256": train["sha256"], "train_rows": len(train["y"]),
+                              "validation_sha256": validation["sha256"], "validation_rows": len(validation["y"])},
+        "checks": checks,
+    })
+
+
+def _pair_review_candidate(parent_path, parent, train, validation, directory, spec, limits,
+                           started, cpu_started, parent_sha, parent_artifact_id, initial):
+    from .frozen_router import FrozenRouter, load_predictor, retain_bundle
+    from .pair_review import PairReview
+    from .sensor_training.data import evaluate
+
+    if not isinstance(parent, FrozenRouter):
+        raise ValueError("Pair review requires an existing frozen router")
+    deadline = started + limits["max_seconds_per_candidate"]
+    review = PairReview.fit(train, deadline)
+    before = evaluate(parent, validation)
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=False)
+    checkpoint = directory / "checkpoint.npz"
+    shutil.copyfile(parent_path, checkpoint)
+    after, manifest = retain_bundle(parent, directory, validation, fitted_review=(review, train["sha256"]))
+    exported = load_predictor(checkpoint, train["paths"])
+    child = exported.models["four_sensor"]
+    if (digest(parent_path) != parent_sha or state_identity(child) != initial
+            or exported.policy != parent.policy):
+        raise ValueError("Pair review changed the actual parent's neural state or routing policy")
+    elapsed = time.monotonic() - started
+    if time.monotonic() >= deadline:
+        raise TimeoutError("Pair review exceeded the candidate budget")
+    report = {"format": "gas-a.experiment.v1", "name": spec["name"], "configuration": spec,
+              "training_mode": "frozen_parent_pair_review", "gradient_scope": "no_neural_gradient_updates",
+              "fit_scope": "authorized_training_rows_only", "parent_checkpoint_sha256": parent_sha,
+              "checkpoint_sha256": digest(checkpoint), "train_sha256": train["sha256"],
+              "validation_sha256": validation["sha256"], "initial_epochs": initial["epochs"],
+              "final_epochs": initial["epochs"], "initial_steps": initial["steps"], "final_steps": initial["steps"],
+              "validation_before": before, "validation_after": after, "training_seconds": elapsed,
+              "resources": {"wall_seconds": elapsed, "cpu_seconds": time.process_time() - cpu_started, "device": "cpu"},
+              "checkpoint_selection": {"basis": "fixed_pair_review", "selected_epoch": initial["epochs"],
+                                       "predictor_scope": "complete_frozen_bundle"},
+              "prediction_bundle": {"format": manifest["format"], "manifest": "routing.json"},
+              "prediction_parameter_count": manifest["prediction_parameter_count"],
+              "retained_components": manifest["calibration"]["retained_components"],
+              "pair_review": manifest["pair_review"]}
+    for filename in ("training.json", "experiment.json"):
+        write_json(directory / filename, report)
+    _write_continuation(directory, parent_sha, parent_artifact_id, initial, child, (train, validation),
+                        {"parent_file_unchanged": True, "neural_state_and_optimizer_preserved": True,
+                         "routing_policy_preserved": True})
+    return report
+
+
 def continue_candidate(parent_path, train, validation, directory, spec, diagnosis, limits,
                        *, expected_parent_sha256=None, parent_artifact_id=None):
     """Load the supplied parent, continue it, and persist a verifiable parent/child record."""
@@ -45,6 +105,9 @@ def continue_candidate(parent_path, train, validation, directory, spec, diagnosi
     parent = load_model(parent_path, train["paths"])
     parent_predictor = load_predictor(parent_path, train["paths"])
     initial = state_identity(parent)
+    if spec.get("pair_review") is True:
+        return _pair_review_candidate(parent_path, parent_predictor, train, validation, directory, spec, limits,
+                                      started, cpu_started, parent_sha, parent_artifact_id, initial)
     primary_limits = dict(limits)
     if "controller_checkpoint_gate" in limits:
         from .sensor_training.data import evaluate
@@ -56,7 +119,8 @@ def continue_candidate(parent_path, train, validation, directory, spec, diagnosi
     retain = isinstance(parent_predictor, FrozenRouter) and not spec.get("routing")
     def epoch_predictor(primary):
         return FrozenRouter({**parent_predictor.models, "four_sensor": primary}, parent_predictor.manifest,
-                            parent_predictor.component_paths, parent_predictor.manifest_path)
+                            parent_predictor.component_paths, parent_predictor.manifest_path, parent_predictor.review,
+                            parent_predictor.review_path)
     report = train_candidate(parent_path, train, validation, directory, spec, diagnosis, primary_limits,
                              validation_predictor=epoch_predictor if retain else None)
     if spec.get("routing") or isinstance(parent_predictor, FrozenRouter):
@@ -102,14 +166,7 @@ def continue_candidate(parent_path, train, validation, directory, spec, diagnosi
             or not preserved or child.meta["steps"] <= initial["steps"]
             or child.meta["epochs"] <= initial["epochs"]):
         raise ValueError("Parent continuation invariants failed")
-    write_json(Path(directory) / "continuation.json", {
-        "format": "gas-a.continuation.v1", "dataset_key": "A",
-        "parent": {"artifact_id": parent_artifact_id, "checkpoint_sha256": parent_sha, "state": initial},
-        "child": {"checkpoint_path": "checkpoint.npz", "checkpoint_sha256": digest(child_path),
-                  "state": state_identity(child)},
-        "public_projection": {"train_sha256": train["sha256"], "train_rows": len(train["y"]),
-                              "validation_sha256": validation["sha256"], "validation_rows": len(validation["y"])},
-        "checks": {"parent_file_unchanged": True, "scaler_seed_target_scale_preserved": True,
-                   "steps_increased": True, "epochs_increased": True},
-    })
+    _write_continuation(directory, parent_sha, parent_artifact_id, initial, child, (train, validation),
+                        {"parent_file_unchanged": True, "scaler_seed_target_scale_preserved": True,
+                         "steps_increased": True, "epochs_increased": True})
     return report

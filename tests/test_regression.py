@@ -23,6 +23,7 @@ from gas_a.regression.data import BEARING_FEATURES, input_values, load_pair, loa
 from gas_a.regression.evaluation import evaluate, promotion_gate, host_gate, parent_reference
 from gas_a.regression.training import continue_candidate, fit_epoch
 from gas_a.regression.monitoring import fit_reference, monitor
+from gas_a.regression.schedule import ordered_experiments
 from gas_a.sensor_training.io import digest
 from gas_a.sensor_training.reference.model import Model
 
@@ -106,6 +107,40 @@ class RegressionTest(unittest.TestCase):
                 input_values(bad, dataset)
             with self.assertRaises(ValueError):
                 load_model(checkpoint, "C" if dataset == "B" else "B")
+
+    def test_dataset_defaults_are_shared_by_schedule_and_first_round_plan(self):
+        for dataset, first in (("B", "bearing_balanced"), ("C", "cmapss_condition_mlp")):
+            with self.subTest(dataset=dataset):
+                names = list(ordered_experiments(self.config, dataset))
+                original = list(ordered_experiments(self.config, dataset, mode="configured"))
+                sequence = self.config.get("preferred_experiment_sequence", {}).get(dataset, [first])
+                self.assertEqual(names, [*sequence, *(name for name in original if name not in sequence)])
+                root = self.root / dataset
+                host = RegressionHost(root, make_fixture(root, dataset), dataset)
+                if dataset == "B":
+                    train_path = root / "data/train.jsonl"
+                    rows = [json.loads(line) for line in train_path.read_text(encoding="utf-8").splitlines()]
+                    for idx, row in enumerate(rows):
+                        row["meta"]["bearing"] = f"Bearing1_{1 + idx % 2}"
+                    train_path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+                host.experiment = None  # The offline reply follows the first available option.
+                self.run_host(host)
+                request = json.loads(host.messages[0][0]["content"])
+                self.assertEqual(next(iter(request["experiments"])), first)
+                self.assertEqual(host.record["configuration"]["experiment"]["name"], first)
+                if dataset == "C":
+                    self.assertEqual(request["strategy"]["default_first_experiment"], first)
+                else:
+                    self.assertEqual(request["strategy"]["scheduled_experiment_preference"], first)
+
+    def test_b_schedule_falls_back_when_bearing_metadata_is_unavailable(self):
+        host = RegressionHost(self.root, make_fixture(self.root, "B"), "B")
+        host.experiment = None
+        self.run_host(host)
+        request = json.loads(host.messages[0][0]["content"])
+        self.assertNotIn("scheduled_experiment_preference", request["strategy"])
+        self.assertNotIn("bearing_balanced", request["experiments"])
+        self.assertEqual(host.record["configuration"]["experiment"]["name"], "low_rate")
 
     def test_four_rounds_each_dataset_read_history_train_and_finish(self):
         for dataset in ("B", "C"):

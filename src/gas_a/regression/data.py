@@ -2,7 +2,7 @@
 from functools import lru_cache
 import math
 from ..sensor_training.reference.data import flatten, read_dataset
-from ..sensor_training.reference.model import Model
+from .model import RegressionModel
 
 
 BEARING_FEATURES = (
@@ -72,7 +72,7 @@ def input_values(inputs, dataset=None):
 def load_model(path, dataset, paths=None):
     # 权重文件自身包含任务、数据集 profile、特征路径和目标缩放。
     # 即使 B/C 都输出一个数，也不能把“分钟”的模型直接拿去预测“循环数”。
-    model = Model.load(path)
+    model = RegressionModel.load(path)
     if (model.meta["task"] != "regression" or model.meta.get("profile") != dataset
             or model.meta["paths"] != (schema(dataset) if paths is None else paths)):
         raise ValueError("Checkpoint regression profile or feature schema does not match the task")
@@ -86,8 +86,9 @@ def load_model(path, dataset, paths=None):
 def load_pair(train_path, validation_path, dataset):
     # 两份文件分别读取，不把公开验证样本并回训练集；验证标签仅供后续诊断与选版。
     # id 只用于检查投影是否交叉，不进入 x 特征矩阵，也不用于反推寿命。
-    train = read_dataset(train_path, "regression", [], schema(dataset))
-    validation = read_dataset(validation_path, "regression", [], train["paths"])
+    fields = ("bearing",) if dataset == "B" else ("source_subset", "source_split", "unit")
+    train = read_dataset(train_path, "regression", [], schema(dataset), metadata_fields=fields)
+    validation = read_dataset(validation_path, "regression", [], train["paths"], metadata_fields=fields)
     if set(train["ids"]) & set(validation["ids"]):
         raise ValueError("Public training and validation sample IDs overlap")
     return train, validation

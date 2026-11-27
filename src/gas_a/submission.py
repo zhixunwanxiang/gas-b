@@ -22,7 +22,7 @@ from .sensor_training.io import CLASSES, append_jsonl, digest, write_json, json_
 from .sensor_training.reference.data import flatten, json_value, finite_number
 from .continuation import continue_candidate
 from .parent_checkpoint import primary_checkpoint
-from .frozen_router import load_predictor, checkpoint_paths as artifact_checkpoint_paths
+from .frozen_router import FrozenRouter, load_predictor, checkpoint_paths as artifact_checkpoint_paths
 from .monitoring import fit_reference, monitor, diagnose
 from .evolution import (load_policy, available_experiments, promotion_gate, experiment_evidence,
                         fingerprint, advance_policy, validate_controller, eligible_history)
@@ -387,6 +387,11 @@ def train(rnd):
         policy.update(version=1, preferred_experiment=None)
     diagnosis = diagnose(before, drift, validation["sha256"], policy.get("last_measurement"))
     allowed_menu, blocked = available_experiments(policy, menu, rnd, train_data, validation, controller, execution)
+    if "pair_review" in allowed_menu and (not isinstance(parent, FrozenRouter)
+            or parent.manifest.get("pair_review", {}).get("train_sha256") == train_data["sha256"]
+            or set(train_data["y"]) != set(range(len(CLASSES)))):
+        allowed_menu.pop("pair_review")
+        blocked.append("pair_review")
     # 阶段 5：历史版本也必须在当前验证数据上复评；父测量口径不可比时不开放回滚动作。
     with stage("restore_and_evaluate_history", dataset="A"):
         restored = _restore_history(rnd, history, run, validation, before, controller)
@@ -475,10 +480,16 @@ def train(rnd):
             configuration.update(routing_policy=manifest["policy"], routing_manifest_sha256=digest(candidate / "routing.json"))
         configuration["local_validation_after"] = report["validation_after"]["macro_f1"]
         candidate_gate = promotion_gate(before, report["validation_after"], controller)
+        if spec.get("pair_review"):
+            accuracy_gain = report["validation_after"]["accuracy"] - before["accuracy"]
+            candidate_gate.update(accuracy_gain=accuracy_gain, eligible=candidate_gate["eligible"] and accuracy_gain > 0.)
+            configuration["pair_review"] = report["pair_review"]
         configuration["candidate_gate"] = candidate_gate
         configuration["checkpoint_selection"] = report["checkpoint_selection"]
         change = "Continued the actual parent using %s; preserved Adam/scaler and exported epoch %d, step %d." % (
             spec["name"], report["final_epochs"], report["final_steps"])
+        if spec.get("pair_review"):
+            change = "Fitted targeted gas review on authorized training rows; preserved all parent neural weights and Adam state."
         write_json(candidate / "planning.json", {"decision": plan, **planning_calls})
         write_json(candidate / "diagnosis.json", diagnosis)
         write_json(candidate / "monitoring.json", drift)

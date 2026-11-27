@@ -11,7 +11,7 @@ from .sensor_training.io import json_text
 from .evolution import EXPERIMENT_POLICY_VERSION, REPEAT_POLICY
 from .sensor_training.reference.data import finite_number
 
-VERSION = "gas-a-controller-zh-v8"
+VERSION = "gas-a-controller-zh-v9"
 EPOCH_POLICY_VERSION = "retained-complete-bundle-per-epoch-v2"
 ROUTING_POLICY_VERSION = "protected-routing-retained-auxiliaries-v3"
 
@@ -104,6 +104,12 @@ def enrich_plan(request, controller, train, validation, policy):
     weak = request["diagnosis"]["weak_classes"][0]["label"]
     guide = {}
     for name,spec in request["experiments"].items():
+        if spec.get("pair_review"):
+            guide[name] = {"actual_change": "fit_targeted_review_on_public_train_with_frozen_parent",
+                           "review_targets": ["Ethanol/Ethylene", "Toluene disagreements"],
+                           "admission": "both Accuracy and Macro-F1 must improve; existing recall and host checks apply",
+                           "risk": "inspect Toluene support before generalizing any Macro-F1 gain"}
+            continue
         kept = spec.get("kept_sensors")
         guide[name] = {"actual_change": "rebuild_frozen_expert_bundle" if "routing" in spec else
                       "output_head_only" if spec.get("freeze") == "features" else "neural_continuation_with_sensor_projection",

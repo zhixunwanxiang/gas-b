@@ -12,10 +12,16 @@ from .evaluation import evaluate, promotion_gate, current_parent_reference, host
 from .monitoring import fit_reference, monitor, diagnose
 from .training import continue_candidate
 from .prompts import VERSION as PROMPT_VERSION, plan_contract, PLAN_INSTRUCTION, SELECT_INSTRUCTION
+from .diagnostics import compact_metrics
+from .stage_reference import measure_stage, compare_stage
+from .schedule import ordered_experiments, stage_experiment_preference
+from .model import BOUNDED_HEADS, BOUNDED_METHODS, CORRECTION_METHODS, MAX_CORRECTIONS, TRANSFORMS
+from .bearing_guard import MAX_PROTOTYPES
+from .residual_basis import BASIS_KINDS
 from ..evolution import (available_experiments, fingerprint, experiment_outcome,
-                         validate_attempts, eligible_history, EXPERIMENT_POLICY_VERSION)
+                         validate_attempts, eligible_history, EXPERIMENT_POLICY_VERSION, REPEAT_POLICY, experiment_evidence)
 from ..host_validation import HOST_ADMISSION_VERSION, bind_candidate_validation
-from ..progress import progress, stage
+from ..progress import progress, stage, record_transfer, save_resources
 from ..sensor_training.io import append_jsonl, digest, write_json
 from ..submission import ROOT, PREDICT_ARGV, _controller_decision, _parent_checkpoint, _prediction_checkpoint, _snapshot
 from ..sdk_records import bounded_configuration, portable_record
@@ -50,6 +56,23 @@ def validate_config(config, limits):
         value = rules[key]
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value) or not 0 <= value <= 1:
             raise ValueError("Invalid regression promotion threshold")
+    if "maximum_nasa_relative_increase" in rules:
+        value = rules["maximum_nasa_relative_increase"]
+        if type(value) not in (int, float) or not np.isfinite(value) or not 0 <= value <= 1:
+            raise ValueError("Invalid NASA protection threshold")
+    if "bearing_device_guard" in rules:
+        guard = rules["bearing_device_guard"]
+        if (type(guard.get("minimum_rows")) is not int or guard["minimum_rows"] < 1
+                or any(type(guard.get(key)) not in (int, float) or not np.isfinite(guard[key])
+                       or not 0 <= guard[key] <= maximum
+                       for key, maximum in (("relative_increase", 1), ("absolute_increase", 1000)))):
+            raise ValueError("Invalid bearing device protection")
+    if type(config.get("skip_locally_rejected_uploads", True)) is not bool:
+        raise ValueError("Invalid local candidate upload policy")
+    preferences = config.get("default_first_experiment", {})
+    if (not isinstance(preferences, dict)
+            or any(dataset not in UNITS or not isinstance(name, str) for dataset, name in preferences.items())):
+        raise ValueError("Invalid regression first experiment defaults")
     for key, low, high in (("json_corrections", 0, 2), ("max_history_restores", 0, 2), ("max_repeat_rejections", 1, 8)):
         if type(rules[key]) is not int or not low <= rules[key] <= high:
             raise ValueError("Invalid regression controller bound")
@@ -63,9 +86,74 @@ def validate_config(config, limits):
         if (not isinstance(spec["name"], str) or not spec["name"] or spec["name"] in names
                 or type(spec["epochs"]) is not int or not 1 <= spec["epochs"] <= limits["max_epochs"]
                 or isinstance(spec["learning_rate"], bool) or not 0 < spec["learning_rate"] <= .01
-                or type(spec["freeze_features"]) is not bool or spec["loss"] not in ("mse", "huber")):
+                or type(spec["freeze_features"]) is not bool or spec["loss"] not in ("mse", "huber", "nasa_proxy")):
             raise ValueError("Invalid bounded regression experiment")
         names.add(spec["name"])
+        for key, low, high in (("device_balance", 0, .5), ("tail_boost", 1, 2), ("huber_quantile", .5, .95),
+                               ("nasa_mix", 0, .35), ("short_overestimate_boost", 1, 1.5)):
+            if key in spec and (type(spec[key]) not in (int, float) or not np.isfinite(spec[key]) or not low <= spec[key] <= high):
+                raise ValueError("Invalid regression weighting or loss parameter")
+        if "datasets" in spec and (not isinstance(spec["datasets"], list) or not spec["datasets"] or any(k not in ("B", "C") for k in spec["datasets"])):
+            raise ValueError("Invalid regression experiment datasets")
+        if spec.get("sampling", "shuffle") not in ("shuffle", "device_condition"):
+            raise ValueError("Invalid regression sampling policy")
+        if (spec["loss"] == "nasa_proxy" or spec.get("sampling") == "device_condition") and spec.get("datasets") != ["C"]:
+            raise ValueError("NASA and condition sampling experiments require C")
+        if "nasa_mix" in spec and spec["loss"] != "nasa_proxy":
+            raise ValueError("NASA mix requires the NASA proxy loss")
+        if "short_overestimate_boost" in spec and (spec["loss"] != "mse" or spec.get("datasets") != ["B"]
+                or spec.get("method", "mlp") != "mlp"):
+            raise ValueError("Short-life overestimate protection requires B MSE continuation")
+        method = spec.get("method", "mlp")
+        if method not in ("mlp", *CORRECTION_METHODS, *BOUNDED_METHODS):
+            raise ValueError("Invalid regression training method")
+        if method != "mlp":
+            strengths = spec.get("strengths")
+            if (not spec["freeze_features"] or spec.get("sampling", "shuffle") != "shuffle"
+                    or not isinstance(strengths, list) or not 1 <= len(strengths) <= 8
+                    or any(type(s) not in (int, float) or not np.isfinite(s) or not 0 < s <= 1 for s in strengths)
+                    or spec.get("device_balance", 0) or spec.get("tail_boost", 1) != 1 or spec["loss"] != "mse"):
+                raise ValueError("Invalid independent correction experiment")
+        if method in BOUNDED_METHODS and (spec["epochs"] != 1 or not any(
+                spec.get("datasets") == [dataset] and method == bounded for dataset, (_, bounded) in BOUNDED_HEADS.items())):
+            raise ValueError("Bounded residual requires one frozen fit for its configured dataset")
+        if method in CORRECTION_METHODS:
+            datasets = spec.get("datasets", [])
+            if (len(datasets) != 1 or spec.get("transform") not in TRANSFORMS[datasets[0]]
+                    or spec.get("basis", "linear") not in BASIS_KINDS
+                    or type(spec.get("ridge")) not in (int, float) or not np.isfinite(spec["ridge"]) or not 0 < spec["ridge"] <= 10):
+                raise ValueError("Invalid independent correction experiment")
+    sequences = config.get("preferred_experiment_sequence", {})
+    if not isinstance(sequences, dict):
+        raise ValueError("Invalid regression experiment sequences")
+    for dataset, sequence in sequences.items():
+        if (dataset not in UNITS or dataset in preferences or not isinstance(sequence, list)
+                or not 1 <= len(sequence) <= 10 or any(not isinstance(name, str) for name in sequence)
+                or len(set(sequence)) != len(sequence)):
+            raise ValueError("Invalid regression experiment sequence")
+    for dataset in (*preferences, *sequences):
+        ordered_experiments(config, dataset)
+
+
+def experiment_menu(config, dataset, parent, train):
+    menu = ordered_experiments(config, dataset, mode="configured")
+    bounded_key, bounded_method = BOUNDED_HEADS[dataset]
+    if dataset == "B":
+        bearings = set(train.get("metadata", {}).get("bearing", [None]))
+        if None in bearings or "unknown" in bearings:
+            menu = {name: s for name, s in menu.items() if not s.get("device_balance", 0)}
+        if None in bearings or "unknown" in bearings or not 2 <= len(bearings) <= MAX_PROTOTYPES:
+            menu = {name: s for name, s in menu.items() if s.get("method") != bounded_method}
+    bounded = parent.meta.get(bounded_key)
+    if bounded is not None:
+        # 向上限制取决于完整父预测。后续只在训练投影更新时重拟合修正头。
+        return {name: s for name, s in menu.items()
+                if s.get("method") == bounded_method and bounded["train_sha256"] != train["sha256"]}
+    if len(parent.meta.get("corrections", [])) >= MAX_CORRECTIONS:
+        menu = {name: s for name, s in menu.items() if s.get("method") not in CORRECTION_METHODS}
+    else:
+        menu = {name: s for name, s in menu.items() if s.get("method") != bounded_method}
+    return menu
 
 
 def _policy(state, dataset, menu):
@@ -91,16 +179,17 @@ def _policy(state, dataset, menu):
 
 
 def _advance(policy, selected, parent, candidate, plan, identity, reduction, failed,
-             local_gate=None, host_gate=None, selection_source="model"):
+             local_gate=None, host_gate=None, selection_source="model", completed=False):
     # 依据已经发生的结果更新策略，而不是依据模型在 reason 里声称“有效”。
     # 拒绝/本地失败也计入 attempts，后续用完整实验指纹限制同一个失败方案重复尝试。
     result = deepcopy(policy)
     result["artifact_policies"].setdefault(parent, {k: policy[k] for k in ("version", "preferred_experiment")})
-    if candidate is not None or failed:
+    if candidate is not None or failed or completed:
         adopted = candidate is not None and selected == candidate
         result["attempts"].append({"fingerprint": identity, "experiment": plan["experiment"],
                                    "adopted": adopted, "rmse_reduction": reduction,
                                    "status": "local_training_failed" if failed else "measured",
+                                   "candidate_artifact_id": candidate,
                                    **experiment_outcome(adopted=adopted, failed=failed,
                                        local_gate=local_gate, host_gate=host_gate, selection_source=selection_source)})
         result["attempts"] = result["attempts"][-128:]
@@ -133,8 +222,13 @@ def _history_view(history):
                        "configuration": {key: config[key] for key in (
                            "dataset", "experiment", "parent_checkpoint_sha256", "train_sha256", "validation_sha256",
                            "validation_before", "validation_after", "candidate_gate", "host_candidate_gate",
-                           "experiment_failure", "selected_local_rmse") if key in config}}, context="regression_history_view"))
+                           "experiment_failure", "selected_local_rmse", "execution_policy", "experiment_outcome") if key in config}}, context="regression_history_view"))
     return result
+
+
+def _restored_view(restored):
+    return {key: {**value, **({"metrics": compact_metrics(value["metrics"])} if "metrics" in value else {})}
+            for key, value in restored.items()}
 
 
 def _restore_history(rnd, history, run, validation, before, rules, dataset):
@@ -207,39 +301,73 @@ def train(rnd):
     with stage("load_public_data", dataset=dataset):
         train_data, validation = load_pair(rnd.data.train_path, rnd.data.validation_path, dataset)
     with stage("evaluate_parent", dataset=dataset):
+        primary_sha = digest(checkpoint)
         parent = load_model(checkpoint, dataset, train_data["paths"])
-        before = evaluate(parent, validation, dataset)
+        parent_prediction = parent.predict(validation["x"])
+        before = evaluate(parent, validation, dataset, prediction=parent_prediction)
     with stage("validate_parent_measurement", dataset=dataset):
         parent_host = current_parent_reference(rnd, checkpoint, before, validation["sha256"])
     with stage("history_rpc", dataset=dataset):
         history = rnd.history()
     state = rnd.state_workspace(run / "state")
+    with stage("evaluate_stage_start", dataset=dataset):
+        stage_identity, stage_metrics = measure_stage(rnd, state, checkpoint, primary_sha, before, validation)
+    stage_comparison = {"identity": stage_identity, "validation_sha256": validation["sha256"],
+                        "start_metrics": compact_metrics(stage_metrics),
+                        "parent_delta": compare_stage(stage_metrics, before)}
     reference_path = state / "regression_monitor_reference.json"
     # 阶段 3：首轮只从 train 建立监测参考；后续校验其来源和结构，保持最初的比较口径。
     # 平台可以更新公开 train，不能因此重拟合父模型 scaler，也不能把合法新投影判成状态损坏。
     # monitor 看输入变没变，diagnose 看公开标签上的误差分段；二者一起给出可验证的实验线索。
     reference = json.loads(reference_path.read_text(encoding="utf-8")) if reference_path.exists() else fit_reference(train_data, dataset)
     drift = monitor(reference, validation, train_data, dataset, full_config["controller"]["drift_thresholds"])
-    diagnosis = diagnose(parent, validation, reference, before, drift)
-    menu = {spec["name"]: spec for spec in config["experiments"]}
-    policy = _policy(state, dataset, menu)
+    diagnosis = diagnose(parent, validation, reference, before, drift, prediction=parent_prediction)
+    menu = experiment_menu(config, dataset, parent, train_data)
+    policy = _policy(state, dataset, {s["name"]: s for s in config["experiments"]})
     # 阶段 4：策略必须与本轮实际父模型配对；换了父产物却没有对应策略时，偏好恢复为初值。
     paired = policy["artifact_policies"].get(rnd.parent.artifact_id)
     if paired:
         policy.update(paired)
     elif policy["artifact_policies"]:
         policy.update(version=1, preferred_experiment=None)
-    execution = {"format": "rul.execution.v1", "rules": rules, "limits": limits, "prompt_version": PROMPT_VERSION,
+    execution = {"format": "rul.execution.v2", "rules": rules, "limits": limits, "prompt_version": PROMPT_VERSION,
+                 "repeat_policy": REPEAT_POLICY, "training_version": "weighted-composite-rul-v3",
+                 "skip_locally_rejected_uploads": config.get("skip_locally_rejected_uploads", True),
                  "experiment_policy_version": EXPERIMENT_POLICY_VERSION,
                  "host_admission_policy_version": HOST_ADMISSION_VERSION,
                  "parent_reference_policy_version": PARENT_REFERENCE_VERSION,
                  "monitor_reference_policy": "fixed_initial_training_projection-v1"}
+    first_experiment = config.get("default_first_experiment", {}).get(dataset) if rnd.round_index == 1 else None
+    if first_experiment in menu:
+        execution["default_first_experiment"] = first_experiment
     allowed, blocked = available_experiments(policy, menu, rnd, train_data, validation, rules, execution)
+    bounded_key, bounded_method = BOUNDED_HEADS[dataset]
+    def unavailable_reason(spec):
+        if spec.get("method") == bounded_method:
+            if dataset == "C":
+                return "bounded_head_already_fitted" if parent.meta.get(bounded_key) else "requires_frozen_c_residuals"
+            if len(parent.meta.get("corrections", [])) < MAX_CORRECTIONS:
+                return "requires_frozen_b_residuals"
+            return "bounded_head_already_fitted" if parent.meta.get(bounded_key) else "trace_metadata"
+        if parent.meta.get(bounded_key):
+            return "bounded_head_requires_frozen_anchor"
+        return "correction_capacity" if spec.get("method") in CORRECTION_METHODS else "trace_metadata"
+
+    unavailable = {s["name"]: unavailable_reason(s)
+                   for s in config["experiments"] if dataset in s.get("datasets", ["B", "C"]) and s["name"] not in menu}
+    unavailable.update(dict.fromkeys(blocked, "repeat_policy"))
     admission_blocker = None
     if not parent_host["comparable"]:
         # 不可核验的父测量使本轮任何候选都不能上线；直接观察并留证，避免重复消耗训练预算。
         admission_blocker = parent_host.get("reason", "parent_measurement_unverified")
+        unavailable.update(dict.fromkeys(allowed, "parent_measurement_unverified"))
         allowed = {}
+    first_experiment = first_experiment if first_experiment in allowed else None
+    stage_round = rnd.round_index - stage_identity["round_index"] + 1
+    scheduled = stage_experiment_preference(config, dataset, stage_round, allowed)
+    preferred = scheduled or first_experiment
+    if preferred:
+        allowed = {preferred: allowed[preferred], **allowed}
     # 指纹包含父模型、train、validation、方案和执行规则；只屏蔽同一身份下反复失败的方案。
     with stage("restore_and_evaluate_history", dataset=dataset):
         # 父测量不可比时历史也不能采用，避免白白传输整份历史产物。
@@ -267,18 +395,52 @@ def train(rnd):
 
     request = {"phase": "plan", "round_index": rnd.round_index, "dataset": dataset,
                "task": "regression", "metric": "rmse", "metric_direction": "lower", "target_unit": UNITS[dataset],
-               "parent_artifact_id": rnd.parent.artifact_id, "validation_before": before,
+               "parent_artifact_id": rnd.parent.artifact_id, "validation_before": compact_metrics(before),
                "parent_host_reference": parent_host,
+                 "stage_reference": stage_comparison,
                "admission_blocker": admission_blocker,
                "history": _history_view(history), "experiments": allowed, "strategy": {
                    "version": policy["version"], "preferred_experiment": policy["preferred_experiment"],
-                   "blocked_repeated_experiments": blocked},
+                   "blocked_repeated_experiments": blocked, "unavailable_experiments": unavailable},
                "monitoring": {k: v for k, v in drift.items() if k != "features"}, "diagnosis": diagnosis,
-               "historical_validation": restored, "promotion_rules": rules,
-               "plan_contract": plan_contract(rnd.parent.artifact_id, before, restored, rollback_ids, allowed),
+               "historical_validation": _restored_view(restored), "promotion_rules": rules,
+               "plan_contract": plan_contract(rnd.parent.artifact_id, compact_metrics(before), restored, rollback_ids, allowed),
                "controller_prompt": {"version": PROMPT_VERSION, "instruction": PLAN_INSTRUCTION},
                "response_schema": {"action": actions, "experiment": ["none", *allowed],
                    "target_artifact_id": [rnd.parent.artifact_id, *rollback_ids], "hypothesis": "非空实验假设", "reason": "非空证据理由"}}
+    request["experiment_evidence"] = experiment_evidence(_history_view(history), policy["attempts"], menu,
+        rnd.parent.checkpoint_sha256, train_data["sha256"], validation["sha256"], execution, rules,
+        gain_key="rmse_reduction", blocked=blocked)
+    if first_experiment:
+        request["strategy"]["default_first_experiment"] = first_experiment
+        request["controller_prompt"]["instruction"] += (
+            "首轮决定做实验时，默认选择strategy.default_first_experiment。"
+            "有本轮已核验的证据支持其他合法动作时，可以按证据选择并说明理由。")
+    if scheduled:
+        request["strategy"]["scheduled_experiment_preference"] = scheduled
+        request["controller_prompt"]["instruction"] += (
+            "为尽早获得收益，本轮默认优先评估 strategy.scheduled_experiment_preference。"
+            "如当轮可比证据支持其他合法动作，按证据决策并说明理由。")
+    bounded_name = next((name for name, s in allowed.items() if s.get("method") == bounded_method), None)
+    if bounded_name:
+        if dataset == "C":
+            request["strategy"]["preferred_bounded_experiment"] = bounded_name
+            request["controller_prompt"]["instruction"] += (
+                "C 已有完整残差父模型时，优先评估 preferred_bounded_experiment 的限幅修正。"
+                "该候选必须同时改善 RMSE、MAE 和 NASA。")
+        else:
+            request["controller_prompt"]["instruction"] += (
+                "B 的 bearing_upward_guard 可用时，可依据轴承误差方向选择它。"
+                "它冻结完整父模型，对高估风险的上调限幅，且须同时降低 RMSE、MAE 并通过分轴承保护。")
+    request["data_scope"] = {"train_sha256": train_data["sha256"], "validation_sha256": validation["sha256"],
+                             "train_rows": len(train_data["y"]), "validation_rows": len(validation["y"]), "hidden_labels_available": False}
+    request["experiment_guide"] = {name: {"actual_change": s.get("method", "mlp"),
+        "freeze_mlp_and_existing_corrections": s.get("method") in (*CORRECTION_METHODS, *BOUNDED_METHODS),
+        "device_balance": s.get("device_balance", 0), "tail_boost": s.get("tail_boost", 1),
+        "basis": s.get("basis"), "sampling": s.get("sampling", "shuffle"),
+        "loss": s["loss"], "transform": s.get("transform"), "huber_quantile": s.get("huber_quantile"),
+        "risk": "Weights change the training objective; correction statistics use train only. Compare RMSE/MAE/NASA on the same validation."}
+        for name, s in allowed.items()}
     plan, planning_calls = _controller_decision(rnd, request, ("action", "experiment", "target_artifact_id", "hypothesis", "reason"),
                                      full_config["max_output_tokens"], validate_plan, rules["json_corrections"], state)
     spec = allowed[plan["experiment"]] if plan["action"] == "experiment" else None
@@ -286,9 +448,11 @@ def train(rnd):
     cfg = {"dataset": dataset, "task": "regression", "metric": "rmse", "metric_direction": "lower",
            "target_unit": UNITS[dataset], "action": plan["action"], "experiment": spec,
            "parent_checkpoint_sha256": rnd.parent.checkpoint_sha256, "train_sha256": train_data["sha256"],
-           "parent_primary_file_sha256": digest(checkpoint),
-           "validation_sha256": validation["sha256"], "validation_before": before,
+           "parent_primary_file_sha256": primary_sha,
+           "validation_sha256": validation["sha256"], "validation_before": compact_metrics(before),
            "parent_host_reference": parent_host,
+           "stage_reference": stage_comparison,
+           **({"scheduled_experiment_preference": scheduled} if scheduled else {}),
            "admission_blocker": admission_blocker,
            "controller_prompt_version": PROMPT_VERSION, "execution_policy": execution}
     submitted, report, gate, admission, failure = None, None, None, None, None
@@ -302,7 +466,7 @@ def train(rnd):
         try:
             with stage("local_training", dataset=dataset, experiment=spec["name"]):
                 report = continue_candidate(checkpoint, train_data, validation, candidate, spec, limits, rules, dataset,
-                                            digest(checkpoint))
+                                            primary_sha, parent_measurement=(primary_sha, before))
         except (TimeoutError, ValueError, ArithmeticError, np.linalg.LinAlgError) as error:
             failure = {"stage": "local_training", "error_type": type(error).__name__, "message": str(error)[:1000]}
             append_jsonl(state / "experiment_attempts.jsonl", {"round_index": rnd.round_index, "status": "failed", **failure})
@@ -312,20 +476,32 @@ def train(rnd):
             append_jsonl(state / "experiment_attempts.jsonl", {"round_index": rnd.round_index, "status": "trained"})
     if report is not None:
         # 阶段 7：本地算准入、写诊断证据，并把候选交给宿主真实测量；上传成功不等于准许上线。
-        gate = promotion_gate(before, report["validation_after"], rules)
-        cfg.update(validation_after=report["validation_after"], candidate_gate=gate)
+        gate = promotion_gate(before, report["validation_after"], rules,
+                              require_all_improved=spec.get("method") == bounded_method)
+        cfg.update(validation_after=compact_metrics(report["validation_after"]), candidate_gate=gate)
+        stage_comparison["candidate_delta"] = compare_stage(stage_metrics, report["validation_after"])
         write_json(candidate / "monitoring.json", drift)
         write_json(candidate / "diagnosis.json", diagnosis)
         write_json(candidate / "planning.json", {"decision": plan, **planning_calls})
-        change = "Continued the actual %s regression parent using %s; preserved Adam/scalers/seed and measured RMSE in %s." % (dataset, spec["name"], UNITS[dataset])
+        change = (("Fitted a new correction on the frozen complete parent" if spec.get("method") in (*CORRECTION_METHODS, *BOUNDED_METHODS)
+                   else "Continued the complete regression parent") + " using %s; preserved parent Adam/scalers/seed and measured RMSE in %s." % (spec["name"], UNITS[dataset]))
         # SDK 上传在计算异常捕获之外；任何结果未知的 RPC 立即结束会话，不重试或伪造成功。
-        with stage("submit_candidate_rpc", dataset=dataset):
-            submitted = rnd.submit_candidate(candidate, hypothesis=plan["hypothesis"], change_summary=change,
-                configuration=bounded_configuration(cfg, state, rnd.round_index, "candidate"), seed=parent.meta["seed"], checkpoint_paths=["checkpoint.npz"],
-                code_paths=_snapshot(candidate), predict_argv=PREDICT_ARGV)
-        admission = host_gate(submitted, parent_host, report["validation_after"], validation["sha256"], rules,
-                              binding=bind_candidate_validation(rnd, submitted, validation["sha256"]))
-        cfg["host_candidate_gate"] = admission
+        if gate["eligible"] or not config.get("skip_locally_rejected_uploads", True):
+            code_paths = _snapshot(candidate)
+            transfer = record_transfer("candidate", candidate)
+            with stage("submit_candidate_rpc", dataset=dataset):
+                submitted = rnd.submit_candidate(candidate, hypothesis=plan["hypothesis"], change_summary=change,
+                    configuration=bounded_configuration(cfg, state, rnd.round_index, "candidate"), seed=parent.meta["seed"], checkpoint_paths=["checkpoint.npz"],
+                    code_paths=code_paths, predict_argv=PREDICT_ARGV)
+            transfer["acknowledged"] = True
+            admission = host_gate(submitted, parent_host, report["validation_after"], validation["sha256"], rules,
+                                  binding=bind_candidate_validation(rnd, submitted, validation["sha256"]))
+            cfg["host_candidate_gate"] = admission
+        else:
+            cfg["candidate_upload_skipped"] = "local_promotion_gate_rejected"
+            # 保存真实本地报告而不伪造 artifact_id 或宿主测量回执。
+            write_json(state / f"local-training-{rnd.round_index}.json", report)
+            change = "Completed and locally rejected the regression experiment; retained the actual parent."
     eligible = [rnd.parent.artifact_id]
     # 阶段 8：最终白名单取本地和宿主两道门槛的交集；不合格候选即使模型坚持也不能选。
     # 历史资格由当前 SDK 授权及本轮复评决定，独立于是否在规划中预先声明 rollback。
@@ -342,13 +518,14 @@ def train(rnd):
 
     selection_request = {"phase": "select", "dataset": dataset, "action": plan["action"],
         "parent_artifact_id": rnd.parent.artifact_id, "candidate_artifact_id": submitted["artifact_id"] if submitted else None,
-        "same_local_validation": {"parent": before, "candidate": report["validation_after"] if report else None, "historical": restored},
+        "same_local_validation": {"parent": compact_metrics(before), "candidate": compact_metrics(report["validation_after"]) if report else None, "historical": _restored_view(restored)},
         "historical_admission": {key: {"eligible": key in selection_history_ids,
             "reevaluated_this_round": value.get("reevaluated_this_round") is True,
             "validation_sha256": value.get("validation_sha256"), "gate": value["gate"],
-            "fresh_metrics": value.get("metrics")} for key, value in restored.items()},
+            "fresh_metrics": compact_metrics(value["metrics"]) if "metrics" in value else None} for key, value in restored.items()},
         "host_candidate_receipt": submitted, "host_candidate_gate": admission, "candidate_gate": gate,
         "parent_host_reference": parent_host, "experiment_failure": failure, "promotion_rules": rules,
+        "stage_reference": stage_comparison,
         "controller_prompt": {"version": PROMPT_VERSION, "instruction": SELECT_INSTRUCTION},
         "response_schema": {"selected_artifact_id": eligible, "reason": "依据实际回归测量的非空理由"}}
     selection, selection_calls = _controller_decision(rnd, selection_request, ("selected_artifact_id", "reason"),
@@ -366,13 +543,14 @@ def train(rnd):
         change = "Measured the regression candidate but retained the actual parent artifact."
     next_policy = _advance(policy, selected, rnd.parent.artifact_id, candidate_id, plan, identity,
                            gate["rmse_reduction"] if gate else None, failure is not None,
-                           local_gate=gate, host_gate=admission, selection_source=selection_calls["decision_source"])
-    if candidate_id or failure:
+                           local_gate=gate, host_gate=admission, selection_source=selection_calls["decision_source"], completed=report is not None)
+    if report is not None or failure:
         cfg["experiment_outcome"] = {key: next_policy["attempts"][-1][key] for key in (
             "outcome", "reason", "counts_toward_rejection_limit")}
     cfg["selection_action"] = ("adopt_candidate" if selected == candidate_id else
                                 "retain_parent" if selected == rnd.parent.artifact_id else "rollback")
     cfg.update(selected_local_rmse=selected_metrics["rmse"], strategy_version_after=next_policy["version"])
+    stage_comparison["selected_delta"] = compare_stage(stage_metrics, selected_metrics)
     cfg["controller_decisions"] = {"plan": planning_calls["decision_source"], "select": selection_calls["decision_source"]}
     if "program_guard" in cfg["controller_decisions"].values():
         change = "Controller decision validation exhausted; program guard retained the actual parent without adopting an unapproved candidate."
@@ -387,9 +565,11 @@ def train(rnd):
     write_json(state / "regression_strategy.json", next_policy)
     write_json(state / "monitoring.json", drift)
     write_json(state / "diagnosis.json", diagnosis)
+    write_json(state / "parent-validation-metrics.json", before)
     record = portable_record(record, context="regression_round_record")
     append_jsonl(state / "decisions.jsonl", record)
     write_json(run / "round_summary.json", record)
+    save_resources(state)
     with stage("save_state_rpc", dataset=dataset):
         rnd.save_state(state)
     # 阶段 11：保存的是可写状态副本；finish 引用实际读过的历史和本轮真实回执，等待宿主确认后退出。

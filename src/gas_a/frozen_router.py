@@ -15,6 +15,7 @@ import numpy as np
 
 from .home_training import binary_cutoffs, train_home
 from .model import Model as HomeModel
+from . import pair_review
 from .router import HomeExpert, PAIRS, pair_codes
 from .signals import Flatline, correct, home_probabilities
 from .sensor_training.data import evaluate, load_model, score_predictions
@@ -76,7 +77,7 @@ def route_scores(scores, policy):
 
 class FrozenRouter:
     """Immutable label-selected policy; streaming state contains features only."""
-    def __init__(self, models, manifest, component_paths, manifest_path):
+    def __init__(self, models, manifest, component_paths, manifest_path, review=None, review_path=None):
         # 复制冻结策略并创建该进程专属特征流状态，防止外部字典修改改变已加载策略。
         self.models = models
         self.manifest = manifest
@@ -84,18 +85,23 @@ class FrozenRouter:
         self.manifest_path = manifest_path
         self.meta = models["four_sensor"].meta
         self.policy = deepcopy(manifest["policy"])
+        self.review = review
+        self.review_path = review_path
         self._stream = _new_stream(models["four_sensor"])
+
+    def _predict(self, x, stream):
+        routed = route_scores(_expert_scores(self.models, self.policy, x, stream), self.policy)
+        return routed if self.review is None else self.review.predict(x, routed)
 
     def predict(self, x):
         # Independent evaluation starts from the same empty state as a new process.
         # 批量独立评估从空状态开始，确保每次公开测量不继承之前评测的特征窗口。
         x = np.asarray(x, dtype=np.float64)
-        scores = _expert_scores(self.models, self.policy, x, _new_stream(self.models["four_sensor"]))
-        return route_scores(scores, self.policy)
+        return self._predict(x, _new_stream(self.models["four_sensor"]))
 
     def predict_one(self, x):
         # 平台逐行预测沿用本进程特征流状态；它与整批从空状态按顺序处理保持相同语义。
-        return route_scores(_expert_scores(self.models, self.policy, x, self._stream), self.policy)
+        return self._predict(x, self._stream)
 
 
 def load_predictor(checkpoint, paths=None, resolve_file=None):
@@ -149,7 +155,18 @@ def load_predictor(checkpoint, paths=None, resolve_file=None):
                 or not np.array_equal(model.mean, anchor.mean) or not np.array_equal(model.scale, anchor.scale)):
             raise ValueError("Routing components have incompatible task or standardization")
         models[role], component_paths[role] = model, path
-    return FrozenRouter(models, manifest, component_paths, manifest_path)
+    review, review_path = None, None
+    if "pair_review" in manifest or "pair_review_sha256" in marker:
+        entry = manifest.get("pair_review")
+        if (not isinstance(entry, dict) or entry.get("format") != pair_review.FORMAT
+                or entry.get("path") != pair_review.FILENAME or not isinstance(entry.get("sha256"), str)
+                or entry["sha256"] != marker.get("pair_review_sha256")):
+            raise ValueError("Invalid pair review manifest")
+        review_path = resolve_file(_relative(root, entry["path"]))
+        if digest(review_path) != entry["sha256"]:
+            raise ValueError("Pair review checkpoint digest mismatch")
+        review = pair_review.PairReview.load(review_path)
+    return FrozenRouter(models, manifest, component_paths, manifest_path, review, review_path)
 
 
 def checkpoint_paths(checkpoint):
@@ -158,10 +175,13 @@ def checkpoint_paths(checkpoint):
     if not isinstance(model, FrozenRouter):
         return [Path(checkpoint).name]
     root = Path(checkpoint).parent
-    return [model.component_paths[role].relative_to(root).as_posix() for role in COMPONENTS]
+    paths = [model.component_paths[role].relative_to(root).as_posix() for role in COMPONENTS]
+    if model.review_path is not None:
+        paths.append(model.review_path.relative_to(root).as_posix())
+    return paths
 
 
-def calibrate_policy(models, validation, cutoffs, search, *, controller=None, parent_metrics=None):
+def calibrate_policy(models, validation, cutoffs, search, *, controller=None, parent_metrics=None, review=None):
     """Compare a bounded family of class-pair policies using validation labels only."""
     # 在有上限的修正开关/融合权重菜单中，逐个类别对尝试加入路由。
     # 支持数不足或没有严格公开验证增益的类别对不启用；最后还必须通过外层整体晋升门槛。
@@ -189,8 +209,15 @@ def calibrate_policy(models, validation, cutoffs, search, *, controller=None, pa
     base = {"inner_weight": .75, "outer_weight": .6, "active_pairs": [], "cutoffs": cutoffs,
             "feature_correction": False}
     y = validation["y"]
+    evidence = review.evidence(validation["x"]) if review is not None else None
+
+    def measure(probabilities):
+        if evidence is not None:
+            probabilities = review.apply(probabilities, evidence)
+        return score_predictions(probabilities, y)
+
     best_policy = deepcopy(base)
-    baseline = score_predictions(models["four_sensor"].predict(validation["x"]), y)
+    baseline = measure(models["four_sensor"].predict(validation["x"]))
     best = baseline
     trials = []
     for correction in corrections:
@@ -209,7 +236,7 @@ def calibrate_policy(models, validation, cutoffs, search, *, controller=None, pa
                     if support < minimum_support:
                         continue
                     proposal = dict(policy, active_pairs=[*policy["active_pairs"], code])
-                    metric = score_predictions(route_scores(scores, proposal), y)
+                    metric = measure(route_scores(scores, proposal))
                     # 合格路由优先于不合格高分；已合格时不能为 F1 牺牲类别保护。
                     feasible, current_feasible = gate(metric)["eligible"], gate(current)["eligible"]
                     accepted = ((feasible and not current_feasible) or
@@ -240,7 +267,31 @@ def _replace_checkpoint(model, target):
         Path(temporary).unlink(missing_ok=True)
 
 
-def retain_bundle(parent, candidate, validation):
+def _export_review(parent, candidate, fitted=None):
+    if fitted is None and parent.review is None:
+        return None, None, None
+    path = candidate / pair_review.FILENAME
+    if fitted is not None:
+        review, train_sha = fitted
+        review.save(path)
+        entry = {"format": pair_review.FORMAT, "path": pair_review.FILENAME,
+                 "sha256": digest(path), "train_sha256": train_sha}
+    else:
+        review, entry = parent.review, parent.manifest["pair_review"]
+        shutil.copyfile(parent.review_path, path)
+        if digest(path) != entry["sha256"]:
+            raise ValueError("Retained pair review differs from the authorized parent")
+    return review, path, entry
+
+
+def _bundle_marker(review_entry):
+    marker = {"format": FORMAT, "manifest": MANIFEST}
+    if review_entry is not None:
+        marker["pair_review_sha256"] = review_entry["sha256"]
+    return marker
+
+
+def retain_bundle(parent, candidate, validation, *, fitted_review=None):
     """Export the continued primary with byte-identical actual-parent auxiliaries."""
     candidate = Path(candidate)
     primary_path = candidate / "checkpoint.npz"
@@ -261,8 +312,9 @@ def retain_bundle(parent, candidate, validation):
         files[role] = target
         retained[role] = {"sha256": expected, "unchanged": True}
     models = {**parent.models, "four_sensor": primary}
-    measured = evaluate(FrozenRouter(models, parent.manifest, files, candidate / MANIFEST), validation)
-    primary.meta["prediction_bundle"] = {"format": FORMAT, "manifest": MANIFEST}
+    review, review_path, entry = _export_review(parent, candidate, fitted_review)
+    measured = evaluate(FrozenRouter(models, parent.manifest, files, candidate / MANIFEST, review, review_path), validation)
+    primary.meta["prediction_bundle"] = _bundle_marker(entry)
     _replace_checkpoint(primary, primary_path)
     manifest = deepcopy(parent.manifest)
     manifest["components"] = {role: {"path": path.relative_to(candidate).as_posix(), "sha256": digest(path)}
@@ -270,12 +322,18 @@ def retain_bundle(parent, candidate, validation):
     manifest["prediction_parameter_count"] = sum(model.meta["parameter_count"] for model in models.values())
     manifest["prediction_parameter_count"] += sum(len(head["w"]) + 1
         for head in models["home_router"].meta["private_joint_rescue"].values())
+    if entry is not None:
+        manifest["pair_review"] = entry
+        manifest["prediction_parameter_count"] += review.parameter_count
+        if fitted_review is None:
+            retained["pair_review"] = {"sha256": entry["sha256"], "unchanged": True}
     manifest["calibration"] = {"scope": "authorized_public_validation", "validation_sha256": validation["sha256"],
         "validation_rows": len(validation["y"]), "selected_metrics": measured,
-        "policy_source": "retained_actual_parent_policy", "retained_components": retained}
+        "policy_source": "actual_parent_policy_with_pair_review" if fitted_review is not None else "retained_actual_parent_policy",
+        "retained_components": retained}
     write_json(candidate / MANIFEST, manifest)
     exported = evaluate(load_predictor(primary_path, validation["paths"]), validation)
-    if abs(exported["macro_f1"] - measured["macro_f1"]) > 1e-12:
+    if any(abs(exported[key] - measured[key]) > 1e-12 for key in ("macro_f1", "accuracy")):
         raise ValueError("Retained exported bundle differs from epoch predictor")
     return exported, manifest
 
@@ -330,13 +388,17 @@ def build_bundle(parent_path, parent_predictor, train, validation, candidate, sp
                        for group in ("params", "first", "second") for k in ("w1", "b1"))):
             raise ValueError("Home expert did not preserve and continue the actual parent state")
     controller = limits.get("controller_checkpoint_gate")
+    review, review_entry = None, None
+    if isinstance(parent_predictor, FrozenRouter):
+        review, _, review_entry = _export_review(parent_predictor, candidate)
     policy, calibration = calibrate_policy(models, validation, cutoffs, routing["selection"],
                                           controller=controller,
-                                          parent_metrics=evaluate(parent_predictor, validation) if controller is not None else None)
+                                          parent_metrics=evaluate(parent_predictor, validation) if controller is not None else None,
+                                          review=review)
     remaining()
     anchor = models["four_sensor"]
     # 先把主检查点标记为完整路由入口，再计算各组件摘要和清单，保证平台从主文件能找回整包。
-    anchor.meta["prediction_bundle"] = {"format": FORMAT, "manifest": MANIFEST}
+    anchor.meta["prediction_bundle"] = _bundle_marker(review_entry)
     _replace_checkpoint(anchor, anchor_path)
     files = {"four_sensor": anchor_path, **{k: aux / (k + ".npz") for k in COMPONENTS[1:]}}
     parameter_count = sum(model.meta["parameter_count"] for model in models.values())
@@ -344,6 +406,9 @@ def build_bundle(parent_path, parent_predictor, train, validation, candidate, sp
     manifest = {"format": FORMAT, "classes": CLASSES, "policy": policy, "calibration": calibration,
                 "prediction_parameter_count": parameter_count,
                 "components": {k: {"path": p.relative_to(candidate).as_posix(), "sha256": digest(p)} for k,p in files.items()}}
+    if review_entry is not None:
+        manifest["pair_review"] = review_entry
+        manifest["prediction_parameter_count"] += review.parameter_count
     write_json(candidate / MANIFEST, manifest)
     write_json(candidate / "routing_training.json", {
         "gradient_and_memory_scope": "authorized_training_rows_only", "route_selection_scope": "authorized_public_validation",

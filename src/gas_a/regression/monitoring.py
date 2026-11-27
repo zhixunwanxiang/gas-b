@@ -1,5 +1,6 @@
 """B/C 的特征漂移与回归误差诊断，监测参考只来自公开训练集。"""
 import numpy as np
+from .diagnostics import error_metrics, compact_metrics
 
 
 def fit_reference(train, dataset):
@@ -58,10 +59,10 @@ def monitor(reference, current, train, dataset, thresholds):
             "thresholds": thresholds, "top_features": ordered[:8], "features": ordered}
 
 
-def diagnose(model, validation, reference, metrics, drift):
+def diagnose(model, validation, reference, metrics, drift, *, prediction=None):
     # 只有授权公开 validation 的标签参与误差诊断，不向隐藏预测过程索取真实标签。
     # 寿命分组边界来自 train 的 25%/50%/75% 分位点，避免每轮更换分组后无法对比。
-    error = model.predict(validation["x"]) - validation["y"]
+    error = (model.predict(validation["x"]) if prediction is None else prediction) - validation["y"]
     cuts = np.asarray(reference["target_cuts"], dtype=float)
     if cuts.ndim != 1 or not np.isfinite(cuts).all() or np.any(np.diff(cuts) <= 0):
         raise ValueError("Invalid training-origin RUL diagnosis cut points")
@@ -72,10 +73,13 @@ def diagnose(model, validation, reference, metrics, drift):
     for group in range(len(cuts) + 1):
         selected = error[groups == group]
         if len(selected):
-            segments.append({"rul_group": group, "rows": len(selected),
-                             "rmse": float(np.sqrt(np.mean(selected ** 2))),
-                             "mae": float(np.abs(selected).mean()), "bias": float(selected.mean())})
-    return {"scope": "authorized_public_validation", "metrics": metrics,
+            item = {"rul_group": group, **error_metrics(selected, reference["dataset"]),
+                    "squared_error_share": float(np.sum(selected ** 2) / np.sum(error ** 2)) if np.any(error) else 0.}
+            if reference["dataset"] == "C":
+                total = metrics["nasa_score"]
+                item["nasa_share"] = item["nasa_score"] / total if total and item["nasa_score"] is not None else None
+            segments.append(item)
+    return {"scope": "authorized_public_validation", "metrics": compact_metrics(metrics),
             "training_target_cuts": cuts.tolist(), "rul_segments": segments,
             "drift_features": drift["top_features"],
             "interpretation": "Positive bias means overestimated remaining life; feature drift and error groups are hypotheses, not physical failure causes.",

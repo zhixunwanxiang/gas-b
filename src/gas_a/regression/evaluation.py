@@ -4,42 +4,91 @@ import numpy as np
 from ..host_validation import SCORE_TOLERANCE, parse_measurement, metric_matches
 from ..sensor_training.io import digest
 from ..parent_checkpoint import verify_selected_checkpoint
+from .diagnostics import VERSION as METRIC_VERSION, error_metrics, grouped_metrics, groups
 
 PARENT_REFERENCE_VERSION = "current-parent-public-reevaluation-v2"
 
 
-def evaluate(model, data, dataset):
+def evaluate(model, data, dataset, *, prediction=None, detailed=True, device_masks=None):
     # Model.predict 已把标准化输出还原到原单位；这里直接计算分钟/循环上的误差。
     # 正 bias 表示寿命被高估，overestimate_fraction 表示高估样本占比，供诊断使用。
-    prediction = model.predict(data["x"])
+    prediction = model.predict(data["x"]) if prediction is None else prediction
     if prediction.shape != data["y"].shape or not np.isfinite(prediction).all() or np.any(prediction < 0):
         raise ValueError("Regression predictions must be finite nonnegative values")
     error = prediction - data["y"]
-    result = {"rmse": float(np.sqrt(np.mean(error ** 2))), "mae": float(np.mean(np.abs(error))),
-              "bias": float(error.mean()), "overestimate_fraction": float(np.mean(error > 0)),
-              "rows": len(error)}
-    if not all(math.isfinite(result[k]) for k in ("rmse", "mae", "bias")):
-        raise ValueError("Nonfinite regression measurement")
-    if dataset == "C":
-        # NASA：高估寿命除以 10，低估除以 13；逐样本求和，不冒充可跨样本数量比较的均值。
-        exponent = np.where(error < 0, -error / 13.0, error / 10.0)
-        with np.errstate(over="ignore"):
-            score = float(np.expm1(exponent).sum())
-        # 极端高估可能导致指数溢出：如实记录 None 和溢出标志，不截断后另报较小分数。
-        result.update(nasa_score=score if math.isfinite(score) else None,
-                      nasa_score_overflow=not math.isfinite(score))
+    result = error_metrics(error, dataset, detailed=detailed)
+    result.update(dataset=dataset, metric_version=METRIC_VERSION,
+                  validation_sha256=data.get("sha256"), scope="authorized_public_validation")
+    if not detailed:
+        if dataset == "B":
+            if device_masks is None:
+                labels = groups(data, dataset)["device"]
+                device_masks = {name: labels == name for name in np.unique(labels)}
+            result["group_metrics"] = {"device": {name: {"rows": int(mask.sum()),
+                "rmse": float(np.sqrt(np.mean(error[mask] ** 2)))} for name, mask in device_masks.items()}}
+        return result
+    result["group_metrics"] = grouped_metrics(error, data, dataset, result.get("nasa_score"))
+    devices = result["group_metrics"]["device"]
+    known = [(key, row) for key, row in devices.items() if key != "unknown"]
+    result["device_equal_mean_rmse"] = float(np.mean([v["rmse"] for _, v in known])) if known else None
+    worst = max(known, key=lambda item: item[1]["rmse"], default=None)
+    result["worst_device"] = ({"device": worst[0], "rmse": worst[1]["rmse"], "rows": worst[1]["rows"]} if worst else None)
     return result
 
 
-def promotion_gate(before, after, rules):
+def promotion_gate(before, after, rules, *, require_all_improved=False):
     # 改善量为 父 RMSE - 新 RMSE；分钟和循环分别比较，不把它们转成分类百分点。
     gain = before["rmse"] - after["rmse"]
     required = max(rules["minimum_rmse_absolute_gain"], before["rmse"] * rules["minimum_rmse_relative_gain"])
     # 绝对收益和相对收益取较严者：默认相对 0.0005 即误差至少降低 0.05%。
-    # 还要满足 MAE 最多相对增加 2% 的默认保护；NASA 只记录，不在此处作为硬门槛。
+    # NASA 保护为显式本地策略，不冒充比赛公式；缺失/溢出按不可核验处理。
     mae_limit = before["mae"] * (1 + rules["maximum_mae_relative_increase"])
-    return {"eligible": bool(gain > 1e-12 and gain >= required and after["mae"] <= mae_limit + 1e-12),
-            "rmse_reduction": gain, "required_rmse_reduction": required, "mae_limit": mae_limit}
+    reasons = []
+    if not all(math.isfinite(m[k]) and m[k] >= 0 for m in (before, after) for k in ("rmse", "mae")):
+        reasons.append("invalid_primary_metrics")
+    for key in ("validation_sha256", "rows", "dataset", "metric_version"):
+        if (key in before or key in after) and before.get(key) != after.get(key):
+            reasons.append("incomparable_" + key)
+    if gain <= 1e-12 or gain < required:
+        reasons.append("rmse_reduction_below_threshold")
+    if after["mae"] > mae_limit + 1e-12:
+        reasons.append("mae_regression")
+    if require_all_improved and after["mae"] >= before["mae"]:
+        reasons.append("mae_not_improved")
+    device_losses = {}
+    protected = rules.get("bearing_device_guard")
+    if protected and before.get("dataset") == "B":
+        parent_devices = before.get("group_metrics", {}).get("device", {})
+        candidate_devices = after.get("group_metrics", {}).get("device", {})
+        for name, parent in parent_devices.items():
+            if name == "unknown" or parent["rows"] < protected["minimum_rows"]:
+                continue
+            candidate = candidate_devices.get(name)
+            if candidate is None or candidate["rows"] != parent["rows"]:
+                reasons.append("incomparable_device_support")
+                continue
+            allowance = max(protected["absolute_increase"], parent["rmse"] * protected["relative_increase"])
+            if candidate["rmse"] > parent["rmse"] + allowance + 1e-12:
+                device_losses[name] = {"rows": parent["rows"], "parent_rmse": parent["rmse"],
+                                       "candidate_rmse": candidate["rmse"], "allowed_increase": allowance}
+        if device_losses:
+            reasons.append("bearing_device_regression")
+    nasa_limit = None
+    has_nasa = before.get("dataset") == "C" or "nasa_score" in before
+    if has_nasa and (require_all_improved or "maximum_nasa_relative_increase" in rules):
+        a, b = before.get("nasa_score"), after.get("nasa_score")
+        if (a is None or b is None or not math.isfinite(a) or not math.isfinite(b)
+                or before.get("nasa_score_overflow") or after.get("nasa_score_overflow")):
+            reasons.append("nasa_measurement_unverified")
+        else:
+            nasa_limit = a if require_all_improved else a * (1 + rules["maximum_nasa_relative_increase"])
+            if b > nasa_limit + 1e-12:
+                reasons.append("nasa_regression")
+            elif require_all_improved and b >= a:
+                reasons.append("nasa_not_improved")
+    return {"eligible": not reasons, "reasons": reasons,
+            "rmse_reduction": gain, "required_rmse_reduction": required, "mae_limit": mae_limit,
+            "nasa_limit": nasa_limit, "device_losses": device_losses}
 
 
 def measurement(value, validation_sha256, *, binding=None):
