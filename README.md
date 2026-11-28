@@ -1,55 +1,35 @@
 # Gas RSI：工业模型自进化系统
 
-更新日期：2026-11-27。
+更新日期：2026-11-28。
 
 项目支持 A 气体识别、B 轴承剩余寿命、C 发动机剩余寿命，使用 contest-harness SDK 1.0.5 接入平台。
 
 核心思路是：**程序固定实验菜单和上线门槛，27B 根据数据、错误和历史选择方案，程序实际训练并测量，合格才允许采用，不合格则保留父模型，必要时选回本轮验证合格的历史模型。** AI 可以选择方案，不能随意改写训练代码、扩大预算或放宽门槛。
 
-当前工作区包含 A 定向复核、B 提前调度和上调保护、C 工况修正与限幅残差。B/C 从历史 V18 回退记录继续演进，详见 [B/C 调优对照](docs/BC_RISK_TUNING_20261127.md)。
+当前 `main` 包含 A 的定向复核、B 的分轴承保护和优先调度、C 的工况修正和分来源保护。B/C 同时检查相对当轮父模型的变化和相对阶段起点的累计退化。详见 [B/C 调优对照](docs/BC_RISK_TUNING_20261127.md)和[配置说明](SUBMISSION_CONFIG_GUIDE.md)。
 
 SDK 1.0.5 沿用 `contest.harness.workspace.v2`、`chunked-v1` 和原入口模板。它在 stderr 新增 `state_request sent`、`state_response received`、`round_complete sent`、`round_ack received`，便于区分状态保存和结束确认阶段的等待。旧镜像需重建才会使用这些日志。
 
-下文 v20 表格描述历史交付物，已有镜像不会因源码回退而自动改变。v21 的实现、数值失败及验收记录保留在 Git 历史和 [历史调优记录](docs/SCORE_ALIGNED_TUNING_V21_20261126.md)，不代表当前 B/C 配置。
+从源码复现请从[本地测试与镜像构建](#7-本地测试与镜像构建)开始。[验证结果](#8-验证结果与历史实验)分别记录当前交付镜像和前一份十轮验收快照。
 
-## 1. 当前交付与工作区版本
+## 1. 当前交付与运行行为
 
-平台最新诊断已确认旧版的多文件父模型加载错误：`parent_checkpoint_sha256` 可为整组检查点的聚合摘要，旧代码误将它与每个单文件摘要比较，A 在采用四组件路由包后的下一轮因此退出。此前离线宿主只模拟单文件摘要，未覆盖这一情况。
-
-工作区已修复：按 `checkpoint_paths` 对每个文件调用 `rnd.parent.path()`，由 SDK 按产物清单核验各文件；四组件包依据主模型内的路由标记确定入口，不依赖文件名或清单顺序。平台父身份继续原样用于 SDK 协议、父评分绑定和实验指纹；续训文件校验独立使用实际主文件摘要，另记为 `configuration.parent_primary_file_sha256`。A、B、C 的父评分及续训路径均已调整。程序不自行推测官方聚合算法，文件损坏、缺失或声明冲突仍应拒绝。
-
-新增回归测试为 `tests/test_parent_checkpoint_manifest.py`，离线容器宿主支持 `--aggregate-parent` 和 `--compact-validation` 联合测试；聚合算法只是测试夹具，程序不会自行重算或替换官方身份。
-
-历史交付 **v20 按项调优版**继承 v19 的完整专家包续训、解析提速和 C `fine_rate`，增加 B 温和低估加权 `underestimate_mild`、相同条件已完成性能失败的去重，以及 CPU/耗时/token 资源记录。实施结果见 [v20 验收记录](docs/ITEM_TUNING_V20_20261126.md)。
-
-后续平台反馈：用户确认 v20 的 B/C 隐藏集表现未达到提分预期。本地协议通过与公开集小幅收益不能视为正式泛化验收通过；已补充分设备和尾部诊断，见 [B/C 平台反馈复核](docs/BC_V20_PLATFORM_REVIEW_20261126.md)。
-
-| 项目 | 内容 |
+| 项目 | 当前交付 |
 |---|---|
-| 镜像标签 | `gas-rsi-abc:wyx-sdk104-v20-item-tuning-20261126` |
-| 不可变镜像 ID | `sha256:7acb79daae6b23287372a2ee2e4b2e1fc0719afed928c886cd88ace5fee8d400` |
-| 镜像包 | [v20 TAR](output/submission-wyx-sdk104-v20-item-tuning-20261126/gas-rsi-abc-wyx-sdk104-v20-item-tuning-20261126.tar) |
-| 完整交付目录 | `output/submission-wyx-sdk104-v20-item-tuning-20261126/` |
-| 交付摘要 | 逐文件大小与 SHA-256 见目录内 `delivery-manifest.json` |
-| 已测源码快照 | `runtime/item-tuning-v20-20261126/source/`，应用代码与镜像逐文件一致；文档随后同步交付状态 |
-| 运行依赖 | Python 3.12.13、NumPy 1.26.4、SDK 1.0.4 |
-| 验证范围 | 官方 SDK、公开数据真实训练、A/B/C 各十轮容器预测；决策使用离线替身，未重新测量正式隐藏成绩 |
+| 镜像标签 | `gas-rsi-abc:wyx-sdk105-20261128` |
+| 镜像 ID | `sha256:facd0f02cd3e80d5d1ec431aa1cd80ce9e961c79f7b30a8d1ee60af9b9dda483` |
+| 本地镜像归档 | `output/submission-wyx-sdk105-20261128/gas-rsi-abc-wyx-sdk105-20261128.tar` |
+| 归档 SHA-256 | `3f709c264f5cce9fab6fd575496aa3f5f211e3c4fba16805af7c42a8578a89f5` |
+| 运行环境 | Python 3.12.13、NumPy 1.26.4、contest-harness SDK 1.0.5 |
+| 镜像验证 | 49 个应用文件与 `45f530f` 对应的工作区逐字节一致，9 个 SDK 模块核验通过，A/B/C 各完成 2 轮容器冒烟测试 |
 
-本 README 的更新不会改变已经交付的镜像、源码审查包及其摘要。
+镜像归档、验收日志和生成的图表分别保存在本机的 `output/` 与 `runtime/`。新克隆可按第 7 节构建镜像。镜像源码核对和冒烟结果见本地 `runtime/image-sdk105-clean-20261128/archive-verification.json` 与 `smoke-*.log`。
 
-v18 已包含 v16/v17 的分类拒绝计数、最终历史选版和历史输入保护。后续再改本地代码时仍需另行构建，已有镜像不会自动更新。
+多文件父模型由 SDK 按产物清单逐文件校验，四组件包依据主模型内的路由标记确定入口。平台提供的 `parent_checkpoint_sha256` 继续用于父身份、评分绑定和实验指纹，实际主文件摘要独立记录为 `configuration.parent_primary_file_sha256`。相关回归测试见 [父检查点清单测试](tests/test_parent_checkpoint_manifest.py)。
 
-| 行为 | 旧 v15 | v16/v17/v18 |
-|---|---|---|
-| 重复拒绝计数 | 未采用/本地失败可能计入重复限制 | 区分性能拒绝、测量未核验、控制器保护、合格但未选择等结果；只对明确性能拒绝或本地训练失败计数 |
-| 最终选择历史模型 | 规划需要明确选择 rollback，才能选对应合格历史目标 | 规划有效时，observe/experiment 结束后也可选择本轮复评合格、SDK 授权且进入白名单的历史模型 |
-| 规划进入 program_guard | 只能保留实际父模型 | 仍只能保留实际父模型，不开放历史选择 |
+只有明确的性能拒绝和本地训练失败计入重复限制。规划有效时，最终选版可以采用本轮复评合格、经 SDK 授权且进入白名单的历史模型，最终动作记录在 `configuration.selection_action`。
 
-相关修改在 [策略模块](src/gas_a/evolution.py)、[A 主控](src/gas_a/submission.py)、[B/C 主控](src/gas_a/regression/submission.py)及对应提示词中。最终动作记录在 `configuration.selection_action`，便于区分“规划未训练”和“最终选择了历史模型”。
-
-2026-11-25 已清理本项目 16 个旧 Docker 镜像及 21 个旧导出包，保留 v15 最终版、基础镜像、源码和实验记录。历史文档中的旧镜像包不再保证存在。`runtime/` 和 `output/` 不进入 Git，克隆仓库不会自动获得这些本地产物。
-
-2026-11-27 在 `codex/main-20261127` 上新增 B/C 分组和 NASA 尾部验证、NASA 准入保护、独立实验账本及本地拒绝不上传；训练菜单增加 B 设备加权/振动特征修正、C 尾段加权/工况修正，支持完整复合模型续训与恢复。公开验证的消融、十轮结果和分组退化限制见 [B/C 优化与验证记录](docs/BC_OPTIMIZATION_VALIDATION_20261127.md)。
+B/C 支持完整复合模型续训与恢复，本地门槛拒绝的候选默认跳过上传。公开验证的消融和分组结果见 [B/C 优化与验证记录](docs/BC_OPTIMIZATION_VALIDATION_20261127.md)。旧版镜像及平台反馈见 [v20 验收](docs/ITEM_TUNING_V20_20261126.md)、[v20 平台反馈](docs/BC_V20_PLATFORM_REVIEW_20261126.md)和 [v21 调优记录](docs/SCORE_ALIGNED_TUNING_V21_20261126.md)。
 
 B 的[上调保护验证脚本](scripts/validate_b_upward_guard.py)对比原模型、限幅残差和带上调保护的限幅残差，输出公开验证、逐轴承留出、两根长寿命轴承同时留出及整组 `40 Hz / 10 kN` 留出的 RMSE、MAE 和高低估偏差。该入口用于离线验证。`--parent-run` 传入 B 的本地十轮结果目录，脚本读取选中模型及其训练记录来重建各留出组的基准模型。运行脚本的 Python 环境需安装 `scikit-learn`，复现使用版本 1.8.0。
 
@@ -98,6 +78,8 @@ A 增加 `pair_review` 候选。已有完整路由模型时，使用公开训练
 
 程序会保存 `model-responses.jsonl`、`decisions.jsonl`，记录真实回执及 `decision_source=program_guard`。**程序兜底不等于 27B 给出了合法决定，也不计为一次成功的完整实验。**
 
+发给模型的单条选手消息上限为 24 KiB。超出预算时先压缩重复历史和诊断摘要，保留逐方案尝试证据与选版白名单。审计记录包含实际发送的内容、摘要和字节数。实现见 [请求裁剪](src/gas_a/controller_prompts.py)。
+
 实现见 [共享决策与保护逻辑](src/gas_a/submission.py)。
 
 ## 4. 固定菜单、上线门槛与数据边界
@@ -118,10 +100,11 @@ A 增加 `pair_review` 候选。已有完整路由模型时，使用公开训练
 
 ### AI 可以选择什么
 
-- A：`frozen_router`、`four_sensor`、`five_sensor`、`conservative_head`。
-- B/C：`low_rate`、`standard_rate`、`head_only`、`robust_huber`。
+- A 的菜单包括 `frozen_router`、`four_sensor`、`five_sensor`、`conservative_head` 和符合条件时的 `pair_review`。
+- B/C 共享低学习率、标准学习率、只训练输出头和 Huber 方案。B 另外提供设备加权、振动特征修正和上调保护。C 另外提供工况残差、尾部加权和限幅残差。完整菜单见 [submission_config.json](submission_config.json)。
+- B/C 按阶段轮次调整推荐顺序。推荐项须先满足当轮菜单条件，控制器仍可选择其他合法方案。
 - `observe` 规划不启动训练；`experiment` 只能从实际父模型续训一个允许方案；`rollback` 规划不训练，提出经过本轮复评的历史目标。
-- 最终历史选择范围按第 1 节区分镜像与工作区。无论哪个版本，AI 都不能绕过白名单、改写实际父模型或放宽门槛。
+- 最终选版范围为实际父模型、合格候选及本轮获准的历史模型。规划进入 `program_guard` 后，目标锁定为实际父模型。
 
 ### 默认门槛
 
@@ -130,13 +113,16 @@ A 增加 `pair_review` 候选。已有完整路由模型时，使用公开训练
 | A 上线 | Macro-F1 严格提高，且至少增加 0.0005，即 **0.05 个百分点** |
 | A 类别保护 | 父 validation 支持数至少 20 的类别，单步召回下降最多 0.20，即 **20 个百分点** |
 | B/C 上线 | RMSE 至少减少 `max(0.000001, 父 RMSE × 0.0005)`，MAE 最多相对增加 2% |
+| B 分轴承保护 | 每组至少 30 条。单轮允许的 RMSE 增量为 10 分钟与父模型该组 RMSE 的 5% 中较大者。阶段累计使用阶段起点的 10% 与 10 分钟 |
+| C 分来源保护 | 每组至少 30 条。单轮和阶段累计允许的 RMSE 增量均为 2 循环与对应参考模型该组 RMSE 的 5% 中较大者 |
+| C NASA 保护 | 相对当轮父模型的总惩罚最多增加 5%。限幅残差候选还须严格改善 NASA 评分 |
 | 宿主核验 | 公开验证身份可核验，宿主分数与本地复核一致；显式冲突或无效测量不能放行 |
 | 漂移 | 当前样本至少 30 条；PSI ≥ 0.2、分箱距离 ≥ 0.2 或均值偏移 ≥ 1.5 个训练标准差 |
 | 漂移汇总 | A 每个传感器的 8 维指标先取均值再判断；B/C 对 34/24 列逐项判断 |
 | 本地训练 | A 最多 32 个 epoch、B/C 最多 8 个；单候选数值阶段最多 30 秒，并受菜单及早停限制 |
 | 历史恢复 | 每轮最多恢复 2 个历史产物，失败历史也占一次恢复额度 |
 
-保护门槛逐轮相对**实际父模型**比较，不是相对初始基线的永久累计保护。A 少于 20 个验证样本的类别不受上述召回硬保护，C 的 NASA 评分只作辅助记录。
+单轮门槛以实际父模型为基准。B/C 的阶段累计保护使用阶段起点模型在本轮验证数据上的分组指标。NASA 评分是逐条求和，只比较使用同一批验证样本的结果。
 
 参数详见 [submission_config.json](submission_config.json) 与 [参数逻辑说明](SUBMISSION_CONFIG_GUIDE.md)。根目录 `config.json` 属于历史回放。
 
@@ -159,26 +145,22 @@ v17 继续保留 v15 的坏 NPZ 隔离，并修复后续实际镜像故障注入
 
 已知文件格式错误在 [检查点加载器](src/gas_a/sensor_training/reference/model.py) 中规范为 ValueError；[B/C 历史复评](src/gas_a/regression/submission.py) 只隔离本地加载和测量错误。SDK 的恢复与摘要校验仍在这个捕获范围之外，没有用 `except Exception` 吞掉所有问题。
 
-## 6. 加载现有 v18 镜像
+## 6. 加载当前交付镜像
 
-在项目根目录使用 PowerShell。以下变量也供后面的命令使用。
+已取得第 1 节的本地镜像归档时，在项目根目录用 PowerShell 校验并加载。示例使用 Docker Desktop 的 Linux 上下文和 PATH 中的 `docker`。
 
 ```powershell
-$projectRoot = (Get-Location).Path
-$pythonExe = Join-Path $projectRoot '.venv/Scripts/python.exe'
-$dockerExe = 'C:/Users/Administrator/AppData/Local/Programs/DockerDesktop/resources/bin/docker.exe'
-$baselineRoot = 'D:/liyue/工业模型赛题研究'
-$sdkArchive = Join-Path $projectRoot 'vendor/contest-harness-sdk-1.0.5.tar.gz'
-$v18Tag = 'gas-rsi-abc:wyx-sdk104-v18-parent-manifest-20261125'
-$v18Id = 'sha256:3bf46eec43814d6fcaef9e885d7629d8b87507115d87e4c36fc5c6d72522c774'
-$v18Archive = Join-Path $projectRoot 'output/submission-wyx-sdk104-v18-parent-manifest-20261125/gas-rsi-abc-wyx-sdk104-v18-parent-manifest-20261125.tar'
-
-& $dockerExe --context desktop-linux load --input $v18Archive
-& $dockerExe --context desktop-linux image inspect $v18Tag --format '{{.Id}}'
-& $dockerExe --context desktop-linux run --rm --pull=never --network none --read-only $v18Id describe
+$imageArchive = 'output/submission-wyx-sdk105-20261128/gas-rsi-abc-wyx-sdk105-20261128.tar'
+$expectedHash = '3f709c264f5cce9fab6fd575496aa3f5f211e3c4fba16805af7c42a8578a89f5'
+if ((Get-FileHash -Algorithm SHA256 -LiteralPath $imageArchive).Hash -ne $expectedHash) {
+    throw '镜像归档 SHA-256 与交付记录不一致'
+}
+docker --context desktop-linux load --input $imageArchive
+docker --context desktop-linux image inspect gas-rsi-abc:wyx-sdk105-20261128 --format '{{.Id}}'
+docker --context desktop-linux run --rm --pull=never --network none --read-only gas-rsi-abc:wyx-sdk105-20261128 describe
 ```
 
-Docker 已在 PATH 时可将 `$dockerExe` 改为 `docker`。镜像已验证可加载；正式入口保持 SDK 原模板：
+核对镜像 ID 与第 1 节一致，`describe` 应返回 `sdk_version: 1.0.5`。正式入口使用 SDK 原模板。
 
 ```text
 python3 /app/harness.py describe
@@ -190,42 +172,49 @@ python3 /app/harness.py predict
 
 预测时平台通过 `CONTEST_PREDICTION_CONTEXT` 和 `CONTEST_ARTIFACT_PATH` 指定任务与主检查点，`model_dir` 是 /model 根目录。A 输出六类分数数组，B/C 输出 `{"outputs":{"value":123.4}}`。stdout 只写协议 JSONL，日志写 stderr。
 
-## 7. 构建和测试当前工作区源码
-
-若在 v18 之后继续修改工作区代码，需要构建新镜像。已有镜像不会自动更新，测试工具的源码一致性检查也会拒绝混用版本。
-
-```powershell
-$localImageTag = 'gas-rsi-abc:local-review-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
-& $dockerExe --context desktop-linux build --pull=false --network none -f Dockerfile.offline --build-arg "CONTEST_RUNTIME=$v18Tag" -t $localImageTag .
-$localImageId = (& $dockerExe --context desktop-linux image inspect $localImageTag --format '{{.Id}}').Trim()
-& $dockerExe --context desktop-linux run --rm --network none --read-only $localImageId describe
-```
-
-为 `CONTEST_RUNTIME` 显式传入本机已核验的运行镜像。离线构建复用其 Python/NumPy 并从本地 wheel 安装 SDK 1.0.5。需要从基础环境重新安装依赖时，可使用根目录 Dockerfile 正常构建。新镜像的 `describe` 应返回 `sdk_version: 1.0.5`。
+## 7. 本地测试与镜像构建
 
 ### 本地单元测试与官方 SDK 离线测试
 
-安装环境后运行：
+在仓库根目录用 Python 3.12 和 PowerShell 运行。依赖使用仓库内的 SDK wheel，来源见 [SDK 清单](vendor/sdk-provenance.json)。
 
 ```powershell
+$projectRoot = (Get-Location).Path
+$pythonExe = Join-Path $projectRoot '.venv/Scripts/python.exe'
 if (-not (Test-Path $pythonExe)) { py -3.12 -m venv .venv }
+$env:PYTHONUTF8 = '1'
+$env:PYTHONIOENCODING = 'utf-8'
 & $pythonExe -m pip install -r requirements.txt
 & $pythonExe -B -X utf8 -m unittest discover -s tests -t . -v
 
-$env:PYTHONUTF8 = '1'
-$env:PYTHONIOENCODING = 'utf-8'
 Push-Location vendor/contest-harness-sdk-1.0.5
 & $pythonExe -B -X utf8 -m unittest tests.test_sdk tests.test_contract_regressions tests.test_transport_regressions -v
 Pop-Location
 ```
 
-SDK wheel 随源码保存在 vendor，来源见 [SDK 清单](vendor/sdk-provenance.json)，不要从 PyPI 搜索同名比赛 SDK。以上测试不调用真实模型；SDK 的 `tests/test_live.py` 是另行运行的真实模型测试，不包含在命令内。
+以上测试使用离线宿主与测试替身。真实模型测试单独运行，见第 9 节。
+
+### 构建当前源码镜像
+
+使用根目录的 [Dockerfile](Dockerfile) 构建。首次构建需要基础镜像和 NumPy 依赖。
+
+```powershell
+$dockerExe = 'docker'
+$localImageTag = 'gas-rsi-abc:local-review-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
+& $dockerExe --context desktop-linux build -t $localImageTag .
+$localImageId = (& $dockerExe --context desktop-linux image inspect $localImageTag --format '{{.Id}}').Trim()
+& $dockerExe --context desktop-linux run --rm --pull=never --network none --read-only $localImageId describe
+```
+
+离线构建可使用 [Dockerfile.offline](Dockerfile.offline)。通过 `--build-arg CONTEST_RUNTIME=<本机已核验的运行镜像>` 显式传入已有基础镜像，复用其 Python 3.12.13 和 NumPy 1.26.4，并从本地 wheel 安装 SDK 1.0.5。
 
 ### 当前源码的 A/B/C 并行镜像测试
 
-三份官方包应保持原名称，放在 `$baselineRoot` 下。先完成当前源码构建，再运行：
+将三份官方基线包解压至同一目录，保留 `cpu-a-guide-20261110-v1`、`cpu-b-rul-20261110-v1` 和 `cpu-c-guide-20261110-v1` 三个子目录。完成当前源码构建后运行。
 
 ```powershell
+$baselineRoot = Read-Host '请输入三份官方基线目录的上级路径'
+$sdkArchive = Join-Path $projectRoot 'vendor/contest-harness-sdk-1.0.5.tar.gz'
 $offlineOut = Join-Path $projectRoot ('runtime/offline-current-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff'))
 & $pythonExe -B -X utf8 scripts/benchmark_sdk_agent.py --baseline-root $baselineRoot --sdk-archive $sdkArchive --output $offlineOut --image $localImageTag --expected-image-id $localImageId --rounds 4 --modes parallel --compact-validation --aggregate-parent --docker-executable $dockerExe --docker-context desktop-linux
 ```
@@ -242,9 +231,10 @@ $offlineOut = Join-Path $projectRoot ('runtime/offline-current-' + (Get-Date -Fo
 $v15Source = Join-Path $projectRoot 'runtime/history-guard-v15-20261125/source-final'
 $v15Tag = 'gas-rsi-abc:wyx-sdk104-v15-history-guard-final-20261125'
 $v15Id = 'sha256:bb7cd7e69b1a5632568db81dd828de9d942e5607d7311192ccdcc9a8a21432e0'
+$v15SdkArchive = Join-Path $baselineRoot 'contest-harness-sdk-1.0.4.tar.gz'
 $v15Out = Join-Path $projectRoot ('runtime/v15-repeat-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff'))
 Push-Location $v15Source
-& $pythonExe -B -X utf8 scripts/benchmark_sdk_agent.py --baseline-root $baselineRoot --sdk-archive $sdkArchive --output $v15Out --image $v15Tag --expected-image-id $v15Id --rounds 4 --modes parallel --compact-validation --rpc-delay-seconds 0.02 --model-delay-seconds 2 --docker-executable $dockerExe --docker-context desktop-linux
+& $pythonExe -B -X utf8 scripts/benchmark_sdk_agent.py --baseline-root $baselineRoot --sdk-archive $v15SdkArchive --output $v15Out --image $v15Tag --expected-image-id $v15Id --rounds 4 --modes parallel --compact-validation --rpc-delay-seconds 0.02 --model-delay-seconds 2 --docker-executable $dockerExe --docker-context desktop-linux
 Pop-Location
 ```
 
@@ -252,7 +242,25 @@ Pop-Location
 
 容器测试固定 Linux、非 root、2 CPU、4 GiB、只读根目录和禁网。测试的工作/临时卷采用 tmpfs，与平台说明中的磁盘卷不完全相同。
 
-## 8. 最新验证结果与历史真实模型实验
+## 8. 验证结果与历史实验
+
+### 当前交付：SDK 1.0.5
+
+`45f530f` 的应用源码通过 277 项项目测试和 18 项 SDK 离线测试。第 1 节列出的 2026-11-28 交付镜像通过归档校验和重新加载后的 A/B/C 各两轮冒烟测试，共收到 6 次结束确认。
+
+2026-11-27 的十轮验收使用独立镜像 `gas-rsi-abc:sdk105-current-20261127`，其 ID 为 `sha256:5709f2a520402b0b7cc1bfc58a83f33083b0b372a84b60a7f061e2ea86b32920`。该镜像在更新模型请求裁剪及 B/C 逐方案尝试证据之前冻结。A/B/C 从各自的官方初始模型和空状态开始，各运行 10 轮，30 轮均收到 SDK 结束确认，独立重算了 259,720 条预测。
+
+| 公开验证指标 | 初始 | 第 1–10 轮平均 | 第 10 轮 |
+|---|---:|---:|---:|
+| A Macro-F1 | 71.40% | 87.84% | 93.84% |
+| A Accuracy | 87.86% | 95.48% | 97.91% |
+| B RMSE（分钟） | 681.16 | 583.42 | 547.86 |
+| B MAE（分钟） | 563.11 | 478.67 | 444.11 |
+| C RMSE（循环） | 52.87 | 47.27 | 46.36 |
+| C MAE（循环） | 38.90 | 33.31 | 32.37 |
+| C NASA 惩罚总和 | 5,823,439,325 | 1,554,158,145 | 1,209,747,448 |
+
+两次容器验证均使用离线模型替身。上表按实际选中的模型统计同一套公开验证数据，正式隐藏集成绩仍以比赛平台为准。十轮验收清单保存在本地 `output/submission-sdk105-current-20261127/verification.json`，指标 CSV 保存在 `output/multiround-charts-codex-main-20261127-sdk105/`。
 
 ### v18：整组父摘要与单文件校验分开
 
@@ -286,7 +294,7 @@ v16 实际镜像中复现的 9 个坏历史失败用例，在 v17 中均完成�
 | B RMSE ↓，分钟 | 681.159832604 | 651.626661250 |
 | C RMSE ↓，循环 | 52.868572566 | 51.756636508 |
 
-v14 的十轮 C 结果 51.614535 来自另一轮数的实验，不能写成 v15 四轮结果。v15 的证据见 [修复说明](output/submission-wyx-sdk104-v15-history-guard-20261125/修复与使用说明.txt) 和 `runtime/history-guard-v15-20261125/verification-final.json`。
+v14 的十轮 C 结果为 51.614535。v15 四轮结果的证据保存在本地 `runtime/history-guard-v15-20261125/verification-final.json`。
 
 ### 最近一次保留的全新真实 27B 实验：v7
 
@@ -304,7 +312,7 @@ v14 的十轮 C 结果 51.614535 来自另一轮数的实验，不能写成 v15 
 
 真实模型测试会产生费用，并向云端写实验结果，需要单独执行。先安装 requirements-platform.txt，按 .env.example 在宿主配置 PYTRIO_API_KEY 和 SWANLAB_API_KEY。不要把真实密钥写入源码、Git、镜像、候选或实验记录。
 
-需要测试当前工作区时，使用第 7 节新构建的匹配镜像：
+需要测试当前工作区时，使用第 7 节新构建的匹配镜像和官方基线目录。
 
 ```powershell
 & $pythonExe -m pip install -r requirements-platform.txt
@@ -323,7 +331,7 @@ $liveOut = Join-Path $projectRoot ('runtime/fresh-abc-' + (Get-Date -Format 'yyy
 | 记录 | 保存的内容 |
 |---|---|
 | `protocol.jsonl`、`sdk-timing.json` | 实际 SDK 帧、上传确认、回执引用、结束确认与耗时 |
-| `state/model-responses.jsonl` | 完整模型请求、回复、回执与纠正过程 |
+| `state/model-responses.jsonl` | 实际发送的模型请求、回复、回执与纠正过程 |
 | `state/decisions.jsonl` | 规划、选版、program_guard 来源及历史不可用原因 |
 | `monitoring.json`、`diagnosis.json` | 漂移与错误诊断 |
 | `strategy.json`、`regression_strategy.json` | 配套策略版本、偏好及实验结果 |
