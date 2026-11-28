@@ -40,7 +40,7 @@ def compare_stage(origin, measured):
 
     result = {"rmse_delta": delta(origin, measured, "rmse"), "mae_delta": delta(origin, measured, "mae")}
     axis, keys = ("device", ("rmse", "bias")) if origin["dataset"] == "B" else (
-        "source", ("nasa_score", "nasa_underestimate_score", "nasa_overestimate_score"))
+        "source", ("rmse", "bias", "nasa_score", "nasa_underestimate_score", "nasa_overestimate_score"))
     if origin["dataset"] == "C":
         result["nasa_delta"] = delta(origin, measured, "nasa_score")
     old = origin["group_metrics"][axis]

@@ -11,7 +11,8 @@ from unittest.mock import patch
 from tests.test_submission import ROOT, OfflineHost, writes_only_in
 from contest_harness.round import Round
 from gas_a import submission
-from gas_a.controller_prompts import VERSION, admission, execution_policy, history_feedback, request_digest
+from gas_a.controller_prompts import (MODEL_REQUEST_BYTES, VERSION, admission, bounded_model_request,
+                                      execution_policy, history_feedback, request_digest)
 from gas_a.evolution import available_experiments, fingerprint, initial_policy
 from gas_a.sensor_training.data import load_pair, evaluate
 from gas_a.sensor_training.reference.model import Model
@@ -117,6 +118,42 @@ class ControllerPromptTest(unittest.TestCase):
         requests = [frame for frame in host.frames if frame["type"] == "model_request"]
         self.assertTrue(requests)
         self.assertTrue(all(frame["enable_thinking"] is False for frame in requests))
+
+    def test_large_controller_evidence_keeps_comparable_scores_and_allowed_artifacts(self):
+        request = {"phase": "select", "parent_artifact_id": "parent",
+                   "response_schema": {"selected_artifact_id": ["parent", "historical"], "reason": "理由"},
+                   "same_local_validation": {"parent": {"rmse": 51.2}},
+                   "historical_admission": {"historical": {"eligible": True, "fresh_metrics": {"rmse": 50.2}}},
+                   "diagnosis": {"trace": "循环" * MODEL_REQUEST_BYTES},
+                   "correction": {"previous_completed_response": "数据" * MODEL_REQUEST_BYTES}}
+        sent, content = bounded_model_request(request)
+        self.assertLessEqual(len(content.encode("utf-8")), MODEL_REQUEST_BYTES)
+        self.assertEqual(json.loads(content), sent)
+        for key in ("response_schema", "same_local_validation", "historical_admission", "parent_artifact_id"):
+            self.assertEqual(sent[key], request[key])
+        self.assertTrue(sent["correction"]["response_excerpt_only"])
+        self.assertIn("diagnosis", sent["evidence_budget"]["omitted_fields"])
+        self.assertIn("diagnosis", request)
+
+    def test_large_plans_keep_per_experiment_attempt_evidence_for_all_datasets(self):
+        attempts = {
+            "untried": {"available": True, "current_condition_attempts": 0,
+                        "recent_history": [{"history_id": "old-parent", "conditions": "different"}]},
+            "rejected": {"available": False, "current_condition_attempts": 1,
+                         "current_condition_counted_rejections": 1, "remaining_rejection_budget": 0,
+                         "completed_identical_rejection": True},
+        }
+        for dataset in "ABC":
+            with self.subTest(dataset=dataset):
+                request = {"phase": "plan", "dataset": dataset, "experiment_evidence": attempts,
+                           "history": [{"diagnostics": "漂移" * MODEL_REQUEST_BYTES}],
+                           "response_schema": {"action": ["observe", "experiment"], "experiment": ["none", "untried"]}}
+                sent, content = bounded_model_request(request)
+                self.assertLessEqual(len(content.encode("utf-8")), MODEL_REQUEST_BYTES)
+                self.assertEqual(json.loads(content)["experiment_evidence"], attempts)
+                self.assertEqual(sent["response_schema"], request["response_schema"])
+                self.assertIn("history", sent["evidence_budget"]["omitted_fields"])
+                self.assertNotIn("experiment_evidence", sent["evidence_budget"]["omitted_fields"])
 
     def test_actual_sdk_exports_and_adopts_feasible_epoch_instead_of_rejecting_best_raw_f1(self):
         host = OfflineHost(self.root, self.parent, experiment="four_sensor")

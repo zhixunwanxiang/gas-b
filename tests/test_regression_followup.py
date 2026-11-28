@@ -169,6 +169,25 @@ class RegressionFollowUpTest(unittest.TestCase):
             self.assertEqual(identity["provenance"], "sdk_stage_transition")
             self.assertEqual(measured, second_metrics)
 
+    def test_stage_group_protection_rejects_accumulated_loss_under_each_round_limit(self):
+        rules = json.loads((ROOT / "submission_config.json").read_text(encoding="utf-8"))["regression"]["controller"]
+        for dataset, axis, local_reason in (("B", "device", "bearing_device_regression"),
+                                            ("C", "source", "cmapss_source_regression")):
+            with self.subTest(dataset=dataset):
+                def scores(total, group):
+                    return {"dataset": dataset, "rmse": total, "mae": 10., "nasa_score": 100.,
+                            "rows": 300, "validation_sha256": "current", "metric_version": "test",
+                            "group_metrics": {axis: {"protected": {"rows": 50, "rmse": group},
+                                                     "low_support": {"rows": 2, "rmse": 500.}}}}
+                stage_start, parent, candidate = scores(100., 40.), scores(90., 48.), scores(80., 52.)
+                if dataset == "C":
+                    parent, candidate = scores(90., 42.), scores(80., 44.)
+                self.assertTrue(promotion_gate(parent, candidate, rules)["eligible"])
+                gate = promotion_gate(parent, candidate, rules, retention_reference=stage_start)
+                self.assertEqual(gate["reasons"], ["stage_group_regression"])
+                self.assertEqual(set(gate["stage_group_losses"]), {"protected"})
+                self.assertIn(local_reason, promotion_gate(stage_start, candidate, rules)["reasons"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,4 +1,4 @@
-"""Exercise current A and restored V18 B/C with SDK 1.0.4 and an offline controller."""
+"""Exercise current A and restored V18 B/C with SDK 1.0.5 and an offline controller."""
 import argparse
 import json
 from pathlib import Path

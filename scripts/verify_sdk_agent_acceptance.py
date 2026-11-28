@@ -53,7 +53,9 @@ def verify(root):
         raise ValueError("Missing evidence of three overlapping training containers")
     maximum = {key: max(item.get(key, 0) for item in sizes) for key in (
         "hypothesis_utf8_bytes", "change_summary_utf8_bytes", "reason_utf8_bytes", "configuration_serialized_bytes")}
-    return {"passed": True, "scope": "offline_parallel_sdk104_public_data_acceptance",
+    sdk_version = summary.get("sdk_version", "1.0.4")
+    return {"passed": True, "scope": "offline_parallel_sdk" + sdk_version.replace(".", "") + "_public_data_acceptance",
+        "sdk_version": sdk_version,
         "image_id": summary["image_id"], "rounds_total": sum(d["rounds_completed"] for d in datasets),
         "max_overlapping_training_containers": proof["max_overlapping_train_containers"],
         "declaration_maximum_bytes": maximum, "limits": {"text_utf8_bytes": 4000, "configuration_serialized_bytes": 65536},

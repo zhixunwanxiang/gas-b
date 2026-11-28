@@ -1,4 +1,4 @@
-"""Read-only SDK 1.0.4 wire-order and timing audit; never sends protocol frames."""
+"""Read-only workspace.v2 wire-order and timing audit; never sends protocol frames."""
 import base64
 from collections import Counter, defaultdict
 import hashlib

@@ -10,7 +10,7 @@
 
 此前未接云端的独立 v4 测试为 `0.714030 → 0.838108`，真实模型选择与本次不同，见[历史报告](runtime/image-real-27b-v4-20261122/REAL_IMAGE_TEST_REPORT.md)。旧 v3 的真实回滚失败记录继续保留。
 
-正式入口为 `harness.py train/predict`，协议为 SDK 1.0.4 的 `contest.harness.workspace.v2`。
+正式入口为 `harness.py train/predict`，当前 SDK 1.0.5 沿用 `contest.harness.workspace.v2`。
 `scripts/closed_loop_validation.py` 仍是历史回放工具；它的批次标签反馈机制不进入正式入口。
 按用户要求，本次不审核《实验记录规范》。云端完整运行证据已完成留档及回读，不代替该规范的字段验收或正式平台提交。
 
@@ -60,7 +60,7 @@ python3 -m unittest tests.test_sdk tests.test_contract_regressions tests.test_tr
 ```powershell
 $env:PYTHONUTF8 = '1'
 $env:PYTHONIOENCODING = 'utf-8'
-Push-Location vendor/contest-harness-sdk-1.0.4
+Push-Location vendor/contest-harness-sdk-1.0.5
 try {
     ..\..\.venv\Scripts\python.exe -B -m unittest tests.test_sdk tests.test_contract_regressions tests.test_transport_regressions -v
 } finally {
@@ -79,9 +79,9 @@ SDK 的 `example/contest_submission.py` 仅展示协议和模型调用，不提�
 在安装并启动 Docker 的机器执行：
 
 ```powershell
-docker build -t gas-a-rsi:sdk104 .
-docker run --rm --network none --read-only gas-a-rsi:sdk104 describe
-.\.venv\Scripts\python.exe -B scripts/validate_platform.py --image gas-a-rsi:sdk104 --parent "$baselineDir/checkpoint.npz" --train "$baselineDir/public/train.jsonl" --validation "$baselineDir/public/validation.jsonl" --output runtime/container-rehearsal-new --rounds 10
+docker build -t gas-a-rsi:sdk105 .
+docker run --rm --network none --read-only gas-a-rsi:sdk105 describe
+.\.venv\Scripts\python.exe -B scripts/validate_platform.py --image gas-a-rsi:sdk105 --parent "$baselineDir/checkpoint.npz" --train "$baselineDir/public/train.jsonl" --validation "$baselineDir/public/validation.jsonl" --output runtime/container-rehearsal-new --rounds 10
 ```
 
 脚本以非 root 镜像用户运行，禁网、只读根文件系统、2 CPU、4 GiB 内存；train 仅只读挂载授权数据、父产物与上轮状态，工作目录使用 4 GiB tmpfs。predict 仅挂载选中产物，不挂载训练数据，并测试逐行刷新。容器检查仍使用离线模型替身。

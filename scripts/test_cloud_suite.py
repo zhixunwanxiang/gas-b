@@ -19,6 +19,7 @@ from scripts.cloud_experiment import CloudJournal
 from scripts.live_platforms import load_env, configuration, write_receipt, termination_handler
 from scripts.docker_rehearsal import DockerRuntime
 
+# Retained for the historical recorded-response replay.
 DEFAULT_IMAGE = "gas-rsi-abc:wyx-sdk104-v10-20261124"
 DEFAULT_IMAGE_ID = "sha256:de5a58d5c3fbeafa1399b531dadff78fd24067a818b094a16747a90cfba45b71"
 
@@ -31,7 +32,7 @@ def snapshot(out, baseline):
               "scripts/test_real_sdk.py", "scripts/cloud_experiment.py", "scripts/test_cloud_suite.py",
               "scripts/docker_rehearsal.py", "scripts/live_platforms.py", "scripts/simulate_competition.py",
               "scripts/simulation_audit.py", "scripts/validate_platform.py", "tests/__init__.py", "tests/test_submission.py",
-              "vendor/contest_harness-1.0.4-py3-none-any.whl")]
+              "vendor/contest_harness-1.0.5-py3-none-any.whl")]
     manifest = {}
     for path in files:
         name = path.relative_to(ROOT)
@@ -55,8 +56,8 @@ def main():
     parser.add_argument("--baseline-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--env-file", type=Path, default=ROOT / ".env")
-    parser.add_argument("--image", default=DEFAULT_IMAGE)
-    parser.add_argument("--expected-image-id", default=DEFAULT_IMAGE_ID)
+    parser.add_argument("--image", required=True)
+    parser.add_argument("--expected-image-id", required=True)
     parser.add_argument("--docker-executable", default="docker")
     parser.add_argument("--docker-context", default="desktop-linux")
     parser.add_argument("--normal-max-calls", type=int, default=16)
@@ -85,7 +86,7 @@ def main():
     # 镜像文件采用字节摘要比对，注释变化也会使旧镜像与当前源码不一致；需要源码一致时应重新构建镜像。
     app_files = {name: digest for name, digest in source.items()
                  if name.startswith("src/") or name in ("harness.py", "contest_submission.py", "submission_config.json",
-                                                       "requirements.txt", "vendor/contest_harness-1.0.4-py3-none-any.whl")}
+                                                       "requirements.txt", "vendor/contest_harness-1.0.5-py3-none-any.whl")}
     script = "import hashlib,json,pathlib,sys; print(json.dumps({p:'sha256:'+hashlib.sha256((pathlib.Path('/app')/p).read_bytes()).hexdigest() for p in json.loads(sys.argv[1])}))"
     actual = runtime._run(["run", "--rm", "--pull=never", "--network", "none", "--read-only", "--entrypoint", "python3",
                            runtime.image, "-c", script, json.dumps(list(app_files))])
@@ -94,7 +95,7 @@ def main():
     probe["application_source_files_matched"] = len(app_files)
     write_receipt(out / "image-preflight.json", probe)
     task_config = {"purpose": "full_real_model_training_experiment_audit", "dataset_key": "A",
-                   "model": live.MODEL, "image_id": args.expected_image_id, "sdk_version": "1.0.4",
+                   "model": live.MODEL, "image_id": args.expected_image_id, "sdk_version": "1.0.5",
                    "controller_version": "gas-a-controller-zh-v4", "source_files": source,
                    "data_sha256": {n: "sha256:" + hashlib.sha256((baseline / "public" / n).read_bytes()).hexdigest()
                                    for n in ("train.jsonl", "validation.jsonl")},

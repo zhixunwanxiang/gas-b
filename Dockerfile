@@ -4,7 +4,7 @@ FROM ${PYTHON_BASE} AS runtime
 # 构建时安装锁定依赖；正式训练/预测不会在容器里下载 SDK 或访问外部模型服务。
 WORKDIR /app
 COPY requirements.txt /app/requirements.txt
-COPY vendor/contest_harness-1.0.4-py3-none-any.whl /app/vendor/
+COPY vendor/contest_harness-1.0.5-py3-none-any.whl /app/vendor/
 RUN python3 -m pip install --no-cache-dir --only-binary=:all: -r requirements.txt \
     && python3 -c "from pathlib import Path; import shutil; base=Path('/usr/local/lib/python3.12'); paths=[base/'ensurepip', base/'site-packages/pip', *base.glob('site-packages/pip-*.dist-info'), *(base/'site-packages/numpy').rglob('tests')]; [shutil.rmtree(p) for p in paths if p.is_dir()]; [p.unlink() for p in Path('/usr/local/bin').glob('pip*') if p.is_file()]"
 

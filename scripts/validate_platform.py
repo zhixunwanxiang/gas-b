@@ -345,7 +345,7 @@ def main():
         print(json.dumps({"round": index, "action": summary["action"], "selected": selected}, ensure_ascii=False), flush=True)
         write_json(root / "validation-summary.json", {
             "scope": "offline_model_stub_container_sandbox" if args.image else "offline_model_stub_native_sdk",
-            "sdk_version": "1.0.4", "image": args.image, "rounds_completed": index,
+            "sdk_version": "1.0.5", "image": args.image, "rounds_completed": index,
             "real_approved_controller_verified": False, "official_hidden_score": None, "rounds": summaries})
     prediction = check_prediction(root, registry[selected][0], registry[selected][1]["artifact"], args.image)
     summary_path = root / "validation-summary.json"

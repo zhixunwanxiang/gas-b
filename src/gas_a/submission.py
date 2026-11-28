@@ -27,7 +27,7 @@ from .monitoring import fit_reference, monitor, diagnose
 from .evolution import (load_policy, available_experiments, promotion_gate, experiment_evidence,
                         fingerprint, advance_policy, validate_controller, eligible_history)
 from .controller_prompts import (VERSION as CONTROLLER_PROMPT_VERSION, execution_policy,
-                                 enrich_plan, enrich_selection, request_digest)
+                                 enrich_plan, enrich_selection, request_digest, bounded_model_request)
 from .host_validation import (parent_reference, candidate_gate as host_candidate_gate,
                               bind_candidate_validation, bind_parent_validation)
 from .progress import progress, stage
@@ -155,20 +155,21 @@ def _completed_reply_text(response):
 def _decision(rnd, request, fields, token_limit, validate, corrections=1, evidence_path=None):
     # 一次完整返回后才解析并校验 JSON，格式错误允许有限次数的纠正请求。
     # 纠正请求也是真实调用，必须记录其 call_id；RPC 异常发生在 try 之外，不能吞掉后继续会话。
-    call_ids, failures, request_hashes = [], [], []
+    call_ids, failures, request_hashes, request_sizes = [], [], [], []
     request = {**request, "response_limits": {"text_field_utf8_bytes": TEXT_BYTES,
                "instruction": "Return exactly the requested JSON fields. Keep hypothesis and reason concise."}}
     metadata = {"model_call_ids": call_ids, "corrections": failures,
                 "prompt_version": request.get("controller_prompt", {}).get("version", CONTROLLER_PROMPT_VERSION),
-                "request_sha256": request_hashes, "decision_source": "model"}
+                "request_sha256": request_hashes, "request_utf8_bytes": request_sizes, "decision_source": "model"}
     for attempt in range(corrections + 1):
         # request 只含本轮证据和自有提示；不重复加入 rnd.prompt，官方提示由宿主在请求前附加。
         # Never catch an RPC failure: its outcome may be unknown to the SDK.
-        request = portable_record(request, context="controller_request")
-        request_hashes.append(request_digest(request))
+        sent, content = bounded_model_request(portable_record(request, context="controller_request"))
+        request_hashes.append(request_digest(sent))
+        request_sizes.append(len(content.encode("utf-8")))
         with stage("model_rpc", phase=request.get("phase"), attempt=attempt + 1):
             receipt = rnd.model(
-                [{"role": "user", "content": json_text(request)}],
+                [{"role": "user", "content": content}],
                 # Structured controller decisions must leave room for final JSON.
                 # Qwen can otherwise spend the entire authorized budget reasoning.
                 max_tokens=min(token_limit, rnd.max_output_tokens), temperature=0, enable_thinking=False,
@@ -178,7 +179,7 @@ def _decision(rnd, request, fields, token_limit, validate, corrections=1, eviden
         call_ids.append(receipt.call_id)
         if evidence_path is not None:
             append_jsonl(evidence_path, portable_record({"round_index": rnd.round_index, "phase": request.get("phase"),
-                "attempt": attempt + 1, "call_id": receipt.call_id, "request": request,
+                "attempt": attempt + 1, "call_id": receipt.call_id, "request": sent,
                 "request_sha256": request_hashes[-1], "response": receipt.response}, context="model_response_evidence"))
         completed_text = None
         try:
@@ -203,7 +204,7 @@ def _decision(rnd, request, fields, token_limit, validate, corrections=1, eviden
             failures.append({"call_id": receipt.call_id, "error": str(error), "response_excerpt": excerpt})
             if attempt == corrections:
                 raise DecisionValidationError(metadata) from error
-            request = {**request, "correction": {"attempt": attempt + 1, "error": str(error),
+            request = {**request, "correction": {"attempt": attempt + 1, "error": str(error)[:600],
                        "previous_completed_response": previous,
                        "instruction": "The previous completed response failed validation. Return a corrected JSON object using only the supplied schema and choices."}}
 
@@ -332,9 +333,9 @@ def train(rnd):
     # 即使保留父模型也需要真实模型决策、保存记录并等待 SDK 的完成确认；每个回合不等于整个程序只能训练一次。
     _check_task(rnd.task.get("task"), rnd.dataset_key)
     progress("train_started", dataset="A", round_index=rnd.round_index)
-    # 1.0.4 has no inline fallback. Fail before data loading or model calls.
+    # 1.0.5 has no inline fallback. Fail before data loading or model calls.
     if rnd.limits.get("artifact_upload_protocol") != "chunked-v1":
-        raise HarnessError("CHUNKED_UPLOAD_UNSUPPORTED", "SDK 1.0.4 requires a host with chunked-v1 uploads")
+        raise HarnessError("CHUNKED_UPLOAD_UNSUPPORTED", "SDK 1.0.5 requires a host with chunked-v1 uploads")
     # 阶段 1：加载固定实验菜单与门槛。大模型只能选择允许项，不能在回复里扩大配置权限。
     config = json.loads((ROOT / "submission_config.json").read_text(encoding="utf-8"))
     validate_controller(config["controller"])

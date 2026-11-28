@@ -1,8 +1,15 @@
-# 离线重建：基础镜像必须是已核验 SDK 1.0.4 / NumPy 1.26.4 / Python 3.12.13 的运行环境。
+# 离线重建：基础镜像提供已核验的 NumPy 1.26.4 / Python 3.12.13。SDK 从本地 wheel 安装。
 # 默认固定旧 v4，也可用 CONTEST_RUNTIME 显式传入本机已核验的后续镜像及摘要。
 # 标准在线构建仍使用 Dockerfile；本文件不访问包源，不把旧镜像的 /app 源码当成最新实现。
 ARG CONTEST_RUNTIME=gas-rsi-a:wyx-sdk104-v4-20261122@sha256:388fb0d9721fa11d0cb9befcb6dee6dbadb23597dfdb59415913d276b4ec25fe
 FROM ${CONTEST_RUNTIME} AS runtime
+USER 0:0
+COPY requirements.txt /app/requirements.txt
+COPY vendor/contest_harness-1.0.5-py3-none-any.whl /app/vendor/
+# 旧运行镜像已移除 pip。用 Python 标准库安装此纯 Python wheel，清除旧 SDK 的包和分发元数据。
+RUN python3 -c "from pathlib import Path; import shutil, sysconfig; site = Path(sysconfig.get_path('purelib')); [shutil.rmtree(p) for p in [site/'contest_harness', *site.glob('contest_harness-*.dist-info')] if p.is_dir()]" \
+    && python3 -m zipfile -e /app/vendor/contest_harness-1.0.5-py3-none-any.whl "$(python3 -c 'import sysconfig; print(sysconfig.get_path("purelib"))')" \
+    && python3 -c "from importlib.metadata import version; from contest_harness.protocol import SDK_VERSION; assert version('contest-harness') == SDK_VERSION == '1.0.5'"
 COPY harness.py contest_submission.py submission_config.json /app/
 COPY src /app/src
 

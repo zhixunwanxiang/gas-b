@@ -128,10 +128,10 @@ class RegressionTest(unittest.TestCase):
                 request = json.loads(host.messages[0][0]["content"])
                 self.assertEqual(next(iter(request["experiments"])), first)
                 self.assertEqual(host.record["configuration"]["experiment"]["name"], first)
-                if dataset == "C":
-                    self.assertEqual(request["strategy"]["default_first_experiment"], first)
-                else:
-                    self.assertEqual(request["strategy"]["scheduled_experiment_preference"], first)
+                self.assertEqual(request["strategy"]["scheduled_experiment_preference"], first)
+                evidence = request["experiment_evidence"]
+                self.assertEqual(set(request["experiments"]), {name for name, row in evidence.items() if row["available"]})
+                self.assertTrue(all(row["current_condition_attempts"] == 0 for row in evidence.values()))
 
     def test_b_schedule_falls_back_when_bearing_metadata_is_unavailable(self):
         host = RegressionHost(self.root, make_fixture(self.root, "B"), "B")
@@ -185,6 +185,19 @@ class RegressionTest(unittest.TestCase):
             for key in ("w1", "b1"):
                 np.testing.assert_array_equal(getattr(original, group)[key], getattr(after, group)[key])
         self.assertFalse(np.array_equal(original.params["w2"], after.params["w2"]))
+
+    def test_controller_can_execute_cmapss_stratified_experiment(self):
+        parent = make_fixture(self.root, "C")
+        host = RegressionHost(self.root, parent, "C")
+        host.experiment = "cmapss_stratified"
+        state = self.run_host(host)
+        cfg = host.record["configuration"]
+        self.assertEqual(cfg["experiment"]["name"], "cmapss_stratified")
+        self.assertEqual(cfg["experiment"]["sampling"], "device_condition")
+        self.assertNotIn("experiment_failure", cfg)
+        self.assertEqual(len(host.calls), 2)
+        attempts = [json.loads(line) for line in (state / "experiment_attempts.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([row["status"] for row in attempts], ["started", "trained"])
 
     def test_authorized_training_projection_can_change_between_sdk_rounds(self):
         for dataset in ("B","C"):

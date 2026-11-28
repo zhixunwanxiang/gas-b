@@ -1,4 +1,4 @@
-"""SDK 1.0.4 local agent timing: real containers/training, offline decisions.
+"""SDK 1.0.5 local agent timing: real containers/training, offline decisions.
 
 Compare sequential A/B/C scheduling with three independent dataset processes.
 No provider API, cloud account, or official platform host is contacted.
@@ -115,8 +115,8 @@ def worker(config, dataset, out):
 def verify_sdk_and_image(args, out):
     import contest_harness
     from scripts.docker_rehearsal import DockerRuntime
-    if importlib.metadata.version("contest-harness") != "1.0.4":
-        raise ValueError("Installed SDK must be 1.0.4")
+    if importlib.metadata.version("contest-harness") != "1.0.5":
+        raise ValueError("Installed SDK must be 1.0.5")
     package = Path(contest_harness.__file__).parent
     sdk_expected, template = {}, None
     with tarfile.open(args.sdk_archive, "r:gz") as archive:
@@ -136,7 +136,7 @@ def verify_sdk_and_image(args, out):
                             expected_id=args.expected_image_id, required_tasks=("classification", "regression"))
     proof = runtime.preflight()
     paths = [Path(n) for n in ("harness.py", "contest_submission.py", "submission_config.json", "requirements.txt",
-                                "vendor/contest_harness-1.0.4-py3-none-any.whl")]
+                                "vendor/contest_harness-1.0.5-py3-none-any.whl")]
     paths += [p.relative_to(ROOT) for p in (ROOT / "src").rglob("*.py")]
     app_expected = {p.as_posix(): hashlib.sha256((ROOT / p).read_bytes()).hexdigest() for p in paths}
     script = """import hashlib,json,pathlib,sys,contest_harness
@@ -284,7 +284,7 @@ def write_outputs(root, config, results, docker):
     with (root / "round-timings.csv").open("w", encoding="utf-8-sig", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(rows[0])); writer.writeheader(); writer.writerows(rows)
     equality = compare_results(root / "serial", root / "parallel") if {r["mode"] for r in results} == {"serial", "parallel"} else []
-    summary = {"format": "sdk104.agent-benchmark.v1", "status": "completed",
+    summary = {"format": "sdk105.agent-benchmark.v1", "status": "completed", "sdk_version": "1.0.5",
         "image_id": config["image_id"], "rounds_per_dataset": config["rounds"], "scenarios": results,
         "docker_event_concurrency": docker, "serial_parallel_comparison": equality,
         "all_order_checks_passed": all(row["order_valid"] and row["acknowledged"] for row in rows),
@@ -304,7 +304,7 @@ def write_outputs(root, config, results, docker):
         by_mode = {r["mode"]: r for r in results}
         summary["serial_to_parallel_wall_speedup"] = by_mode["serial"]["wall_seconds"] / by_mode["parallel"]["wall_seconds"]
     save(root / "summary.json", summary)
-    lines = ["SDK 1.0.4 测试 agent 计时与并发验证", "日期：2026-11-24（Asia/Shanghai）", "",
+    lines = ["SDK 1.0.5 测试 agent 计时与并发验证", "",
         "固定镜像：" + config["image_id"], "每个数据集轮数：" + str(config["rounds"]),
         "真实模型新增调用：0；云端写入：0。使用离线决策，真实执行训练、SDK 传输和预测。", ""]
     for mode in results:
@@ -329,8 +329,8 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--baseline-root", type=Path)
     parser.add_argument("--sdk-archive", type=Path)
-    parser.add_argument("--image", default="gas-rsi-abc:wyx-sdk104-v10-20261124")
-    parser.add_argument("--expected-image-id", default="sha256:de5a58d5c3fbeafa1399b531dadff78fd24067a818b094a16747a90cfba45b71")
+    parser.add_argument("--image")
+    parser.add_argument("--expected-image-id")
     parser.add_argument("--docker-executable", default="docker")
     parser.add_argument("--docker-context", default="desktop-linux")
     parser.add_argument("--rounds", type=int, default=10)
@@ -347,6 +347,8 @@ def main():
     args = parser.parse_args()
     if args.worker:
         return worker(json.loads(args.worker_config.read_text(encoding="utf-8")), args.worker, args.output.resolve())
+    if not args.image or not args.expected_image_id:
+        parser.error("--image and --expected-image-id are required for SDK 1.0.5 image validation")
     if not args.baseline_root or not args.sdk_archive or not 1 <= args.rounds <= 10:
         parser.error("baseline-root, sdk-archive and rounds=1..10 are required")
     if len(set(args.modes)) != len(args.modes): parser.error("Duplicate modes")

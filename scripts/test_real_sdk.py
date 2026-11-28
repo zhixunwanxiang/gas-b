@@ -1,4 +1,4 @@
-"""Local SDK 1.0.4 host rehearsal backed by real PyTRiO Qwen3.8-27B replies.
+"""Local SDK 1.0.5 host rehearsal backed by real PyTRiO Qwen3.8-27B replies.
 
 This host-side tool is excluded from the submission image. It spends real model
 credits; it is not the organizer's host and its IDs are provider receipt IDs.
@@ -31,7 +31,7 @@ import numpy as np
 
 MODEL = "Qwen/Qwen3.8-27B"
 LOCAL_PROMPT = (
-    "这是本地 SDK 1.0.4 协议测试的固定任务说明，不是赛方正式宿主提示。"
+    "这是本地 SDK 1.0.5 协议测试的固定任务说明，不是赛方正式宿主提示。"
     "任务 A：使用128维气体传感器特征预测六类气体，主指标 Macro-F1 越高越好。"
     "仅公开训练集可更新梯度，公开验证集可评估和选版；不得获取或推断隐藏标签。"
     "从实际父产物续训，保留 Adam 和标准化状态。"
@@ -122,7 +122,7 @@ class RealModelHost(EvidenceHost):
         super().__init__(*args, **kwargs)
         self.gateway, self.runtime = gateway, runtime
         self.frame.update(model_name=MODEL, prompt=LOCAL_PROMPT,
-                          prompt_version="local-real-27b-sdk-1.0.4-v1")
+                          prompt_version="local-real-27b-sdk-1.0.5-v1")
         if runtime is not None:
             self.frame["task_contract"]["public_projection"].update(
                 train_path="/data/train.jsonl", validation_path="/data/validation.jsonl")
@@ -328,7 +328,7 @@ def main():
     if info["dataset_key"] != "A" or digest(base/"checkpoint.npz") != info["checkpoint_sha256"]:
         raise ValueError("Official baseline identity mismatch")
     out.mkdir(parents=True, exist_ok=False)
-    report = {"scope":"real_27b_local_sdk_1.0.4_host_rehearsal", "status":"preflight",
+    report = {"scope":"real_27b_local_sdk_1.0.5_host_rehearsal", "status":"preflight",
               "model":MODEL, "official_host_verified":False, "official_hidden_score":None,
               "cloud_experiment_record_created":False, "rounds":[], "model_calls":[]}
     write_json(out/"live-report.json", report)
@@ -338,7 +338,7 @@ def main():
             runtime = DockerRuntime(args.image, executable=args.docker_executable,
                                     context=args.docker_context, expected_id=args.expected_image_id)
             report["runtime"] = runtime.preflight()
-            report["scope"] = "real_27b_sdk_1.0.4_in_actual_docker_image"
+            report["scope"] = "real_27b_sdk_1.0.5_in_actual_docker_image"
             write_json(out/"live-report.json", report)
         ensure_model(config, key)
         if args.recovery_from:

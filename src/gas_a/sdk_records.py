@@ -1,4 +1,4 @@
-"""SDK 1.0.4 declaration limits; detailed evidence stays in uploaded state."""
+"""SDK 1.0.5 declaration limits; detailed evidence stays in uploaded state."""
 import hashlib
 import json
 import math

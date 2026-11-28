@@ -155,3 +155,38 @@ def request_digest(request):
     # 固定 JSON 键序和分隔符计算请求摘要，用于追踪真实发送的证据版本，不是模型调用回执。
     raw = json_text(request, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
+MODEL_REQUEST_BYTES = 24 * 1024
+
+
+def bounded_model_request(request):
+    """限制选手消息体，优先保留本轮可执行动作、同口径分数和准入结论。"""
+    content = json_text(request, separators=(",", ":"))
+    size = len(content.encode("utf-8"))
+    if size <= MODEL_REQUEST_BYTES:
+        return request, content
+    # 超预算时先裁剪重复历史。逐方案尝试证据和实际选版白名单始终保留，
+    # 便于模型区分同条件已失败、仅在旧条件试过和本轮尚未尝试。
+    request = {**request, "evidence_budget": {"original_bytes": size, "omitted_fields": []}}
+    for field, count in (("history", 4), ("history_feedback", 4)):
+        if isinstance(request.get(field), list):
+            request[field] = request[field][-count:]
+    correction = request.get("correction")
+    if correction and len(correction["previous_completed_response"]) > 2000:
+        request["correction"] = {**correction, "previous_completed_response": correction["previous_completed_response"][:2000],
+                                 "response_excerpt_only": True}
+    omitted = request["evidence_budget"]["omitted_fields"]
+    for field in ("history_feedback", "history", "execution_policy", "monitoring", "diagnosis",
+                  "historical_validation", "experiment_guide",
+                  "host_candidate_receipt", "local_training", "checkpoint_selection"):
+        content = json_text(request, separators=(",", ":"))
+        if len(content.encode("utf-8")) <= MODEL_REQUEST_BYTES:
+            return request, content
+        if field in request:
+            omitted.append(field)
+            del request[field]
+    content = json_text(request, separators=(",", ":"))
+    if len(content.encode("utf-8")) > MODEL_REQUEST_BYTES:
+        raise ValueError("Controller decision contract exceeds the participant message budget")
+    return request, content

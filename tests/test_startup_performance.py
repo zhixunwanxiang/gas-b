@@ -23,7 +23,7 @@ from gas_a import submission
 
 class StartupPerformanceTest(unittest.TestCase):
     def test_harness_is_the_unmodified_sdk_template(self):
-        template = ROOT / 'vendor/contest-harness-sdk-1.0.4/template/harness.py'
+        template = ROOT / 'vendor/contest-harness-sdk-1.0.5/template/harness.py'
         self.assertEqual((ROOT / 'harness.py').read_bytes(), template.read_bytes())
 
     def test_sdk_describe_does_not_import_numpy_or_business_modules(self):
@@ -44,7 +44,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         self.assertEqual(r.returncode, 0, r.stderr)
         result = json.loads(r.stdout)
         self.assertEqual(result['tasks'], ['classification', 'regression'])
-        self.assertEqual(result['sdk_version'], '1.0.4')
+        self.assertEqual(result['sdk_version'], '1.0.5')
         self.assertEqual(len(r.stdout.splitlines()), 1)
 
     def test_describe_replies_with_stdin_still_open(self):

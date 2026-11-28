@@ -7,9 +7,16 @@ from ..parent_checkpoint import verify_selected_checkpoint
 from .diagnostics import VERSION as METRIC_VERSION, error_metrics, grouped_metrics, groups
 
 PARENT_REFERENCE_VERSION = "current-parent-public-reevaluation-v2"
+GROUP_GUARDS = {"B": ("bearing_device_guard", "device"), "C": ("cmapss_source_guard", "source")}
 
 
-def evaluate(model, data, dataset, *, prediction=None, detailed=True, device_masks=None):
+def guarded_masks(data, dataset):
+    axis = GROUP_GUARDS[dataset][1]
+    labels = groups(data, dataset)[axis]
+    return {name: labels == name for name in np.unique(labels)}
+
+
+def evaluate(model, data, dataset, *, prediction=None, detailed=True, group_masks=None):
     # Model.predict 已把标准化输出还原到原单位；这里直接计算分钟/循环上的误差。
     # 正 bias 表示寿命被高估，overestimate_fraction 表示高估样本占比，供诊断使用。
     prediction = model.predict(data["x"]) if prediction is None else prediction
@@ -20,12 +27,11 @@ def evaluate(model, data, dataset, *, prediction=None, detailed=True, device_mas
     result.update(dataset=dataset, metric_version=METRIC_VERSION,
                   validation_sha256=data.get("sha256"), scope="authorized_public_validation")
     if not detailed:
-        if dataset == "B":
-            if device_masks is None:
-                labels = groups(data, dataset)["device"]
-                device_masks = {name: labels == name for name in np.unique(labels)}
-            result["group_metrics"] = {"device": {name: {"rows": int(mask.sum()),
-                "rmse": float(np.sqrt(np.mean(error[mask] ** 2)))} for name, mask in device_masks.items()}}
+        if group_masks is None:
+            group_masks = guarded_masks(data, dataset)
+        axis = GROUP_GUARDS[dataset][1]
+        result["group_metrics"] = {axis: {name: {"rows": int(mask.sum()),
+            "rmse": float(np.sqrt(np.mean(error[mask] ** 2)))} for name, mask in group_masks.items()}}
         return result
     result["group_metrics"] = grouped_metrics(error, data, dataset, result.get("nasa_score"))
     devices = result["group_metrics"]["device"]
@@ -36,7 +42,25 @@ def evaluate(model, data, dataset, *, prediction=None, detailed=True, device_mas
     return result
 
 
-def promotion_gate(before, after, rules, *, require_all_improved=False):
+def _guard_groups(reference, after, axis, bounds, *, stage=False):
+    losses, comparable = {}, True
+    candidate_groups = after.get("group_metrics", {}).get(axis, {})
+    relative = bounds.get("stage_relative_increase", bounds["relative_increase"]) if stage else bounds["relative_increase"]
+    for name, previous in reference.get("group_metrics", {}).get(axis, {}).items():
+        if name == "unknown" or previous["rows"] < bounds["minimum_rows"]:
+            continue
+        current = candidate_groups.get(name)
+        if current is None or current["rows"] != previous["rows"]:
+            comparable = False
+            continue
+        allowance = max(bounds["absolute_increase"], previous["rmse"] * relative)
+        if current["rmse"] > previous["rmse"] + allowance + 1e-12:
+            losses[name] = {"rows": previous["rows"], "parent_rmse": previous["rmse"],
+                            "candidate_rmse": current["rmse"], "allowed_increase": allowance}
+    return losses, comparable
+
+
+def promotion_gate(before, after, rules, *, require_all_improved=False, retention_reference=None):
     # 改善量为 父 RMSE - 新 RMSE；分钟和循环分别比较，不把它们转成分类百分点。
     gain = before["rmse"] - after["rmse"]
     required = max(rules["minimum_rmse_absolute_gain"], before["rmse"] * rules["minimum_rmse_relative_gain"])
@@ -55,24 +79,26 @@ def promotion_gate(before, after, rules, *, require_all_improved=False):
         reasons.append("mae_regression")
     if require_all_improved and after["mae"] >= before["mae"]:
         reasons.append("mae_not_improved")
-    device_losses = {}
-    protected = rules.get("bearing_device_guard")
-    if protected and before.get("dataset") == "B":
-        parent_devices = before.get("group_metrics", {}).get("device", {})
-        candidate_devices = after.get("group_metrics", {}).get("device", {})
-        for name, parent in parent_devices.items():
-            if name == "unknown" or parent["rows"] < protected["minimum_rows"]:
-                continue
-            candidate = candidate_devices.get(name)
-            if candidate is None or candidate["rows"] != parent["rows"]:
-                reasons.append("incomparable_device_support")
-                continue
-            allowance = max(protected["absolute_increase"], parent["rmse"] * protected["relative_increase"])
-            if candidate["rmse"] > parent["rmse"] + allowance + 1e-12:
-                device_losses[name] = {"rows": parent["rows"], "parent_rmse": parent["rmse"],
-                                       "candidate_rmse": candidate["rmse"], "allowed_increase": allowance}
-        if device_losses:
-            reasons.append("bearing_device_regression")
+    group_losses, stage_losses = {}, {}
+    guard = GROUP_GUARDS.get(before.get("dataset"))
+    if guard and guard[0] in rules:
+        name, axis = guard
+        group_losses, comparable = _guard_groups(before, after, axis, rules[name])
+        if not comparable:
+            reasons.append(f"incomparable_{axis}_support")
+        if group_losses:
+            reasons.append("bearing_device_regression" if axis == "device" else "cmapss_source_regression")
+        if retention_reference is not None and retention_reference is not before:
+            # 两道护栏分别约束单轮退化与同阶段累计退化，避免小幅退化逐轮累积。
+            if any(retention_reference.get(key) != after.get(key)
+                   for key in ("validation_sha256", "rows", "dataset", "metric_version")):
+                reasons.append("incomparable_stage_reference")
+            else:
+                stage_losses, comparable = _guard_groups(retention_reference, after, axis, rules[name], stage=True)
+                if not comparable:
+                    reasons.append("incomparable_stage_group_support")
+                if stage_losses:
+                    reasons.append("stage_group_regression")
     nasa_limit = None
     has_nasa = before.get("dataset") == "C" or "nasa_score" in before
     if has_nasa and (require_all_improved or "maximum_nasa_relative_increase" in rules):
@@ -88,7 +114,9 @@ def promotion_gate(before, after, rules, *, require_all_improved=False):
                 reasons.append("nasa_not_improved")
     return {"eligible": not reasons, "reasons": reasons,
             "rmse_reduction": gain, "required_rmse_reduction": required, "mae_limit": mae_limit,
-            "nasa_limit": nasa_limit, "device_losses": device_losses}
+            "nasa_limit": nasa_limit, "device_losses": group_losses if before.get("dataset") == "B" else {},
+            "source_losses": group_losses if before.get("dataset") == "C" else {},
+            "stage_group_losses": stage_losses}
 
 
 def measurement(value, validation_sha256, *, binding=None):

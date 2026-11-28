@@ -5,7 +5,7 @@ from pathlib import Path
 import time
 import numpy as np
 from .data import load_model
-from .evaluation import evaluate, promotion_gate
+from .evaluation import evaluate, guarded_masks, promotion_gate
 from .model import BOUNDED_HEADS, BOUNDED_METHODS, CORRECTION_METHODS, fit_bounded_cmapss, fit_guarded_bearing, frozen_correction
 from . import bearing_guard, bounded_residual
 from .diagnostics import groups
@@ -88,7 +88,7 @@ def fit_epoch(model, train, spec, deadline, *, weights=None, prepared=None):
 
 
 def continue_candidate(checkpoint, train, validation, output, spec, limits, rules, dataset, expected_sha,
-                       *, parent_measurement=None, detailed_epochs=False, fixed_epochs=False):
+                       *, parent_measurement=None, detailed_epochs=False, fixed_epochs=False, retention_reference=None):
     # 再次核对实际父文件，防止“声明从父模型续训，实际读了固定本机权重”。
     # 训练在加载后的内存副本上进行，original 留作继承关系核验，不修改父文件。
     if digest(checkpoint) != expected_sha:
@@ -121,10 +121,8 @@ def continue_candidate(checkpoint, train, validation, output, spec, limits, rule
     output = Path(output)
     output.mkdir()  # 候选目录必须全新，不覆盖父产物或之前实验。
     best, best_metrics, best_eligible, stale = None, None, False, 0
-    device_masks = None
-    if dataset == "B" and not detailed_epochs:
-        labels = groups(validation, dataset)["device"]
-        device_masks = {name: labels == name for name in np.unique(labels)}
+    group_masks = None if detailed_epochs else guarded_masks(validation, dataset)
+    gate_options = {"require_all_improved": is_bounded, "retention_reference": retention_reference}
     executed = 0
     if is_bounded:
         fit_head = fit_guarded_bearing if dataset == "B" else fit_bounded_cmapss
@@ -146,8 +144,8 @@ def continue_candidate(checkpoint, train, validation, output, spec, limits, rule
             loss = None  # 这些是固定收缩系数的验证，不伪装成 NN epoch。
         else:
             loss = fit_epoch(model, train, numerical_spec, deadline, weights=weights, prepared=prepared)
-        metric = evaluate(model, validation, dataset, detailed=detailed_epochs, device_masks=device_masks)
-        gate = promotion_gate(before, metric, rules, require_all_improved=is_bounded)
+        metric = evaluate(model, validation, dataset, detailed=detailed_epochs, group_masks=group_masks)
+        gate = promotion_gate(before, metric, rules, **gate_options)
         # 先在可上线的 epoch 中选 RMSE 最低者；全部不合格时仍保留真实训练结果供拒绝和归档。
         better = (fixed_epochs or best is None or (gate["eligible"] and not best_eligible)
                   or (gate["eligible"] == best_eligible and metric["rmse"] < best_metrics["rmse"]))
@@ -172,7 +170,7 @@ def continue_candidate(checkpoint, train, validation, output, spec, limits, rule
     if not np.array_equal(restored.predict(validation["x"]), best_prediction):
         raise ValueError("Full regression predictor changed after serialization")
     best_metrics = evaluate(best, validation, dataset, prediction=best_prediction)
-    if promotion_gate(before, best_metrics, rules, require_all_improved=is_bounded)["eligible"] != best_eligible:
+    if promotion_gate(before, best_metrics, rules, **gate_options)["eligible"] != best_eligible:
         raise ValueError("Full diagnostic measurement changed candidate eligibility")
     head = best.meta.get(bounded_key, {})
     widths = bearing_guard.WIDTHS if dataset == "B" else bounded_residual.WIDTHS

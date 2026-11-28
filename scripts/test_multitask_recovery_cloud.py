@@ -14,7 +14,6 @@ sys.path.insert(0, str(ROOT))
 import contest_submission
 from scripts.test_multitask_cloud import RealPeerFactory, snapshot, preflight_source
 from scripts.test_real_sdk import MODEL
-from scripts.test_cloud_suite import DEFAULT_IMAGE, DEFAULT_IMAGE_ID
 from scripts.verify_multitask_cloud_run import verify_dataset, read, rows
 from scripts.validate_multitask import measure, classification_pair, regression_pair
 from scripts.validate_platform import receipt, exchange
@@ -274,8 +273,8 @@ def main():
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--env-file", type=Path, default=ROOT / ".env")
-    parser.add_argument("--image", default=DEFAULT_IMAGE)
-    parser.add_argument("--expected-image-id", default=DEFAULT_IMAGE_ID)
+    parser.add_argument("--image", required=True)
+    parser.add_argument("--expected-image-id", required=True)
     parser.add_argument("--docker-executable", default="docker")
     parser.add_argument("--docker-context", default="desktop-linux")
     parser.add_argument("--datasets", nargs="+", choices=("A", "B", "C"), default=["A", "B", "C"])

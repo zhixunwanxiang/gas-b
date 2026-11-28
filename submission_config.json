@@ -24,13 +24,14 @@
       "minimum_rmse_relative_gain": 0.0005,
       "maximum_mae_relative_increase": 0.02,
       "maximum_nasa_relative_increase": 0.05,
-      "bearing_device_guard": {"minimum_rows": 30, "relative_increase": 0.05, "absolute_increase": 10}
+      "bearing_device_guard": {"minimum_rows": 30, "relative_increase": 0.05, "absolute_increase": 10, "stage_relative_increase": 0.10},
+      "cmapss_source_guard": {"minimum_rows": 30, "relative_increase": 0.05, "absolute_increase": 2}
     },
     "limits": {"max_epochs": 8, "max_seconds_per_candidate": 30, "early_stopping_patience": 3},
     "skip_locally_rejected_uploads": true,
-    "default_first_experiment": {"C": "cmapss_condition_mlp"},
     "preferred_experiment_sequence": {
-      "B": ["bearing_balanced", "bearing_log_ridge", "bearing_balanced_half", "bearing_rbf", "low_rate", "bearing_upward_guard"]
+      "B": ["bearing_balanced", "bearing_log_ridge", "bearing_balanced_half", "bearing_rbf", "low_rate", "bearing_upward_guard"],
+      "C": ["cmapss_condition_mlp", "low_rate", "cmapss_condition_ridge", "cmapss_bounded_residual"]
     },
     "experiments": [
       {"name": "low_rate", "learning_rate": 0.0003, "epochs": 3, "freeze_features": false, "loss": "mse"},

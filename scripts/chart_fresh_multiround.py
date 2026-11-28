@@ -1,5 +1,6 @@
 """Recompute and chart only one newly registered 30-round run; never fall back to history."""
 import argparse
+import base64
 import csv
 import hashlib
 from html import escape
@@ -54,10 +55,12 @@ def sync_metric_summaries(data, output):
             higher = ds == "A"
             gain = ((values[-1] - values[0]) * 100 if higher else
                     100 * (values[0] - values[-1]) / values[0] if values[0] else None)
+            worst = min(values[1:]) if higher else max(values[1:])
+            worst_rounds = [i for i in range(1, 11) if values[i] == worst]
             summary = {"dataset": ds, "metric": key, "label": label, "display_unit": unit,
                 "display_scale": 100 if higher else 1, "initial": values[0], "final": values[-1],
                 "mean_rounds_1_to_10": statistics.mean(values[1:]),
-                "worst_rounds_1_to_10": min(values[1:]) if higher else max(values[1:]),
+                "worst_rounds_1_to_10": worst, "worst_round_indices": worst_rounds,
                 "improvement": gain, "improvement_unit": "百分点" if higher else "%"}
             summaries.append(summary)
             dataset["summary"].update({f"initial_{key}": values[0], f"final_{key}": values[-1],
@@ -67,7 +70,7 @@ def sync_metric_summaries(data, output):
             scale = summary["display_scale"]
             csv_rows.append({"项目": ds, "指标": label, "单位": unit, "初始": values[0] * scale,
                 "十轮平均": summary["mean_rounds_1_to_10"] * scale,
-                "最差轮": summary["worst_rounds_1_to_10"] * scale, "最终": values[-1] * scale,
+                "最差轮": worst * scale, "最差轮次": ",".join(map(str, worst_rounds)), "最终": values[-1] * scale,
                 "改善": gain, "改善单位": summary["improvement_unit"]})
         datasets.append({"项目": ds, "主指标": dataset["primary"], **dataset["summary"]})
     data["metric_summaries"] = summaries
@@ -77,26 +80,76 @@ def sync_metric_summaries(data, output):
     csv_export(output / "各项指标汇总.csv", csv_rows)
 
 
-def prepare(run, output):
+def container_registration(run, verification_path):
+    """Normalize the provenance of a packaged ten-round container rehearsal."""
+    manifest_path = run.parent / "source-manifest.json"
+    snapshot = read(manifest_path)
+    verified = read(verification_path)
+    delivery_path = verification_path.with_name("delivery-manifest.json")
+    delivery = read(delivery_path)
+    verification_entry, = [item for item in delivery["files"] if item["file"] == verification_path.name]
+    assert verification_entry["sha256"] == digest(verification_path)
+    assert verified["compiled_from_current_worktree"] and verified["rounds_acknowledged"] == 30
+    assert verified["real_model_calls"] == 0 and verified["official_score_verified"] is False
+    assert verified["git_head"] == snapshot["git_head"] and verified["frozen_at"] == snapshot["frozen_at"]
+    assert verified["branch"] == snapshot["branch"] and verified["sdk_version"] == snapshot["sdk_version"] == delivery["sdk"]
+    assert verified["image_id"] == delivery["image_id"] == (run.parent / "image-id.txt").read_text(encoding="ascii").strip()
+    code_root = run.parent / "source"
+    assert all(digest(code_root / p) == h for p, h in snapshot["files"].items())
+    app_files = {p: h for p, h in snapshot["files"].items() if p.startswith("src/") or p.endswith(".whl")
+                 or p in ("harness.py", "contest_submission.py", "submission_config.json", "requirements.txt",
+                          "Dockerfile", "Dockerfile.offline", ".dockerignore")}
+    assert all(digest(ROOT / p) == h for p, h in app_files.items()), "Current application differs from the tested image"
+    completions = {task: read(run / f"{task}-completion.json") for task in "ABC"}
+    for task, finished in completions.items():
+        preflight = read(run / f"{task}-preflight.json")
+        assert finished["image_id"] == preflight["image_id"] == verified["image_id"]
+        assert finished["rounds"] == 10 and finished["sdk_version"] == verified["sdk_version"]
+        probe = preflight["runtime_probe"]
+        assert probe["verified"] and probe["cpus"] == 2 and probe["memory_bytes"] == 4 * 1024 ** 3
+        assert probe["network"] == "none" and probe["readonly_root"]
+        assert finished["runtime"]["container_policy_verified"]
+    record = {"scope": "fresh_container_offline_sdk_numeric_test", "created_at": snapshot["frozen_at"],
+              "code_branch": snapshot["branch"], "code_commit": snapshot["git_head"], "code_root": str(code_root),
+              "working_tree_status": ["frozen worktree with local changes"], "sources_sha256": app_files,
+              "rounds_per_dataset": 10, "historical_results_used": False, "controller": "offline_model_stub",
+              "regression_order": "A 登记序列，B/C 自动读取当前优先菜单", "sdk_version": snapshot["sdk_version"],
+              "inputs": {task: {"sha256": r["inputs"]} for task, r in completions.items()},
+              "container": {"image_id": verified["image_id"], "image_tag": verified["image_tag"],
+                            "cpus": 2, "memory_gib": 4, "network": "none", "readonly_root": True}}
+    snapshot_record = {"manifest": str(manifest_path), "manifest_sha256": digest(manifest_path),
+                       "created_at": snapshot["frozen_at"], "origin": str(ROOT), "files_sha256": snapshot["files"]}
+    paths = [manifest_path, run.parent / "image-id.txt", verification_path, delivery_path]
+    return record, snapshot_record, verified, {str(p): digest(p) for p in paths}
+
+
+def prepare(run, output, container_verification=None):
     import numpy as np
-    registration = read(run / "registration.json")
+    in_container = container_verification is not None
+    if in_container:
+        registration, container_snapshot, verified_container, sources = container_registration(run, container_verification)
+    else:
+        sources = {}
+        registration = read(run / "registration.json")
     assert registration["historical_results_used"] is False
     assert registration["rounds_per_dataset"] == 10
     code_root = Path(registration.get("code_root", ROOT)).resolve()
     assert all(digest(code_root / p) == h for p, h in registration["sources_sha256"].items())
     output.mkdir(parents=True, exist_ok=False)
-    sources = {}
     def source(path):
         path = Path(path).resolve()
         assert path.is_relative_to(run.resolve())
         sources[str(path)] = digest(path)
         return path
-    source(run / "registration.json")
-    data = {"scope": "fresh_native_offline_sdk_numeric_test", "historical_results_used": False,
+    if not in_container:
+        source(run / "registration.json")
+    data = {"scope": registration.get("scope", "fresh_native_offline_sdk_numeric_test"), "historical_results_used": False,
             "registration": registration, "datasets": {}, "real_model_calls": 0,
             "official_score_verified": False, "formal_stage_and_recovery_evaluation": "not_available_fixed_public_projection"}
     snapshot_manifest = code_root / "source-snapshot.json"
-    if snapshot_manifest.exists():
+    if in_container:
+        data["code_snapshot"] = container_snapshot
+    elif snapshot_manifest.exists():
         snapshot = read(snapshot_manifest)
         assert all(digest(code_root / p) == h for p, h in snapshot["files_sha256"].items())
         data["code_snapshot"] = {"manifest": str(snapshot_manifest), "manifest_sha256": digest(snapshot_manifest),
@@ -107,10 +160,14 @@ def prepare(run, output):
         directory = run / dataset
         report = read(source(directory / "report.json"))
         completion = read(source(run / f"{dataset}-completion.json"))
-        assert completion["fresh_run"] and completion["rounds"] == 10
+        assert (in_container or completion["fresh_run"]) and completion["rounds"] == 10
+        assert report["real_model_calls"] == 0
+        if in_container:
+            source(run / f"{dataset}-preflight.json")
         assert len(report["rounds"]) == 10
         validation_file = source(directory / "data/validation.jsonl")
         assert digest(validation_file) == registration["inputs"][dataset]["sha256"]["public/validation.jsonl"]
+        assert digest(source(directory / "data/train.jsonl")) == registration["inputs"][dataset]["sha256"]["public/train.jsonl"]
         assert digest(source(directory / "initial/checkpoint.npz")) == registration["inputs"][dataset]["sha256"]["checkpoint.npz"]
         samples = [json.loads(s) for s in validation_file.read_text(encoding="utf-8").splitlines() if s.strip()]
         y = np.array([LABELS.index(s["answer"]) if dataset == "A" else s["answer"] for s in samples])
@@ -208,7 +265,7 @@ def prepare(run, output):
                 expected_candidate = ({"macro_f1": cfg["local_validation_after"]} if dataset == "A" else cfg["validation_after"])
                 candidate_values, _ = measured(measurement_index, expected_candidate, candidate=True)
                 candidate_metric = candidate_values[primary]
-                candidate_source = "independent_native_prediction"
+                candidate_source = "independent_container_prediction" if in_container else "independent_native_prediction"
             elif dataset != "A" and isinstance(cfg.get("validation_after"), dict) and not cfg.get("experiment_failure"):
                 candidate_metric = cfg["validation_after"].get(primary)
                 if candidate_metric is not None:
@@ -221,7 +278,8 @@ def prepare(run, output):
                 else (before - candidate_metric) / before * 100)
             selected_gain = (selected - before) * 100 if dataset == "A" else (before - selected) / before * 100
             cumulative = (selected - baseline[primary]) * 100 if dataset == "A" else (baseline[primary] - selected) / baseline[primary] * 100
-            events = [json.loads(line[len("[gas-rsi] "):]) for line in source(host / "stderr.log").read_text(encoding="utf-8").splitlines()
+            stderr = source(host / "stderr.log").read_text(encoding="utf-8").splitlines()
+            events = [json.loads(line[len("[gas-rsi] "):]) for line in stderr
                       if line.startswith("[gas-rsi] ")]
             resources = [e for e in events if e.get("event") == "round_resources"]
             assert len(resources) == 1
@@ -244,6 +302,21 @@ def prepare(run, output):
                 "local_training_seconds": training_seconds, "prediction_seconds": timing["prediction_process_seconds"],
                 "candidate_payload_bytes": candidate_bytes, "state_payload_bytes": state_bytes,
                 "token_totals": resources["token_totals"], "peak_rss_bytes": resources["peak_rss_bytes"]}
+            if in_container:
+                trace = read(source(host / "sdk-timing.json"))
+                assert trace["status"] == "completed" and trace["order_valid"] and trace["acknowledged"] and not trace["errors"]
+                assert [line.removeprefix("[contest_harness] ") for line in stderr if line.startswith("[contest_harness] ")] == [
+                    "state_request sent", "state_response received", "round_complete sent", "round_ack received"]
+                requests = [len(message["content"].encode("utf-8")) for f in frames if f["frame"].get("type") == "model_request"
+                            for message in f["frame"]["messages"]]
+                chunks = [len(base64.b64decode(f["frame"]["data_base64"], validate=True))
+                          for f in frames if f["frame"].get("type") == "upload_chunk_request"]
+                assert requests and chunks and resources["peak_rss_bytes"] > 0
+                row.update(max_model_request_bytes=max(requests), upload_chunk_count=len(chunks), max_upload_raw_bytes=max(chunks),
+                           process_exit_seconds=trace["process_exit_seconds"])
+                tested = verified_container["data"][dataset]["rounds"][index - 1]
+                assert item["selected_artifact_id"] == tested["selected"] and tested["acknowledged"]
+                assert all(math.isclose(metrics[k], v, rel_tol=1e-11, abs_tol=1e-9) for k, v in tested["metrics"].items())
             assert item["selected_artifact_id"] in registry
             rows.append(row)
             previous_id = item["selected_artifact_id"]
@@ -262,7 +335,12 @@ def prepare(run, output):
             "cpu_seconds": sum(r["cpu_seconds"] for r in rows[1:]), "callback_wall_seconds": sum(r["wall_seconds"] for r in rows[1:]),
             "candidate_payload_bytes": sum(r["candidate_payload_bytes"] for r in rows[1:]),
             "state_payload_bytes": sum(r["state_payload_bytes"] for r in rows[1:]),
-            "model_calls": sum(r["model_call_count"] for r in rows[1:]), "fresh_worker_wall_seconds": completion["wall_seconds"]}
+            "model_calls": sum(r["model_call_count"] for r in rows[1:]), "fresh_worker_wall_seconds": completion.get("wall_seconds")}
+        if in_container:
+            stats.update(peak_rss_bytes=max(r["peak_rss_bytes"] for r in rows[1:]),
+                         max_model_request_bytes=max(r["max_model_request_bytes"] for r in rows[1:]),
+                         upload_chunk_count=sum(r["upload_chunk_count"] for r in rows[1:]),
+                         max_upload_raw_bytes=max(r["max_upload_raw_bytes"] for r in rows[1:]))
         data["datasets"][dataset] = {"primary": primary, "rows": rows, "summary": stats}
         summary_rows.append({"项目": dataset, "主指标": primary, **stats})
         for row in rows:
@@ -288,7 +366,14 @@ def prepare(run, output):
         "acknowledgements_and_model_receipts_verified": True, "parent_checkpoint_chain_verified": True,
         "raw_selected_metrics_reconciled": True, "baseline_round_excluded_from_round_averages": True}
     verification_file = run / "verification.json"
-    if verification_file.exists():
+    if in_container:
+        assert sum(v["summary"]["upload_chunk_count"] for v in data["datasets"].values()) == verified_container["upload_chunks"]
+        assert max(v["summary"]["max_upload_raw_bytes"] for v in data["datasets"].values()) == verified_container["max_raw_upload_chunk_bytes"]
+        assert max(v["summary"]["max_model_request_bytes"] for v in data["datasets"].values()) == verified_container["maximum_model_request_bytes"]
+        data["test_verification"] = {"source": str(container_verification), "sdk_version": verified_container["sdk_version"],
+            "tests_passed": verified_container["tests_passed"], "total_rounds": 30}
+        write(output / "测试与协议验收.json", verified_container)
+    elif verification_file.exists():
         verified = read(source(verification_file))
         assert verified["total_rounds"] == 30 and verified["real_model_calls"] == 0
         data["test_verification"] = {"source": str(verification_file), "tests": verified["tests"],
@@ -349,9 +434,12 @@ def render(data, output):
     blue, green, orange, purple = "#2563eb", "#087f78", "#cb6a22", "#8759b4"
     source_colors = {"FD001": blue, "FD002": green, "FD003": purple, "FD004": orange}
     registration = data["registration"]
+    container = registration.get("container")
     branch = registration.get("code_branch", "未记录分支")
     created_date = registration["created_at"][:10]
     sequence_note = " · B 第10轮显式测试新保护候选" if registration.get("b_guard_replay") else ""
+    setup = (f'SDK {registration["sdk_version"]} · 容器 {container["cpus"]} CPU / {container["memory_gib"]} GiB'
+             if container else "本机原生测试")
     catalog = []
     def rows(ds): return data["datasets"][ds]["rows"]
     def series(ds, metric): return [r["metrics"].get(metric, np.nan) for r in rows(ds)]
@@ -367,7 +455,8 @@ def render(data, output):
     def finish(fig, name, title, note):
         fig.suptitle(title)
         fig.get_layout_engine().set(rect=(0, .055, 1, .945))
-        fig.text(.5, .01, f"{branch} · {created_date} · 固定公开集 / 离线控制器 · 实际选中模型 · 非隐藏成绩{sequence_note}", ha="center", fontsize=9, color="#5d6c7d")
+        fig.text(.5, .01, f"{branch} · {created_date} · {setup} · 固定公开集 / 离线控制器{sequence_note}",
+                 ha="center", fontsize=9, color="#5d6c7d")
         fig.savefig(output / f"{name}.png", dpi=240, bbox_inches="tight", pad_inches=.22)
         fig.savefig(output / f"{name}.svg", bbox_inches="tight", pad_inches=.22)
         plt.close(fig)
@@ -515,7 +604,10 @@ def render(data, output):
         line(axes[1,col], [r["prediction_seconds"] for r in rr], color=colors[ds], start=1)
         axes[1,col].set_title(f"{ds} · 独立预测（{rows(ds)[0]['metrics']['rows']:,} 条）")
         style(axes[1,col], "预测进程墙钟 / 秒"); axes[1,col].set_xticks(range(1,11)); axes[1,col].set_xlabel("轮次")
-    finish(fig, "07-resources", "本次逐轮耗时与独立预测成本", "本机并行测试；回调墙钟包含 RPC/宿主候选测量等待，CPU 仅计参与方进程。预测进程时间包含启动和 JSON。未强制容器 2 CPU/4 GiB，不作为官方效率分；token、峰值内存缺失记未知。")
+    resource_note = "A/B/C 并行；回调墙钟包含 RPC 和宿主候选测量等待，CPU 仅计参与方进程。预测进程时间包含启动和 JSON。"
+    resource_note += ("本次容器限制为 2 CPU/4 GiB；模型决策使用离线替身，真实 Token 未测。" if container else
+                      "本机原生测试未强制比赛容器限制；Token 和峰值内存缺失记未知。")
+    finish(fig, "07-resources", "本次逐轮耗时与独立预测成本", resource_note)
     fig = plt.figure(figsize=(15, 8), layout="constrained")
     grid = fig.add_gridspec(2, 3, height_ratios=(1, 1.7))
     ax = fig.add_subplot(grid[0,:])
@@ -583,7 +675,29 @@ def render(data, output):
         ax.set_title(f"{ds} · 收益与累计 CPU")
         style(ax, "F1 提升 / 百分点" if ds == "A" else "RMSE 降幅 / %", False)
         ax.set_xlabel("参与方回调累计 CPU / 秒"); ax.margins(x=.15, y=.2)
-    finish(fig, "12-gain-vs-cpu", "累计资源投入对应的实际提升", "CPU 来自本次参与方回调账本，不含真实大模型、宿主测量和容器启动成本；只描述此次轨迹。并行本机计时不能推导正式资源分或版本间加速倍数。")
+    finish(fig, "12-gain-vs-cpu", "累计资源投入对应的实际提升", "CPU 来自本次参与方回调账本。真实大模型、宿主测量和容器启动成本另计；并行计时仅描述本次验证环境。")
+    if container:
+        fig, axes = plt.subplots(2, 3, figsize=(15, 8), layout="constrained")
+        for col, ds in enumerate("ABC"):
+            rr = rows(ds)[1:]
+            memory_limit = container["memory_gib"] * 1024
+            memory = [r["peak_rss_bytes"] / 1024 ** 2 for r in rr]
+            sizes = [r["max_model_request_bytes"] / 1024 for r in rr]
+            line(axes[0,col], memory, color=colors[ds], start=1)
+            axes[0,col].set_title(f"{ds} · 进程内存峰值，最高 {max(memory):.0f} MiB")
+            axes[0,col].set_ylim(0, max(memory) * 1.25)
+            axes[0,col].text(.98,.96,f"容器上限 {memory_limit:,} MiB",ha="right",va="top",
+                             transform=axes[0,col].transAxes,fontsize=9,color="#5d6c7d")
+            line(axes[1,col], sizes, "每轮最大模型请求体", colors[ds], start=1)
+            axes[1,col].axhline(24,color="#8995a6",linestyle="--",label="本项目 24 KiB 上限")
+            axes[1,col].set_ylim(0, 26)
+            axes[1,col].set_title(f"{ds} · 模型请求体，最高 {max(sizes):.2f} KiB")
+            axes[1,col].legend(fontsize=8, loc="lower right")
+            for ax, unit in ((axes[0,col],"MiB"),(axes[1,col],"KiB")):
+                style(ax, unit)
+                ax.set_xticks(range(1,11)); ax.set_xlabel("轮次")
+        finish(fig,"13-memory-and-request","容器峰值内存与模型请求体",
+               "峰值 RSS 为参与方回调进程已观测的常驻内存峰值。模型请求体按 UTF-8 字节测量，仅含参赛方发出的消息。模型 Token 未测。")
     write(output/"chart-catalog.json",catalog)
     cells=[]
     for i,item in enumerate(catalog):
@@ -598,19 +712,24 @@ def render(data, output):
     for metric in data["metric_summaries"]:
         ds = metric["dataset"]; scale = metric["display_scale"]
         gain = "未知" if metric["improvement"] is None else f'{metric["improvement"]:+.3f} {metric["improvement_unit"]}'
+        worst_rounds = "、".join(map(str, metric["worst_round_indices"]))
         table.append(f'<tr><td>{ds}</td><td>{metric["label"]}（{metric["display_unit"]}）</td>'
-            f'<td>{metric["initial"] * scale:,.4f}</td><td>{metric["final"] * scale:,.4f}</td><td>{gain}</td>'
+            f'<td>{metric["initial"] * scale:,.4f}</td><td>{metric["mean_rounds_1_to_10"] * scale:,.4f}</td>'
+            f'<td>{metric["worst_rounds_1_to_10"] * scale:,.4f}<br><small>第 {worst_rounds} 轮</small></td>'
+            f'<td>{metric["final"] * scale:,.4f}</td><td>{gain}</td>'
             f'<td>{data["datasets"][ds]["summary"]["adoptions"]}/10</td></tr>')
     gallery="".join(f'<section id="{item["name"]}"><h2>{escape(item["title"])}</h2><img src="{item["name"]}.png" alt="{escape(item["title"])}" loading="lazy"><p>{escape(item["note"])}</p><p><a href="{item["name"]}.png">高清 PNG</a> · <a href="{item["name"]}.svg">矢量 SVG</a></p></section>' for item in catalog)
     html='''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>本次新测 · A/B/C 十轮图表</title><style>body{font:16px/1.7 "Microsoft YaHei",sans-serif;color:#182b42;max-width:1260px;margin:auto;padding:24px}h1,h2{font-weight:500}h2{margin-top:38px}a{color:#2456b2}p{color:#4f6076}img{max-width:100%;height:auto}table{border-collapse:collapse;width:100%}td,th{padding:10px;text-align:left;border-bottom:1px solid #dce3ed}section{border-top:1px solid #dce3ed;margin-top:34px}.table{overflow:auto}@media print{section{break-before:page}}</style>'''
     html+=f'<h1>{escape(branch)} · A/B/C 各十轮</h1><p>{escape(created_date)} · 当前工作区源码及配置重新运行 30 轮。第 0 轮为官方初始检查点；全部提升均相对该初始模型，不与历史版本拼接。离线控制器，真实续训及独立逐条预测，非正式隐藏评分。</p>'
     dirty_note = "含尚未提交的工作区改动；实际测试版本由登记中的逐文件 SHA-256 确定。" if registration.get("working_tree_status") else ""
     html+=f'<p>分支：{escape(branch)} · 提交：{escape(registration["code_commit"][:12])}。{dirty_note}测试顺序：{escape(registration.get("regression_order", "原登记顺序"))}。</p>'
+    if container:
+        html+=f'<p>{escape(setup)} · 禁网、只读根目录。镜像：<code>{escape(container["image_tag"])}</code>。B/C 由离线控制器跟随本轮优先菜单。</p>'
     if registration.get("b_guard_replay"):
         html+='<p>B 第 10 轮显式请求 bearing_upward_guard，代替默认顺序中的 bearing_stumps；前九轮不变。默认菜单中保护候选排在第十一项，这条轨迹专门验证新增方案，不能视作默认十轮必然结果。</p>'
     if data.get("code_snapshot"):
         html+=f'<p>源码快照：{escape(data["code_snapshot"]["created_at"])}；共 {len(data["code_snapshot"]["files_sha256"])} 个文件核对摘要。测试期间使用冻结副本。</p>'
-    html+='<div class="table"><table><tr><th>项目</th><th>指标（单位）</th><th>初始</th><th>第 10 轮</th><th>实际改善</th><th>候选采用</th></tr>'+''.join(table)+'</table></div>'
+    html+='<div class="table"><table><tr><th>项目</th><th>指标（单位）</th><th>初始</th><th>十轮平均</th><th>最差轮</th><th>第 10 轮</th><th>最终改善</th><th>候选采用</th></tr>'+''.join(table)+'</table></div>'
     if data.get("b_default_comparison"):
         comparison = data["b_default_comparison"]
         html+='<h2>B 新方案与默认顺序对照</h2><p>另外从官方初始模型重跑 B 默认顺序十轮，独立保存模型历史；两组前九轮的逐条预测完全一致。总计主轨迹 30 轮，加默认 B 对照 10 轮。</p><div class="table"><table><tr><th>指标（分钟）</th><th>默认十轮</th><th>第十轮显式测试保护方案</th><th>相对默认降低</th></tr>'
@@ -671,12 +790,14 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run",type=Path,required=True)
     parser.add_argument("--output",type=Path,required=True)
+    parser.add_argument("--container-verification",type=Path,help="Verification JSON from a packaged SDK container rehearsal")
     parser.add_argument("--package-only",action="store_true")
     parser.add_argument("--render-only",action="store_true")
     parser.add_argument("--prepare-only",action="store_true")
     parser.add_argument("--visual-review-complete",action="store_true")
     args=parser.parse_args();run=args.run.resolve();output=args.output.resolve()
-    data=read(output/"逐轮指标数据.json") if args.package_only or args.render_only else prepare(run,output)
+    container_proof = args.container_verification.resolve() if args.container_verification else None
+    data=read(output/"逐轮指标数据.json") if args.package_only or args.render_only else prepare(run,output,container_proof)
     if args.prepare_only:
         print(json.dumps(data["validation"],ensure_ascii=False))
         return

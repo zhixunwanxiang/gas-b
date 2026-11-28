@@ -8,6 +8,6 @@
 !src/
 !src/**
 !vendor/
-!vendor/contest_harness-1.0.4-py3-none-any.whl
+!vendor/contest_harness-1.0.5-py3-none-any.whl
 **/__pycache__/
 **/*.py[cod]

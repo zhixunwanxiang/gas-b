@@ -1,4 +1,4 @@
-"""Classified rejection budgets and fresh historical selection through SDK 1.0.4."""
+"""Classified rejection budgets and fresh historical selection through SDK 1.0.5."""
 from copy import deepcopy
 import contextlib
 import io

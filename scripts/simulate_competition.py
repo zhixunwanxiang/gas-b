@@ -414,7 +414,7 @@ def main():
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(p, target)
         source_hashes[relative.as_posix()] = digest(p)
-    wheel = ROOT / "vendor/contest_harness-1.0.4-py3-none-any.whl"
+    wheel = ROOT / "vendor/contest_harness-1.0.5-py3-none-any.whl"
     (root / "reproduction/vendor").mkdir(parents=True)
     shutil.copyfile(wheel, root / "reproduction/vendor" / wheel.name)
     dataset_root = base.parent

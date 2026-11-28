@@ -1,5 +1,5 @@
 """显式区分当前父模型与历史版本；动作、目标和训练起点必须保持一致。"""
-VERSION = "rul-bc-controller-zh-v6"
+VERSION = "rul-bc-controller-zh-v7"
 # 提示词版本也进入实验身份，防止已修复的动作说明与旧失败实验被当作完全相同的上下文。
 
 
@@ -24,6 +24,47 @@ def plan_contract(parent_id, before, restored, rollback_ids, experiments):
                 "rollback": "恢复已在本轮复评达标的历史版本；experiment必须为none，本轮不训练，下轮才从恢复版本续训。"}}
 
 
+def metric_evidence(metrics):
+    """给模型提供主要误差和有限的薄弱分组，完整分组仍用于本地核验和留档。"""
+    if metrics is None:
+        return None
+    fields = ("rows", "rmse", "mae", "bias", "nasa_score", "squared_error_share", "nasa_share")
+    result = {key: metrics[key] for key in fields if key in metrics}
+    result["worst_groups"] = {}
+    for axis, rows in metrics.get("group_metrics", {}).items():
+        ranked = sorted(rows.items(), key=lambda item: (-item[1]["rmse"], item[0]))[:3]
+        result["worst_groups"][axis] = {name: {key: row[key] for key in fields if key in row}
+                                        for name, row in ranked}
+    return result
+
+
+def history_evidence(history, validation_sha):
+    """旧分数标明验证范围，历史原始配置和完整指标留给审核。"""
+    result = []
+    for row in history[-6:]:
+        cfg = row["configuration"]
+        experiment = cfg.get("experiment")
+        outcome = cfg.get("experiment_outcome")
+        result.append({"id": row["id"], "selected_artifact_id": row.get("selected_artifact_id"),
+                       "experiment": experiment.get("name") if isinstance(experiment, dict) else None,
+                       "outcome": outcome.get("outcome") if isinstance(outcome, dict) else None,
+                       "selected_rmse": cfg.get("selected_local_rmse"),
+                       "same_validation": cfg.get("validation_sha256") == validation_sha,
+                       "reason": row["reason"][:180]})
+    return result
+
+
+def stage_evidence(stage):
+    result = {"identity": stage["identity"],
+              "start_metrics": {key: stage["start_metrics"][key] for key in ("rmse", "mae", "nasa_score")
+                                if key in stage["start_metrics"]}}
+    for key in ("parent_delta", "candidate_delta"):
+        if key in stage:
+            result[key] = {name: stage[key][name] for name in ("rmse_delta", "mae_delta", "nasa_delta")
+                           if name in stage[key]}
+    return result
+
+
 PLAN_INSTRUCTION = (
     "你是工业剩余寿命回归实验规划者。先读当前身份表和实测分数，再读历史成败、漂移与误差证据。"
     "actual_current_parent/parent_artifact_id是本轮唯一正在使用的父模型，历史最佳版本不是当前父模型。"
@@ -33,7 +74,7 @@ PLAN_INSTRUCTION = (
     "历史项已在同一当前公开验证集重新测量且gate合格时，应直接比较这些实测RMSE；若历史明显优于当前父模型，优先考虑恢复历史版本。"
     "不能把observe称为保留历史最佳，也不能凭空声称当前父模型就是某个历史ID、把已核验的模型退化解释成未经证实的数据异常。"
     "RMSE越低越好，MAE和配置的C NASA上限共同保护；NASA越低越好，是同验证样本上的逐条求和，不能跨样本数量比较。"
-    "B对公开验证中支持数达到要求的轴承应用RMSE退化保护；超过相对或绝对容差中的较大者就拒绝。"
+    "B保护支持数足够的轴承，C保护支持数足够的来源组；同时检查相对父模型和阶段起点的RMSE退化。"
     "experiment_guide说明实际执行能力；新修正层冻结完整父预测器，MLP续训保留已有修正层并按整体输出计算误差。"
     "设备加权、尾段加权、Huber和新结构是独立实验，不能自行叠加菜单未声明的改动。"
     "未采用的历史候选没有成为父模型，不能把再次从相同父权重运行同一方案描述为累积续训；应结合失败次数选择其他允许方案。"
@@ -41,6 +82,7 @@ PLAN_INSTRUCTION = (
     "parent_host_reference若来自local_current_parent_public_reevaluation，表示当前父权重在本轮公开验证集独立实测，"
     "host_reference仅保留缺少身份字段的旧宿主摘要；不能再把该摘要的unknown_validation_scope误认为当前父参考不可比。"
     "admission_blocker非空时应observe并说明阻塞原因，不反复申请无法上线的训练。bias为预测减真实，负数是低估，正数是高估。"
+    "比较弱组、阶段进展和历史成败；漂移时优先用允许菜单里有证据的实验，或考虑本轮已复评更好的历史版本。"
     "只用公开train拟合参数和统计量，validation只评估选版；meta仅用于分组诊断及train设备权重，不能作为预测特征或反推标签。"
     "预测只用官方34/24维输入，不使用隐藏标签，不重置父权重、Adam或缩放。"
     "reason说明当前父ID/实测RMSE、拟选版本/实测依据及风险，hypothesis写可验证假设，只返回规定JSON字段。"

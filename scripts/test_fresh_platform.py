@@ -20,7 +20,6 @@ from scripts.results_only_journal import ResultsOnlyJournal
 from scripts.verify_closed_loop import verify_recovery
 from scripts.verify_multitask_cloud_run import verify_dataset, read, rows
 from scripts.live_platforms import load_env, configuration, ensure_model, write_receipt, termination_handler
-from scripts.test_cloud_suite import DEFAULT_IMAGE, DEFAULT_IMAGE_ID
 from gas_a.sensor_training.io import digest
 
 
@@ -126,8 +125,8 @@ def main():
     parser.add_argument("--baseline-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--env-file", type=Path, default=ROOT / ".env")
-    parser.add_argument("--image", default=DEFAULT_IMAGE)
-    parser.add_argument("--expected-image-id", default=DEFAULT_IMAGE_ID)
+    parser.add_argument("--image", required=True)
+    parser.add_argument("--expected-image-id", required=True)
     parser.add_argument("--docker-executable", default="docker")
     parser.add_argument("--docker-context", default="desktop-linux")
     args = parser.parse_args()

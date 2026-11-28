@@ -21,7 +21,11 @@ v20 的执行策略启用 `repeat_policy=skip-completed-identical-performance-re
 | `regression.controller.max_repeat_rejections` | 2 | 相同父模型、数据、实验和执行规则下，明确性能不合格或本地训练失败累计2次后屏蔽该方案；测量未核验、选版保护和主动未采用不计入。 |
 | `regression.controller.minimum_rmse_absolute_gain` | 0.000001 | 要求RMSE绝对减少至少该值，B单位分钟，C单位循环。 |
 | `regression.controller.minimum_rmse_relative_gain` | 0.0005 | 同时要求RMSE相对减少至少0.05%；不是分类的0.05个百分点。 |
-| `regression.controller.maximum_mae_relative_increase` | 0.02 | 辅助保护：MAE相对父模型最多增加2%。C的NASA评分如实记录，不单独作为硬门槛。 |
+| `regression.controller.maximum_mae_relative_increase` | 0.02 | MAE 相对当轮父模型最多增加 2%。 |
+| `regression.controller.maximum_nasa_relative_increase` | 0.05 | C 的总 NASA 惩罚相对当轮父模型最多增加 5%。限幅残差方案另要求 NASA 严格改善。 |
+| `regression.controller.bearing_device_guard` | 30 条、5%、10 分钟、阶段 10% | B 按轴承保护 RMSE。支持数达标时，单轮允许增量取 10 分钟和父模型分组 RMSE 的 5% 中较大者。累计比较使用阶段起点模型在本轮数据上的分组 RMSE，取 10 分钟和 10% 中较大者。 |
+| `regression.controller.cmapss_source_guard` | 30 条、5%、2 循环 | C 按公开 FD 来源保护 RMSE。单轮和阶段累计都取 2 循环和对应参考模型分组 RMSE 的 5% 中较大者。 |
+| `regression.preferred_experiment_sequence` | B 六项、C 四项 | 从 SDK 阶段起点计算本阶段轮次，只把仍符合当轮菜单条件的方案置顶。C 优先尝试条件残差 MLP、低学习率续训、条件岭回归和限幅残差。模型仍根据当轮证据选择合法动作。 |
 | `regression.limits.max_epochs` | 8 | 单个候选最多执行的epoch数。 |
 | `regression.limits.max_seconds_per_candidate` | 30 | 本地数值训练预算，按batch检查；不等于模型请求、数据加载和上传的总时限。 |
 | `regression.limits.early_stopping_patience` | 3 | 连续3个epoch没有更好的合格检查点就早停；优先导出达标且RMSE最低的epoch。 |

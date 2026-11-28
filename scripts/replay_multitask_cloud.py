@@ -67,7 +67,8 @@ class ReplayFactory:
         host = (ReplayClassificationPeer(root, parent, index, history=history, state=state) if dataset == "A" else
                 ReplayRegressionPeer(root, parent, dataset, index, history=history, state=state))
         host.gateway = self.gateway
-        host.frame.update(model_name=MODEL, prompt=LOCAL_PROMPT, prompt_version="local-abc-real-sdk104-v1")
+        host.frame.update(model_name=MODEL, prompt=LOCAL_PROMPT.replace("SDK1.0.5", "SDK1.0.4", 1),
+                          prompt_version="local-abc-real-sdk104-v1")
         return host
 
 
@@ -119,7 +120,8 @@ def main():
     args = parser.parse_args()
     args.output.resolve().mkdir(parents=True, exist_ok=False)
     runtime = DockerRuntime(args.image, executable=args.docker_executable, context=args.docker_context,
-                            expected_id=args.expected_image_id, required_tasks=("classification", "regression"))
+                            expected_id=args.expected_image_id, required_tasks=("classification", "regression"),
+                            sdk_version="1.0.4")
     write_json(args.output.resolve() / "image-preflight.json", runtime.preflight())
     results = []
     for key in args.datasets:

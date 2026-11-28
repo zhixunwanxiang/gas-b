@@ -8,10 +8,11 @@ import tempfile
 import numpy as np
 from contest_harness.errors import HarnessError
 from .data import UNITS, input_values, load_model, load_pair
-from .evaluation import evaluate, promotion_gate, current_parent_reference, host_gate, PARENT_REFERENCE_VERSION
+from .evaluation import evaluate, promotion_gate, current_parent_reference, host_gate, GROUP_GUARDS, PARENT_REFERENCE_VERSION
 from .monitoring import fit_reference, monitor, diagnose
 from .training import continue_candidate
-from .prompts import VERSION as PROMPT_VERSION, plan_contract, PLAN_INSTRUCTION, SELECT_INSTRUCTION
+from .prompts import (VERSION as PROMPT_VERSION, plan_contract, metric_evidence, history_evidence,
+                      stage_evidence, PLAN_INSTRUCTION, SELECT_INSTRUCTION)
 from .diagnostics import compact_metrics
 from .stage_reference import measure_stage, compare_stage
 from .schedule import ordered_experiments, stage_experiment_preference
@@ -60,13 +61,18 @@ def validate_config(config, limits):
         value = rules["maximum_nasa_relative_increase"]
         if type(value) not in (int, float) or not np.isfinite(value) or not 0 <= value <= 1:
             raise ValueError("Invalid NASA protection threshold")
-    if "bearing_device_guard" in rules:
-        guard = rules["bearing_device_guard"]
-        if (type(guard.get("minimum_rows")) is not int or guard["minimum_rows"] < 1
-                or any(type(guard.get(key)) not in (int, float) or not np.isfinite(guard[key])
-                       or not 0 <= guard[key] <= maximum
-                       for key, maximum in (("relative_increase", 1), ("absolute_increase", 1000)))):
-            raise ValueError("Invalid bearing device protection")
+    for guard_name, _ in GROUP_GUARDS.values():
+        if guard_name in rules:
+            guard = rules[guard_name]
+            if (not isinstance(guard, dict) or type(guard.get("minimum_rows")) is not int or guard["minimum_rows"] < 1
+                    or any(type(guard.get(key)) not in (int, float) or not np.isfinite(guard[key])
+                           or not 0 <= guard[key] <= maximum
+                           for key, maximum in (("relative_increase", 1), ("absolute_increase", 1000)))
+                    or ("stage_relative_increase" in guard and (
+                        type(guard["stage_relative_increase"]) not in (int, float)
+                        or not np.isfinite(guard["stage_relative_increase"])
+                        or not guard["relative_increase"] <= guard["stage_relative_increase"] <= 1))):
+                raise ValueError(f"Invalid regression group protection: {guard_name}")
     if type(config.get("skip_locally_rejected_uploads", True)) is not bool:
         raise ValueError("Invalid local candidate upload policy")
     preferences = config.get("default_first_experiment", {})
@@ -221,17 +227,12 @@ def _history_view(history):
                        "reason": str(record.get("reason", ""))[:600],
                        "configuration": {key: config[key] for key in (
                            "dataset", "experiment", "parent_checkpoint_sha256", "train_sha256", "validation_sha256",
-                           "validation_before", "validation_after", "candidate_gate", "host_candidate_gate",
+                           "candidate_gate",
                            "experiment_failure", "selected_local_rmse", "execution_policy", "experiment_outcome") if key in config}}, context="regression_history_view"))
     return result
 
 
-def _restored_view(restored):
-    return {key: {**value, **({"metrics": compact_metrics(value["metrics"])} if "metrics" in value else {})}
-            for key, value in restored.items()}
-
-
-def _restore_history(rnd, history, run, validation, before, rules, dataset):
+def _restore_history(rnd, history, run, validation, before, rules, dataset, *, retention_reference=None):
     # 允许恢复的范围只来自当前 start 帧 artifacts；优先最近选中过的版本，跳过实际父版本。
     # 历史旧分数不能直接用于本轮选版：取回后必须在本轮同一 validation 上重新预测并过门槛。
     receipts = {item["artifact_id"]: item for item in rnd.artifacts}
@@ -259,7 +260,8 @@ def _restore_history(rnd, history, run, validation, before, rules, dataset):
             path = directory / descriptor["checkpoint_paths"][0]
             model = load_model(path, dataset, validation["paths"])
             metrics = evaluate(model, validation, dataset)
-            restored[identifier] = {"metrics": metrics, "gate": promotion_gate(before, metrics, rules),
+            restored[identifier] = {"metrics": metrics, "gate": promotion_gate(
+                                        before, metrics, rules, retention_reference=retention_reference),
                                     "checkpoint_sha256": digest(path), "seed": model.meta["seed"],
                                     "validation_sha256": validation["sha256"], "reevaluated_this_round": True}
         except (ValueError, OSError, KeyError) as error:
@@ -280,7 +282,7 @@ def train(rnd):
             or rnd.task.get("target_unit", UNITS[dataset]) != UNITS[dataset]):
         raise ValueError("B/C requires the native RMSE/lower regression contract and original target unit")
     if rnd.limits.get("artifact_upload_protocol") != "chunked-v1":
-        raise HarnessError("CHUNKED_UPLOAD_UNSUPPORTED", "SDK 1.0.4 requires chunked-v1 uploads")
+        raise HarnessError("CHUNKED_UPLOAD_UNSUPPORTED", "SDK 1.0.5 requires chunked-v1 uploads")
     full_config = json.loads((ROOT / "submission_config.json").read_text(encoding="utf-8"))
     config = full_config["regression"]
     limits, rules = config["limits"], config["controller"]
@@ -337,7 +339,8 @@ def train(rnd):
                  "host_admission_policy_version": HOST_ADMISSION_VERSION,
                  "parent_reference_policy_version": PARENT_REFERENCE_VERSION,
                  "monitor_reference_policy": "fixed_initial_training_projection-v1"}
-    first_experiment = config.get("default_first_experiment", {}).get(dataset) if rnd.round_index == 1 else None
+    stage_round = rnd.round_index - stage_identity["round_index"] + 1
+    first_experiment = config.get("default_first_experiment", {}).get(dataset) if stage_round == 1 else None
     if first_experiment in menu:
         execution["default_first_experiment"] = first_experiment
     allowed, blocked = available_experiments(policy, menu, rnd, train_data, validation, rules, execution)
@@ -363,7 +366,6 @@ def train(rnd):
         unavailable.update(dict.fromkeys(allowed, "parent_measurement_unverified"))
         allowed = {}
     first_experiment = first_experiment if first_experiment in allowed else None
-    stage_round = rnd.round_index - stage_identity["round_index"] + 1
     scheduled = stage_experiment_preference(config, dataset, stage_round, allowed)
     preferred = scheduled or first_experiment
     if preferred:
@@ -371,7 +373,8 @@ def train(rnd):
     # 指纹包含父模型、train、validation、方案和执行规则；只屏蔽同一身份下反复失败的方案。
     with stage("restore_and_evaluate_history", dataset=dataset):
         # 父测量不可比时历史也不能采用，避免白白传输整份历史产物。
-        restored = {} if admission_blocker else _restore_history(rnd, history, run, validation, before, rules, dataset)
+        restored = {} if admission_blocker else _restore_history(
+            rnd, history, run, validation, before, rules, dataset, retention_reference=stage_metrics)
     rollback_ids = eligible_history(restored, validation["sha256"], parent_host["comparable"],
                                     {item["artifact_id"] for item in rnd.artifacts})
     # observe 永远保留；只有存在可执行菜单/合格历史时才开放 experiment/rollback。
@@ -393,28 +396,35 @@ def train(rnd):
                              "observe/experiment cannot restore or train a historical model." % (
                                  value["action"], targets, rnd.parent.artifact_id, before["rmse"]))
 
-    request = {"phase": "plan", "round_index": rnd.round_index, "dataset": dataset,
+    history_rows = _history_view(history)
+    request = {"phase": "plan", "round_index": rnd.round_index, "stage_round": stage_round, "dataset": dataset,
                "task": "regression", "metric": "rmse", "metric_direction": "lower", "target_unit": UNITS[dataset],
-               "parent_artifact_id": rnd.parent.artifact_id, "validation_before": compact_metrics(before),
+               "parent_artifact_id": rnd.parent.artifact_id, "validation_before": metric_evidence(before),
                "parent_host_reference": parent_host,
-                 "stage_reference": stage_comparison,
+               "stage_reference": stage_evidence(stage_comparison),
                "admission_blocker": admission_blocker,
-               "history": _history_view(history), "experiments": allowed, "strategy": {
+               "history": history_evidence(history_rows, validation["sha256"]), "experiments": allowed, "strategy": {
                    "version": policy["version"], "preferred_experiment": policy["preferred_experiment"],
                    "blocked_repeated_experiments": blocked, "unavailable_experiments": unavailable},
-               "monitoring": {k: v for k, v in drift.items() if k != "features"}, "diagnosis": diagnosis,
-               "historical_validation": _restored_view(restored), "promotion_rules": rules,
-               "plan_contract": plan_contract(rnd.parent.artifact_id, compact_metrics(before), restored, rollback_ids, allowed),
+               "monitoring": {k: drift[k] for k in ("drift", "changed_features", "training_projection_changed", "rows")},
+               "diagnosis": {"rul_segments": [{"rul_group": row["rul_group"], **metric_evidence(row)}
+                                             for row in diagnosis["rul_segments"]],
+                             "drift_features": drift["top_features"][:4]},
+               "promotion_rules": rules,
+               "plan_contract": plan_contract(rnd.parent.artifact_id, {"rmse": before["rmse"], "mae": before["mae"]},
+                                              restored, rollback_ids, allowed),
                "controller_prompt": {"version": PROMPT_VERSION, "instruction": PLAN_INSTRUCTION},
                "response_schema": {"action": actions, "experiment": ["none", *allowed],
                    "target_artifact_id": [rnd.parent.artifact_id, *rollback_ids], "hypothesis": "非空实验假设", "reason": "非空证据理由"}}
-    request["experiment_evidence"] = experiment_evidence(_history_view(history), policy["attempts"], menu,
+    # 模型需要看到零尝试记录，才能区分未试过的方案与已失败的方案。
+    # 可用性与本轮实际菜单一致，旧结果仍保留逐项范围核验。
+    request["experiment_evidence"] = experiment_evidence(history_rows, policy["attempts"], menu,
         rnd.parent.checkpoint_sha256, train_data["sha256"], validation["sha256"], execution, rules,
-        gain_key="rmse_reduction", blocked=blocked)
+        gain_key="rmse_reduction", blocked=menu.keys() - allowed.keys())
     if first_experiment:
         request["strategy"]["default_first_experiment"] = first_experiment
         request["controller_prompt"]["instruction"] += (
-            "首轮决定做实验时，默认选择strategy.default_first_experiment。"
+                                "阶段首轮决定做实验时，默认选择strategy.default_first_experiment。"
             "有本轮已核验的证据支持其他合法动作时，可以按证据选择并说明理由。")
     if scheduled:
         request["strategy"]["scheduled_experiment_preference"] = scheduled
@@ -438,8 +448,7 @@ def train(rnd):
         "freeze_mlp_and_existing_corrections": s.get("method") in (*CORRECTION_METHODS, *BOUNDED_METHODS),
         "device_balance": s.get("device_balance", 0), "tail_boost": s.get("tail_boost", 1),
         "basis": s.get("basis"), "sampling": s.get("sampling", "shuffle"),
-        "loss": s["loss"], "transform": s.get("transform"), "huber_quantile": s.get("huber_quantile"),
-        "risk": "Weights change the training objective; correction statistics use train only. Compare RMSE/MAE/NASA on the same validation."}
+        "loss": s["loss"], "transform": s.get("transform"), "huber_quantile": s.get("huber_quantile")}
         for name, s in allowed.items()}
     plan, planning_calls = _controller_decision(rnd, request, ("action", "experiment", "target_artifact_id", "hypothesis", "reason"),
                                      full_config["max_output_tokens"], validate_plan, rules["json_corrections"], state)
@@ -466,7 +475,7 @@ def train(rnd):
         try:
             with stage("local_training", dataset=dataset, experiment=spec["name"]):
                 report = continue_candidate(checkpoint, train_data, validation, candidate, spec, limits, rules, dataset,
-                                            primary_sha, parent_measurement=(primary_sha, before))
+                                            primary_sha, parent_measurement=(primary_sha, before), retention_reference=stage_metrics)
         except (TimeoutError, ValueError, ArithmeticError, np.linalg.LinAlgError) as error:
             failure = {"stage": "local_training", "error_type": type(error).__name__, "message": str(error)[:1000]}
             append_jsonl(state / "experiment_attempts.jsonl", {"round_index": rnd.round_index, "status": "failed", **failure})
@@ -477,7 +486,7 @@ def train(rnd):
     if report is not None:
         # 阶段 7：本地算准入、写诊断证据，并把候选交给宿主真实测量；上传成功不等于准许上线。
         gate = promotion_gate(before, report["validation_after"], rules,
-                              require_all_improved=spec.get("method") == bounded_method)
+                              require_all_improved=spec.get("method") == bounded_method, retention_reference=stage_metrics)
         cfg.update(validation_after=compact_metrics(report["validation_after"]), candidate_gate=gate)
         stage_comparison["candidate_delta"] = compare_stage(stage_metrics, report["validation_after"])
         write_json(candidate / "monitoring.json", drift)
@@ -518,14 +527,14 @@ def train(rnd):
 
     selection_request = {"phase": "select", "dataset": dataset, "action": plan["action"],
         "parent_artifact_id": rnd.parent.artifact_id, "candidate_artifact_id": submitted["artifact_id"] if submitted else None,
-        "same_local_validation": {"parent": compact_metrics(before), "candidate": compact_metrics(report["validation_after"]) if report else None, "historical": _restored_view(restored)},
+        "same_local_validation": {"parent": metric_evidence(before), "candidate": metric_evidence(report["validation_after"]) if report else None},
         "historical_admission": {key: {"eligible": key in selection_history_ids,
             "reevaluated_this_round": value.get("reevaluated_this_round") is True,
             "validation_sha256": value.get("validation_sha256"), "gate": value["gate"],
-            "fresh_metrics": compact_metrics(value["metrics"]) if "metrics" in value else None} for key, value in restored.items()},
-        "host_candidate_receipt": submitted, "host_candidate_gate": admission, "candidate_gate": gate,
+            "fresh_metrics": metric_evidence(value.get("metrics"))} for key, value in restored.items()},
+        "host_candidate_gate": admission, "candidate_gate": gate,
         "parent_host_reference": parent_host, "experiment_failure": failure, "promotion_rules": rules,
-        "stage_reference": stage_comparison,
+        "stage_reference": stage_evidence(stage_comparison),
         "controller_prompt": {"version": PROMPT_VERSION, "instruction": SELECT_INSTRUCTION},
         "response_schema": {"selected_artifact_id": eligible, "reason": "依据实际回归测量的非空理由"}}
     selection, selection_calls = _controller_decision(rnd, selection_request, ("selected_artifact_id", "reason"),

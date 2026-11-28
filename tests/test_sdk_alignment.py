@@ -1,4 +1,4 @@
-"""SDK 1.0.4 request/response ordering and cumulative host-test time budgets.
+"""SDK 1.0.5 request/response ordering and cumulative host-test time budgets.
 
 Only offline peers are used. The SDK implementation is never modified.
 """

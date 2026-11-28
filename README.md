@@ -1,12 +1,14 @@
 # Gas RSI：工业模型自进化系统
 
-更新日期：2026-11-26。
+更新日期：2026-11-27。
 
-项目支持 A 气体识别、B 轴承剩余寿命、C 发动机剩余寿命，使用 contest-harness SDK 1.0.4 接入平台。
+项目支持 A 气体识别、B 轴承剩余寿命、C 发动机剩余寿命，使用 contest-harness SDK 1.0.5 接入平台。
 
 核心思路是：**程序固定实验菜单和上线门槛，27B 根据数据、错误和历史选择方案，程序实际训练并测量，合格才允许采用，不合格则保留父模型，必要时选回本轮验证合格的历史模型。** AI 可以选择方案，不能随意改写训练代码、扩大预算或放宽门槛。
 
-当前工作区按用户要求使用 **A 保留当前版本，B/C 恢复 V18** 的组合。B/C 的 7 个核心文件及整个 `regression` 配置块来自已核验的 V18 提交 `9ab6a59`；后续的低估加权、小学习率扩展、均衡与尾部保护、缓存、修正头和限时研究组件已从当前 B/C 路线撤下。A 的源码、参数及共用 SDK/入口代码保持回退前版本。详见 [B/C 回退记录](docs/BC_V18_A_CURRENT_20261126.md)。
+当前工作区包含 A 定向复核、B 提前调度和上调保护、C 工况修正与限幅残差。B/C 从历史 V18 回退记录继续演进，详见 [B/C 调优对照](docs/BC_RISK_TUNING_20261127.md)。
+
+SDK 1.0.5 沿用 `contest.harness.workspace.v2`、`chunked-v1` 和原入口模板。它在 stderr 新增 `state_request sent`、`state_response received`、`round_complete sent`、`round_ack received`，便于区分状态保存和结束确认阶段的等待。旧镜像需重建才会使用这些日志。
 
 下文 v20 表格描述历史交付物，已有镜像不会因源码回退而自动改变。v21 的实现、数值失败及验收记录保留在 Git 历史和 [历史调优记录](docs/SCORE_ALIGNED_TUNING_V21_20261126.md)，不代表当前 B/C 配置。
 
@@ -18,7 +20,7 @@
 
 新增回归测试为 `tests/test_parent_checkpoint_manifest.py`，离线容器宿主支持 `--aggregate-parent` 和 `--compact-validation` 联合测试；聚合算法只是测试夹具，程序不会自行重算或替换官方身份。
 
-当前交付为 **v20 按项调优版**，继承 v19 的完整专家包续训、解析提速和 C `fine_rate`。新增 B 温和低估加权 `underestimate_mild`、相同条件已完成性能失败的去重，以及 CPU/耗时/token 资源记录。未过门槛的 C 偏置与残差修正未加入菜单。实施结果见 [v20 验收记录](docs/ITEM_TUNING_V20_20261126.md)。
+历史交付 **v20 按项调优版**继承 v19 的完整专家包续训、解析提速和 C `fine_rate`，增加 B 温和低估加权 `underestimate_mild`、相同条件已完成性能失败的去重，以及 CPU/耗时/token 资源记录。实施结果见 [v20 验收记录](docs/ITEM_TUNING_V20_20261126.md)。
 
 后续平台反馈：用户确认 v20 的 B/C 隐藏集表现未达到提分预期。本地协议通过与公开集小幅收益不能视为正式泛化验收通过；已补充分设备和尾部诊断，见 [B/C 平台反馈复核](docs/BC_V20_PLATFORM_REVIEW_20261126.md)。
 
@@ -166,7 +168,7 @@ $projectRoot = (Get-Location).Path
 $pythonExe = Join-Path $projectRoot '.venv/Scripts/python.exe'
 $dockerExe = 'C:/Users/Administrator/AppData/Local/Programs/DockerDesktop/resources/bin/docker.exe'
 $baselineRoot = 'D:/liyue/工业模型赛题研究'
-$sdkArchive = Join-Path $baselineRoot 'contest-harness-sdk-1.0.4.tar.gz'
+$sdkArchive = Join-Path $projectRoot 'vendor/contest-harness-sdk-1.0.5.tar.gz'
 $v18Tag = 'gas-rsi-abc:wyx-sdk104-v18-parent-manifest-20261125'
 $v18Id = 'sha256:3bf46eec43814d6fcaef9e885d7629d8b87507115d87e4c36fc5c6d72522c774'
 $v18Archive = Join-Path $projectRoot 'output/submission-wyx-sdk104-v18-parent-manifest-20261125/gas-rsi-abc-wyx-sdk104-v18-parent-manifest-20261125.tar'
@@ -199,7 +201,7 @@ $localImageId = (& $dockerExe --context desktop-linux image inspect $localImageT
 & $dockerExe --context desktop-linux run --rm --network none --read-only $localImageId describe
 ```
 
-必须显式传入上述 CONTEST_RUNTIME：Dockerfile.offline 的旧默认值仍引用已清理的 v4。需要从基础环境重新安装依赖时，可使用根目录 Dockerfile 正常构建；它需要准备基础镜像和依赖。
+为 `CONTEST_RUNTIME` 显式传入本机已核验的运行镜像。离线构建复用其 Python/NumPy 并从本地 wheel 安装 SDK 1.0.5。需要从基础环境重新安装依赖时，可使用根目录 Dockerfile 正常构建。新镜像的 `describe` 应返回 `sdk_version: 1.0.5`。
 
 ### 本地单元测试与官方 SDK 离线测试
 
@@ -212,7 +214,7 @@ if (-not (Test-Path $pythonExe)) { py -3.12 -m venv .venv }
 
 $env:PYTHONUTF8 = '1'
 $env:PYTHONIOENCODING = 'utf-8'
-Push-Location vendor/contest-harness-sdk-1.0.4
+Push-Location vendor/contest-harness-sdk-1.0.5
 & $pythonExe -B -X utf8 -m unittest tests.test_sdk tests.test_contract_regressions tests.test_transport_regressions -v
 Pop-Location
 ```
@@ -228,7 +230,7 @@ $offlineOut = Join-Path $projectRoot ('runtime/offline-current-' + (Get-Date -Fo
 & $pythonExe -B -X utf8 scripts/benchmark_sdk_agent.py --baseline-root $baselineRoot --sdk-archive $sdkArchive --output $offlineOut --image $localImageTag --expected-image-id $localImageId --rounds 4 --modes parallel --compact-validation --aggregate-parent --docker-executable $dockerExe --docker-context desktop-linux
 ```
 
-命令显式指定镜像及 ID，不使用测试脚本遗留的 v10 默认值。`--compact-validation` 模拟精简测量摘要，`--aggregate-parent` 令父身份与任一单文件摘要不同，覆盖本次平台暴露的对接场景；去掉两个选项可测试原先的显式摘要、单文件父身份模式。
+命令显式指定本次构建的镜像、镜像 ID 和 SDK 压缩包。`--compact-validation` 模拟精简测量摘要，`--aggregate-parent` 令父身份与任一单文件摘要不同，覆盖平台暴露的对接场景；去掉两个选项可测试显式摘要、单文件父身份模式。
 
 输出目录必须全新。测试实际执行训练、SDK 分块传输、历史恢复和容器预测，模型选择由明确标记的离线替身产生；不能当作真实 27B 的实验结果。
 
@@ -347,10 +349,10 @@ $liveOut = Join-Path $projectRoot ('runtime/fresh-abc-' + (Get-Date -Format 'yyy
 
 1. **完整实验次数没有硬保证。** 只观察、只回滚或 program_guard 回合不能代替三次实际实验。工作区在 experiment 实际训练后选择合格历史，仍可按完整记录统计实验；它与没有训练的回滚回合不同。测试宿主会核验次数，生产主控仍可能因模型选择或条件不足而未达标。
 2. **本地训练 30 秒不等于整轮 30 秒。** 模型等待、历史恢复、上传、宿主测量、保存状态都占时间。业务代码尚未统一按 rnd.wall_seconds 调度剩余预算。
-3. **协议通过不代表平台一定成功。** SDK 1.0.4 结果未知必须终止；真实网关排队、资源争用及正式宿主行为未由离线替身覆盖。
+3. **协议通过不代表平台一定成功。** SDK 1.0.5 仍要求在 RPC 结果未知后终止；真实网关排队、资源争用及正式宿主行为未由离线替身覆盖。
 4. **源码、镜像和实验记录必须配套。** 工具遗留默认镜像仍可能指向已清理的旧版本，务必显式指定标签和 ID。
 5. **公开验证调优存在选择偏差。** 本地不低于公开基线、合成故障回滚成功，都不能保证隐藏流必然改善。
 
 SDK 采用 `upload_begin → upload_chunk → upload_finish`，再提交候选或状态事务；finish 收到 `round_ack / accepted=true` 后才结束。当前测试宿主默认按整轮 180 秒及 start 中更小的 wall_seconds 核验，这不是 SDK 对所有平台调用的统一时限，也不保证能抢占已发出的同步宿主操作。
 
-历史材料见 [v10 验收](docs/SDK104_V10_ACCEPTANCE_20261124.md)、[v8 超时排查](docs/IMAGE_V8_TIMEOUT_20261124.md)、[续训修复](docs/BASELINE_SDK_FIXES_20261123.md)、[历史回放边界](docs/LEGACY_REPLAY.md)及 [SDK 原说明](vendor/contest-harness-sdk-1.0.4/HARNESS_SDK.md)。这些报告描述各自当时版本，不代表当前镜像仍保留，也不代表所有旧问题已经由后续版本彻底消除。
+历史材料见 [v10 验收](docs/SDK104_V10_ACCEPTANCE_20261124.md)、[v8 超时排查](docs/IMAGE_V8_TIMEOUT_20261124.md)、[续训修复](docs/BASELINE_SDK_FIXES_20261123.md)及[历史回放边界](docs/LEGACY_REPLAY.md)。当前 SDK 接口和限制见 [1.0.5 原说明](vendor/contest-harness-sdk-1.0.5/HARNESS_SDK.md)。

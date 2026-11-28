@@ -17,10 +17,12 @@ def child_environment():
 
 
 class DockerRuntime:
-    def __init__(self, image, *, executable="docker", context=None, expected_id=None, required_tasks=("classification",)):
+    def __init__(self, image, *, executable="docker", context=None, expected_id=None,
+                 required_tasks=("classification",), sdk_version="1.0.5"):
         self.cli = [executable, *(["--context", context] if context else [])]
         self.requested_image, self.image, self.expected_id = image, None, expected_id
         self.required_tasks = set(required_tasks)
+        self.sdk_version = sdk_version
         self.launches = []
         self.probe = None
 
@@ -41,7 +43,7 @@ class DockerRuntime:
         # 预检后锁定不可变 ID，即使外部把标签移动到另一镜像，本次 train/predict 也不会换版本。
         self.image = info["Id"]  # Every launch uses this immutable ID and --pull=never.
         probe = """
-import errno,importlib.metadata as m,json,os
+import errno,importlib.metadata as m,json,os,sys
 assert os.geteuid()==65534
 mount=next(line.split()[3].split(',') for line in open('/proc/mounts') if line.split()[1]=='/')
 assert 'ro' in mount
@@ -58,19 +60,20 @@ except OSError as error:
  assert error.errno in (errno.EACCES,errno.EROFS)
 else:
  raise AssertionError('Code directory is writable')
-assert m.version('contest-harness')=='1.0.4' and m.version('numpy')=='1.26.4'
+sdk = m.version('contest-harness')
+assert sdk==sys.argv[1] and m.version('numpy')=='1.26.4'
 print(json.dumps({'verified':True,'uid':os.geteuid(),'readonly_root':True,'network':'none',
- 'cpus':2,'memory_bytes':4294967296,'sdk':'1.0.4','numpy':'1.26.4','credentials_absent':True}))
+ 'cpus':2,'memory_bytes':4294967296,'sdk':sdk,'numpy':'1.26.4','credentials_absent':True}))
 """
         argv, _ = self._base("probe")
-        result = subprocess.run([*argv, "--entrypoint", "python3", self.image, "-c", probe],
+        result = subprocess.run([*argv, "--entrypoint", "python3", self.image, "-c", probe, self.sdk_version],
                                 capture_output=True, text=True, encoding="utf-8",
                                 env=child_environment(), timeout=60, check=True)
         self.probe = json.loads(result.stdout)
         description = json.loads(self._run(["run", "--rm", "--pull=never", "--network", "none",
                                            "--read-only", self.image, "describe"]).stdout)
         tasks = description.get("tasks")
-        if (description.get("sdk_version") != "1.0.4" or not isinstance(tasks, list)
+        if (description.get("sdk_version") != self.sdk_version or not isinstance(tasks, list)
                 or any(t not in ("classification", "regression") for t in tasks)
                 or not self.required_tasks <= set(tasks)):
             raise ValueError("Unexpected image describe contract")

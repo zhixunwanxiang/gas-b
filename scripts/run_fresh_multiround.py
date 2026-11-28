@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+from contest_harness.protocol import SDK_VERSION
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -62,6 +63,7 @@ def main():
             "code_versions": {"A": "current", "B": "current weighted/composite", "C": "current weighted/composite"},
             "sources_sha256": {p.relative_to(ROOT).as_posix(): digest(p) for p in sources},
             "inputs": inputs, "configuration": config, "rounds_per_dataset": 10,
+            "sdk_version": SDK_VERSION,
             "regression_order": args.regression_order, "regression_order_by_dataset": modes,
             "b_guard_replay": args.b_guard_replay,
             "experiment_sequences": {"A": ["frozen_router", "frozen_router", "conservative_head", "frozen_router", "conservative_head",
@@ -74,6 +76,8 @@ def main():
         print(str(registration), flush=True)
         return
     record = json.loads(registration.read_text(encoding="utf-8"))
+    if record.get("sdk_version", "1.0.4") != SDK_VERSION:
+        raise ValueError("Registered SDK version differs from the installed SDK")
     for name, expected in record["sources_sha256"].items():
         if digest(ROOT / name) != expected:
             raise ValueError("Registered code changed: " + name)

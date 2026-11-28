@@ -310,7 +310,7 @@ class SubmissionTest(unittest.TestCase):
         description = json.loads(result.stdout)
         self.assertEqual(description["protocol"], "contest.harness.workspace.v2")
         self.assertEqual(description["model_access"], "host_gateway_rpc")
-        self.assertEqual(description["sdk_version"], "1.0.4")
+        self.assertEqual(description["sdk_version"], "1.0.5")
         self.assertEqual(description["tasks"], ["classification", "regression"])
 
     def test_legacy_host_is_rejected_before_model_calls_or_training(self):

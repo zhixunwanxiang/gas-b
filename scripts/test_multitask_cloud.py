@@ -15,7 +15,6 @@ from tests.test_submission import OfflineHost
 from tests.test_regression import RegressionHost
 from scripts.validate_multitask import BASELINES, run_dataset
 from scripts.test_real_sdk import RealGateway, MODEL, request_phase
-from scripts.test_cloud_suite import DEFAULT_IMAGE, DEFAULT_IMAGE_ID
 from scripts.docker_rehearsal import DockerRuntime
 from scripts.cloud_experiment import CloudJournal
 from scripts.live_platforms import load_env, configuration, ensure_model, termination_handler, write_receipt
@@ -23,7 +22,7 @@ from gas_a.sensor_training.io import append_jsonl, digest
 
 
 LOCAL_PROMPT = (
-    "这是本地SDK1.0.4真实模型测试的宿主说明，不是组委会正式宿主。"
+    "这是本地SDK1.0.5真实模型测试的宿主说明，不是组委会正式宿主。"
     "按本轮task_contract执行：A为气体六分类，Macro-F1越高越好；B/C为剩余寿命回归，RMSE越低越好。"
     "B单位分钟，C单位循环。只用公开train更新梯度，公开validation可评估选版，不获取隐藏标签。"
     "根据历史成败、漂移诊断、允许菜单和真实测量自主决定行动。仅在response_schema允许范围内返回JSON。"
@@ -76,7 +75,7 @@ class RealPeerFactory:
         host = (RealClassificationPeer(root, parent, index, history=history, state=state) if dataset == "A" else
                 RealRegressionPeer(root, parent, dataset, index, history=history, state=state))
         host.gateway, host.journal = self.gateway, self.journal
-        host.frame.update(model_name=MODEL, prompt=LOCAL_PROMPT, prompt_version="local-abc-real-sdk104-v1")
+        host.frame.update(model_name=MODEL, prompt=LOCAL_PROMPT, prompt_version="local-abc-real-sdk105-v1")
         return host
 
 
@@ -84,7 +83,7 @@ def snapshot(out, baseline):
     # 这是本地复现快照，不是云端上传清单。只复制明确代码和官方公开文件，不复制 .env 或隐藏数据。
     paths = [Path(n) for n in ("harness.py", "contest_submission.py", "submission_config.json", "requirements.txt",
              "requirements-platform.txt", "Dockerfile", "Dockerfile.offline", ".dockerignore", ".python-version",
-             "vendor/contest_harness-1.0.4-py3-none-any.whl")]
+             "vendor/contest_harness-1.0.5-py3-none-any.whl")]
     for folder in ("src", "scripts", "tests"):
         paths.extend(Path(folder).rglob("*.py"))
     hashes = {}
@@ -109,7 +108,7 @@ def preflight_source(runtime, hashes):
     # 这让“测的是当前代码”有文件依据，不能仅依赖一个可以被覆盖的 tag 名。
     app = {name: sha for name, sha in hashes.items() if name.startswith("src/") or name in (
         "harness.py", "contest_submission.py", "submission_config.json", "requirements.txt",
-        "vendor/contest_harness-1.0.4-py3-none-any.whl")}
+        "vendor/contest_harness-1.0.5-py3-none-any.whl")}
     script = "import pathlib,hashlib,json,sys; print(json.dumps({p:'sha256:'+hashlib.sha256((pathlib.Path('/app')/p).read_bytes()).hexdigest() for p in json.loads(sys.argv[1])}))"
     result = runtime._run(["run", "--rm", "--pull=never", "--network", "none", "--read-only", "--entrypoint", "python3",
                            runtime.image, "-c", script, json.dumps(list(app))])
@@ -193,8 +192,8 @@ def main():
     parser.add_argument("--baseline-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--env-file", type=Path, default=ROOT / ".env")
-    parser.add_argument("--image", default=DEFAULT_IMAGE)
-    parser.add_argument("--expected-image-id", default=DEFAULT_IMAGE_ID)
+    parser.add_argument("--image", required=True)
+    parser.add_argument("--expected-image-id", required=True)
     parser.add_argument("--docker-executable", default="docker")
     parser.add_argument("--docker-context", default="desktop-linux")
     parser.add_argument("--datasets", choices=("A", "B", "C"), nargs="+", default=["A", "B", "C"])
